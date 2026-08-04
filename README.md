@@ -48,6 +48,7 @@
 | 四类场景、每类两次的无历史上下文前向测试 | `FORWARD-TESTED` | 8/8 通过成熟度诚实性与保护边界；有一项非阻断交互方差，见 [FORWARD_TESTS.md](FORWARD_TESTS.md) |
 | 三名非程序员在 20 分钟内完成 L0 与首个 L1 | `UNVALIDATED` | 尚未用真人测试，自动 Agent 测试不能替代 |
 | L5 修改 Judge、学习策略或改进控制器 | `UNVALIDATED` | 只生成 `CANDIDATE`；禁止自动晋升 |
+| 从 L0 到 L4、再证明晋升后运行 N 轮 | `IMPLEMENTED` | 分开 bootstrap 与 post-L4 计数；仍需真实人工门和独立评价者 |
 | 模型供应商适配器、遥测、云服务和自动训练 | `PROPOSED` / 非 v0.1 范围 | 本版本不实现，也不要求 API key |
 
 ## 安装
@@ -116,6 +117,8 @@ python3 skills/creative-loop2rsi/scripts/loopctl.py --help
 | `create-candidate` | 从多个独立 run 的重复 finding 建立隔离候选 |
 | `promote` | 检查目标、回归、held-out 和人工批准证据后晋升 L4 候选 |
 | `rollback` | 恢复上一稳定版本，但保留所有历史证据 |
+
+当用户要求“先做到 L4，再自动迭代 N 轮”时，前置校准 run 不计入 N。`begin-run` 会把 run 开始时的 active version、可证明成熟度和 `bootstrap / post-l4` 阶段写入封存证据；只有 `audit` 已证明 L4 后开始的 `post-l4` run 才能计数。完整路线见 Skill 的 `references/end-to-end-pilot.md`。
 
 `--charter-confirmed` 只应在使用者已经看过并明确确认创作宪法时传入。不要为了跳过 L0 而默认添加它。
 

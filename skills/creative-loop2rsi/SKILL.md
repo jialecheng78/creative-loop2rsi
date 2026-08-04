@@ -150,6 +150,17 @@ produce → evaluate → decide → revise / commit
 
 需要进入系统级实验时，完整读取 [rsi-lab.md](references/rsi-lab.md)。若用户要求取消边界或直接发布，拒绝该部分请求，并给出可逆的候选实验方案。
 
+## 处理“从零做到 L4，再迭代 N 轮”的长程请求
+
+当用户明确要求端到端搭建、达到可验证自我改进并在此后运行若干轮时，完整读取 [end-to-end-pilot.md](references/end-to-end-pilot.md)，先给出分阶段路线，再开始生产。
+
+- 把 L0–L3 所需 run 标为 bootstrap / calibration，不计入用户要求的“L4 之后 N 轮”。
+- 在最早可评价的三个代表结果后批量请求人工认可，不要先耗尽全部创作或迭代预算再发现 `human_accepted=0`。
+- Producer/Judge 分离必须落实为真实独立执行上下文；只有不同 role id、不算独立评价。
+- 先由 `audit` 证明 L4 且 active version 已通过晋升，再把后续 run 计为 `post-l4`。
+- 每个 `post-l4` run 仍可 `commit / reject / rollback / stop`；不要求为凑数量强行改坏作品。
+- 人工门可以合并成小批量选择，但不得代签。遇到 `NEEDS_TASTE` 时暂停该分支，不要用后续自动轮次掩盖。
+
 ## 分开评价三层结果
 
 始终分别报告：
@@ -203,6 +214,7 @@ python3 <skill-dir>/scripts/loopctl.py audit <project-dir>
 - 编写或审查 JSON 合同、状态与 finding：读 [system-contract.md](references/system-contract.md)。
 - 设计多 Loop、attempt、记忆、失效传播与恢复：读 [nested-loops-and-recovery.md](references/nested-loops-and-recovery.md)。
 - 设计三层评价、Judge 校准、候选比较、晋升与回滚：读 [evaluation-and-promotion.md](references/evaluation-and-promotion.md)。
+- 执行从 L0 到 L4、并在晋升后继续指定轮数的完整试点：读 [end-to-end-pilot.md](references/end-to-end-pilot.md)。
 - 讨论修改评价或改进机制本身：读 [rsi-lab.md](references/rsi-lab.md)。
 
 需要示范时，只读取最接近用户方向的一个虚构案例：

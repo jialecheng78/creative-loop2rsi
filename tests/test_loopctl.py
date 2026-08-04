@@ -694,6 +694,111 @@ class LoopCtlTests(unittest.TestCase):
         registry = self.read_json(project / "creative-system" / "releases" / "registry.json")
         self.assertEqual([item["action"] for item in registry["history"]], ["promote", "rollback"])
 
+    def test_run_snapshot_distinguishes_bootstrap_from_post_l4(self):
+        bootstrap_project = self.init_project("bootstrap")
+        bootstrap = self.command(
+            "begin-run",
+            bootstrap_project,
+            "--loop",
+            "main-loop",
+            "--task",
+            "立宪后的首个代表任务",
+            "--run-id",
+            "bootstrap-run",
+        )
+        self.assertEqual(bootstrap["run_phase"], "bootstrap")
+        self.assertEqual(bootstrap["provable_maturity_at_start"], "L0")
+        self.assertEqual(bootstrap["active_version_at_start"], "baseline-v1")
+        self.assertIsNone(bootstrap["post_l4_iteration_index"])
+
+        project = self.make_l3_project()
+        self.create_l4_candidate(project)
+        evaluation = self.promotion_evaluation(project)
+        self.command(
+            "promote",
+            project,
+            "--candidate-id",
+            "pace-fix",
+            "--evaluation",
+            evaluation,
+            "--approved-by",
+            "Alice",
+        )
+        started = self.command(
+            "begin-run",
+            project,
+            "--loop",
+            "main-loop",
+            "--task",
+            "晋升后的第一次正式改进试验",
+            "--run-id",
+            "post-l4-run-1",
+        )
+        self.assertEqual(started["run_phase"], "post-l4")
+        self.assertEqual(started["provable_maturity_at_start"], "L4")
+        self.assertEqual(started["active_version_at_start"], "pace-fix")
+        self.assertEqual(started["post_l4_iteration_index"], 1)
+        attempt = project / started["attempt_path"]
+        (attempt / "artifacts" / "work.md").write_text("晋升后试验成品\n", encoding="utf-8")
+        sealed = self.command(
+            "seal-attempt",
+            project,
+            "--run-id",
+            "post-l4-run-1",
+            "--execution-status",
+            "PASS",
+            "--quality-status",
+            "PASS",
+            "--release-status",
+            "CANDIDATE",
+            "--decision",
+            "commit",
+            "--improved",
+            "true",
+        )
+        manifest = self.read_json(project / sealed["manifest"])
+        self.assertEqual(manifest["run_phase"], "post-l4")
+        self.assertEqual(manifest["post_l4_iteration_index"], 1)
+        audit = self.command("audit", project)
+        self.assertEqual(audit["provable_maturity"], "L4")
+        self.assertEqual(audit["evidence"]["post_l4_runs"], 1)
+        self.assertEqual(audit["evidence"]["post_l4_improved_runs"], 1)
+
+    def test_bootstrap_run_cannot_be_relabelled_as_post_l4(self):
+        project = self.init_project()
+        started = self.command(
+            "begin-run",
+            project,
+            "--loop",
+            "main-loop",
+            "--task",
+            "普通 bootstrap 任务",
+            "--run-id",
+            "forged-phase",
+        )
+        run_path = project / "creative-system" / "runs" / "forged-phase" / "run.json"
+        run = self.read_json(run_path)
+        run["run_phase"] = "post-l4"
+        run["provable_maturity_at_start"] = "L4"
+        run["active_version_at_start"] = "forged-candidate"
+        self.write_json(run_path, run)
+        attempt = project / started["attempt_path"]
+        (attempt / "artifacts" / "work.md").write_text("不能冒充晋升后运行\n", encoding="utf-8")
+        blocked = self.command(
+            "seal-attempt",
+            project,
+            "--run-id",
+            "forged-phase",
+            "--execution-status",
+            "PASS",
+            "--quality-status",
+            "PASS",
+            "--decision",
+            "commit",
+            expected=2,
+        )
+        self.assertIn("不再能证明 L4", blocked["error"])
+
     def test_candidate_proposal_tamper_blocks_promotion(self):
         project = self.make_l3_project()
         self.create_l4_candidate(project)

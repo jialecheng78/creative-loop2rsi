@@ -870,11 +870,23 @@ def audit_project(root: Path) -> Dict[str, Any]:
     system = load_system(root)
     charter = system.get("charter", {})
     finals = [item for item in final_run_manifests(root) if item.get("real_run") is True]
+    post_l4_finals = [
+        item
+        for item in finals
+        if (
+            item.get("run_phase") == "post-l4"
+            and item.get("provable_maturity_at_start") == "L4"
+            and item.get("active_version_at_start") not in {None, "", "baseline-v1"}
+        )
+    ]
     evidence: Dict[str, Any] = {
         "charter_confirmed": charter.get("confirmed") is True,
         "sealed_runs": len(finals),
         "representative_tasks": len({str(item.get("task", "")) for item in finals if item.get("task")}),
         "human_accepted": sum(item.get("human_accepted") is True for item in finals),
+        "post_l4_runs": len(post_l4_finals),
+        "post_l4_improved_runs": sum(item.get("improved") is True for item in post_l4_finals),
+        "post_l4_committed_runs": sum(item.get("decision") == "commit" for item in post_l4_finals),
     }
     provable = "NONE"
     gaps: List[str] = []
@@ -1045,6 +1057,29 @@ def generated_run_id() -> str:
     return f"run-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
+def run_start_snapshot(root: Path, system: Mapping[str, Any]) -> Dict[str, Any]:
+    audit = audit_project(root)
+    if audit.get("status") == "BLOCK":
+        raise LoopCtlError("无法建立 run 起点快照：audit 当前为 BLOCK")
+    maturity = str(audit.get("provable_maturity", "NONE"))
+    project = system.get("project", {})
+    active_version = project.get("active_version") if isinstance(project, Mapping) else None
+    if not isinstance(active_version, str) or not active_version:
+        raise LoopCtlError("无法建立 run 起点快照：active version 无效")
+    phase = "post-l4" if maturity == "L4" and active_version != "baseline-v1" else "bootstrap"
+    post_l4_index: Optional[int] = None
+    if phase == "post-l4":
+        evidence = audit.get("evidence", {})
+        prior = evidence.get("post_l4_runs", 0) if isinstance(evidence, Mapping) else 0
+        post_l4_index = int(prior) + 1
+    return {
+        "active_version_at_start": active_version,
+        "provable_maturity_at_start": maturity,
+        "run_phase": phase,
+        "post_l4_iteration_index": post_l4_index,
+    }
+
+
 def command_begin_run(args: argparse.Namespace) -> Dict[str, Any]:
     root = project_root(args.project)
     validation = validate_project(root)
@@ -1077,6 +1112,7 @@ def command_begin_run(args: argparse.Namespace) -> Dict[str, Any]:
         if run_dir.exists() and any(run_dir.iterdir()):
             raise LoopCtlError(f"run 目录已存在且不可识别：{run_dir}")
         next_number = 1
+        snapshot = run_start_snapshot(root, system)
         run = {
             "schema_version": SCHEMA_VERSION,
             "kind": "RunRecord",
@@ -1090,6 +1126,7 @@ def command_begin_run(args: argparse.Namespace) -> Dict[str, Any]:
             "execution_status": "RUNNING",
             "quality_status": "NOT_EVALUATED",
             "release_status": "NOT_READY",
+            **snapshot,
         }
     maximum_attempts = int(loop.get("retry_budget", {}).get("max_attempts", 0))
     if next_number > maximum_attempts:
@@ -1115,6 +1152,10 @@ def command_begin_run(args: argparse.Namespace) -> Dict[str, Any]:
         "execution_status": "RUNNING",
         "quality_status": "NOT_EVALUATED",
         "release_status": "NOT_READY",
+        "active_version_at_start": run.get("active_version_at_start"),
+        "provable_maturity_at_start": run.get("provable_maturity_at_start"),
+        "run_phase": run.get("run_phase"),
+        "post_l4_iteration_index": run.get("post_l4_iteration_index"),
     }
     atomic_write_json(attempt_dir / "attempt.json", attempt_record)
     (attempt_dir / "artifacts").mkdir()
@@ -1129,6 +1170,10 @@ def command_begin_run(args: argparse.Namespace) -> Dict[str, Any]:
         "run_id": run_id,
         "attempt_id": attempt_id,
         "attempt_path": attempt_dir.relative_to(root).as_posix(),
+        "active_version_at_start": run.get("active_version_at_start"),
+        "provable_maturity_at_start": run.get("provable_maturity_at_start"),
+        "run_phase": run.get("run_phase"),
+        "post_l4_iteration_index": run.get("post_l4_iteration_index"),
         "next_step": "把产物、评价和 finding 写入 attempt 后运行 seal-attempt",
     }
 
@@ -1185,6 +1230,24 @@ def command_seal_attempt(args: argparse.Namespace) -> Dict[str, Any]:
         raise LoopCtlError(f"attempt 不存在：{attempt_dir}")
     if (attempt_dir / ".sealed.json").exists():
         raise LoopCtlError(f"attempt 已封存，拒绝覆盖：{attempt_id}")
+
+    phase = run.get("run_phase", "bootstrap")
+    if phase not in {"bootstrap", "post-l4"}:
+        raise LoopCtlError("run_phase 无效")
+    if phase == "post-l4":
+        if run.get("provable_maturity_at_start") != "L4" or run.get("active_version_at_start") in {
+            None,
+            "",
+            "baseline-v1",
+        }:
+            raise LoopCtlError("post-l4 run 缺少可信的 L4 起点快照")
+        current_audit = audit_project(root)
+        current_system = load_system(root)
+        current_active = current_system.get("project", {}).get("active_version")
+        if current_audit.get("provable_maturity") != "L4":
+            raise LoopCtlError("post-l4 attempt 封存时系统已不再能证明 L4")
+        if current_active != run.get("active_version_at_start"):
+            raise LoopCtlError("post-l4 attempt 运行期间 active version 已改变")
 
     human_accepted = bool_choice(args.human_accepted)
     improved = bool_choice(args.improved)
@@ -1243,6 +1306,10 @@ def command_seal_attempt(args: argparse.Namespace) -> Dict[str, Any]:
         "loop_id": run.get("loop_id"),
         "task": run.get("task"),
         "real_run": bool(run.get("real_run", True)),
+        "active_version_at_start": run.get("active_version_at_start"),
+        "provable_maturity_at_start": run.get("provable_maturity_at_start"),
+        "run_phase": phase,
+        "post_l4_iteration_index": run.get("post_l4_iteration_index"),
         "sealed_at": utc_now(),
         "execution_status": args.execution_status,
         "quality_status": args.quality_status,

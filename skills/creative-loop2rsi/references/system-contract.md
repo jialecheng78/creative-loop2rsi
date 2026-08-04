@@ -75,6 +75,18 @@
 }
 ```
 
+### 运行时成熟度快照
+
+`begin-run` 在创建新 run 时计算并冻结以下字段，使用者不得通过参数自行声明：
+
+| 字段 | 含义 |
+|---|---|
+| `active_version_at_start` | run 开始时经过验证的 active version |
+| `provable_maturity_at_start` | run 开始时 `audit` 实际可证明的成熟度 |
+| `run_phase` | `post-l4` 仅在上项为 L4 且 active version 非基线时成立；其余为 `bootstrap` |
+
+三个字段同时写入 run、attempt 和封存 manifest。它们用于证明运行发生在晋升之前还是之后，不能靠文件名、用户声明或事后修改替代。`audit.evidence.post_l4_runs` 只统计封存 manifest 中真实的 `post-l4` run。
+
 ## 3. LoopSpec
 
 每个 `creative-system/loops/<id>.json` 必须定义：

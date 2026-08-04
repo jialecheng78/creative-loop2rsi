@@ -29,6 +29,7 @@ class SkillContentTests(unittest.TestCase):
             "system-contract.md",
             "nested-loops-and-recovery.md",
             "evaluation-and-promotion.md",
+            "end-to-end-pilot.md",
             "rsi-lab.md",
         ):
             self.assertIn(f"references/{reference}", text)
@@ -51,6 +52,7 @@ class SkillContentTests(unittest.TestCase):
             "system-contract.md": ("CreativeSystem", "LoopSpec", "JudgeSpec", "Finding", "LearningProposal"),
             "nested-loops-and-recovery.md": ("owner", "attempt", "失效", "恢复"),
             "evaluation-and-promotion.md": ("硬合同", "软质量", "人类立宪", "held-out", "回滚"),
+            "end-to-end-pilot.md": ("bootstrap", "post-l4", "独立评价", "人工门"),
             "rsi-lab.md": ("experimental", "unvalidated", "CANDIDATE", "外部元评估"),
         }
         actual = {path.name for path in (SKILL / "references").glob("*.md")}
