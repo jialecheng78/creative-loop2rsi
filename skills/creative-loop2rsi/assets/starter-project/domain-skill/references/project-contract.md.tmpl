@@ -17,3 +17,5 @@
 ## 晋升门
 
 候选必须同时具备目标评估、全量回归、held-out 盲评和人工批准。L5 候选不得晋升。
+
+候选文件在 `creative-system/candidates/<candidate-id>/changes/` 中镜像项目相对路径。`project.active_version` 不是复制或覆盖命令；只有带 `COMMITTED` 晋升记录、且哈希一致的候选 changes 才能成为运行时版本。任何不一致都返回 `BLOCK`。

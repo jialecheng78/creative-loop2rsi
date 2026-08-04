@@ -315,6 +315,37 @@ class LoopCtlTests(unittest.TestCase):
         second = self.init_project("second")
         self.assertEqual(self.tree_hashes(first), self.tree_hashes(second))
 
+    @unittest.skipIf(os.name == "nt", "Windows CI 不保证允许创建符号链接")
+    def test_init_rejects_symlink_target_without_touching_destination(self):
+        destination = self.root / "real-destination"
+        destination.mkdir()
+        marker = destination / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        link = self.root / "linked-destination"
+        link.symlink_to(destination, target_is_directory=True)
+
+        blocked = self.command(
+            "init",
+            link,
+            "--project-name",
+            "X",
+            "--creative-goal",
+            "G",
+            "--minimum-product",
+            "M",
+            "--representative-task",
+            "T",
+            "--constraints",
+            "C",
+            "--taste",
+            "P",
+            "--domain-skill",
+            "domain-loop",
+            expected=2,
+        )
+        self.assertIn("符号链接", blocked["error"])
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
     def test_unconfirmed_charter_stops_at_needs_taste(self):
         project = self.init_project(confirmed=False)
         audit = self.command("audit", project)
@@ -357,6 +388,16 @@ class LoopCtlTests(unittest.TestCase):
         self.assertIn("schema_version", joined)
         self.assertIn("missing.json", joined)
         self.assertIn("release_status", joined)
+
+    def test_validate_rejects_l5_as_active_maturity(self):
+        project = self.init_project()
+        system_path = project / "creative-system" / "system.json"
+        system = self.read_json(system_path)
+        system["maturity"]["declared"] = "L5"
+        self.write_json(system_path, system)
+
+        report = self.command("validate", project, expected=1)
+        self.assertTrue(any("L5" in item and "实验候选" in item for item in report["errors"]))
 
     def test_validate_rejects_duplicate_owner_cycle_and_budget(self):
         project = self.init_project()
@@ -473,6 +514,69 @@ class LoopCtlTests(unittest.TestCase):
         audit = self.command("audit", project)
         self.assertEqual(audit["provable_maturity"], "L2")
         self.assertGreaterEqual(audit["evidence"]["human_machine_direction_agreement"], 0.8)
+
+    def test_synthetic_runs_do_not_count_as_maturity_or_learning_evidence(self):
+        project = self.init_project()
+        finding = self.finding_file()
+        for number in range(1, 4):
+            run_id = "synthetic-{}".format(number)
+            begin = self.command(
+                "begin-run",
+                project,
+                "--loop",
+                "main-loop",
+                "--task",
+                "演示任务 {}".format(number),
+                "--run-id",
+                run_id,
+                "--synthetic",
+            )
+            attempt = project / begin["attempt_path"]
+            (attempt / "artifacts" / "work.md").write_text("演示成品\n", encoding="utf-8")
+            self.command(
+                "seal-attempt",
+                project,
+                "--run-id",
+                run_id,
+                "--execution-status",
+                "PASS",
+                "--quality-status",
+                "PASS",
+                "--decision",
+                "commit",
+                "--human-accepted",
+                "true",
+                "--machine-direction",
+                "PASS",
+                "--human-direction",
+                "PASS",
+                "--improved",
+                "true",
+                "--finding",
+                finding,
+            )
+
+        audit = self.command("audit", project)
+        self.assertEqual(audit["provable_maturity"], "L0")
+        self.assertEqual(audit["evidence"]["sealed_runs"], 0)
+        blocked = self.command(
+            "create-candidate",
+            project,
+            "--candidate-id",
+            "synthetic-only",
+            "--finding-code",
+            "PACE-MIDDLE-STALL",
+            "--root-cause",
+            "假设",
+            "--target-component",
+            "prompts",
+            "--change-summary",
+            "修改",
+            "--changed-path",
+            "skills/paper-lantern-story/references/production-guidance.md",
+            expected=2,
+        )
+        self.assertIn("至少 3 次", blocked["error"])
 
     def test_candidate_requires_three_independent_real_runs(self):
         project = self.init_project()

@@ -386,7 +386,10 @@ def write_initialized_project(destination: Path, args: argparse.Namespace) -> No
 
 
 def command_init(args: argparse.Namespace) -> Dict[str, Any]:
-    target = Path(args.target).expanduser().resolve()
+    target_input = Path(args.target).expanduser()
+    if target_input.is_symlink():
+        raise LoopCtlError(f"拒绝把符号链接作为初始化目标：{target_input}")
+    target = target_input.resolve()
     args.project_name = single_line(args.project_name, "--project-name")
     args.domain_skill = ensure_id(args.domain_skill, "--domain-skill")
     for field, label in (
@@ -505,11 +508,13 @@ def verify_sealed_attempt(attempt: Path) -> List[str]:
             errors.append(f"sealed attempt 文件清单无效：{attempt}")
             continue
         declared[entry["path"]] = str(entry.get("sha256", ""))
-    current = {
-        path.relative_to(attempt).as_posix(): sha256_file(path)
-        for path in sorted(attempt.rglob("*"))
-        if path.is_file() and path.name not in {"manifest.json", ".sealed.json"}
-    }
+    current: Dict[str, str] = {}
+    for path in sorted(attempt.rglob("*")):
+        if path.is_symlink():
+            errors.append(f"sealed attempt 含符号链接：{path}")
+            continue
+        if path.is_file() and path.name not in {"manifest.json", ".sealed.json"}:
+            current[path.relative_to(attempt).as_posix()] = sha256_file(path)
     if set(current) != set(declared):
         errors.append(f"sealed attempt 文件集合已改变：{attempt}")
     for name, digest in declared.items():
@@ -554,6 +559,8 @@ def validate_project(root: Path) -> Dict[str, Any]:
     declared_maturity = maturity.get("declared")
     if declared_maturity not in LEVELS:
         errors.append("maturity.declared 必须是 L0–L5")
+    elif declared_maturity == "L5":
+        errors.append("v0.1 不允许把 L5 声明为 active maturity；L5 只能保留为实验候选")
 
     artifacts = _required_list(system.get("artifacts"), "artifacts", errors)
     artifact_by_id: Dict[str, Dict[str, Any]] = {}
@@ -756,6 +763,41 @@ def validate_project(root: Path) -> Dict[str, Any]:
     if runs_root.is_dir():
         for seal in sorted(runs_root.glob("*/attempts/*/.sealed.json")):
             errors.extend(verify_sealed_attempt(seal.parent))
+
+    active_version = project.get("active_version")
+    if isinstance(active_version, str) and active_version != "baseline-v1":
+        registry_path = root / "creative-system" / "releases" / "registry.json"
+        try:
+            registry = load_json(registry_path)
+            if not isinstance(registry, dict) or registry.get("active_version") != active_version:
+                errors.append("active version 与 release registry 不一致")
+            history = registry.get("history", []) if isinstance(registry, dict) else []
+            receipts = [
+                item
+                for item in history
+                if (
+                    isinstance(item, dict)
+                    and item.get("action") == "promote"
+                    and item.get("state") == "COMMITTED"
+                    and item.get("new_version") == active_version
+                )
+            ]
+            if len(receipts) != 1:
+                errors.append("active version 必须恰好对应一个 COMMITTED 晋升记录")
+            else:
+                receipt = receipts[0]
+                candidate_id = str(receipt.get("candidate_id", ""))
+                candidate_root, proposal, candidate_status = load_candidate(root, candidate_id)
+                if candidate_status.get("status") != "PROMOTED":
+                    errors.append("active candidate 状态不是 PROMOTED")
+                current_hashes = verify_candidate_changes(root, candidate_root, proposal)
+                if current_hashes != receipt.get("candidate_change_hashes"):
+                    errors.append("active candidate changes 哈希与晋升记录不一致")
+                promotion_path = root / "creative-system" / "releases" / active_version / "promotion.json"
+                if not promotion_path.is_file() or load_json(promotion_path) != receipt:
+                    errors.append("active version 的 promotion receipt 缺失或与 registry 不一致")
+        except LoopCtlError as exc:
+            errors.append(str(exc))
 
     if not charter.get("confirmed"):
         warnings.append("创作宪法尚未由使用者确认；只能停在 L0 onboarding")
@@ -1187,6 +1229,8 @@ def command_seal_attempt(args: argparse.Namespace) -> Dict[str, Any]:
 
     file_entries = []
     for path in sorted(attempt_dir.rglob("*")):
+        if path.is_symlink():
+            raise LoopCtlError(f"attempt 不允许包含符号链接：{path}")
         if path.is_file() and path.name not in {"manifest.json", ".sealed.json"}:
             file_entries.append(
                 {"path": path.relative_to(attempt_dir).as_posix(), "sha256": sha256_file(path), "bytes": path.stat().st_size}
@@ -1325,6 +1369,9 @@ def command_create_candidate(args: argparse.Namespace) -> Dict[str, Any]:
 
     system = load_system(root)
     protected = [str(item) for item in system.get("protected_surfaces", [])]
+    editable = {str(item) for item in system.get("editable_surfaces", [])}
+    if level == "L4" and target_component not in editable:
+        raise LoopCtlError(f"当前系统没有开放该 L4 修改面：{target_component}")
     changed_paths = [normalized_change_path(root, value) for value in args.changed_path]
     if not changed_paths:
         raise LoopCtlError("至少提供一个 --changed-path")

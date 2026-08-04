@@ -148,6 +148,16 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("quest-outline", loops["write-quest-dialogue"]["reads"])
         self.assertNotIn("quest-dialogue", loops["maintain-world-rule"]["reads"])
 
+    def test_forward_test_claim_remains_scoped(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        report = (ROOT / "FORWARD_TESTS.md").read_text(encoding="utf-8")
+        self.assertIn("`FORWARD-TESTED`", readme)
+        self.assertIn("8/8", readme)
+        self.assertIn("8/8", report)
+        self.assertIn("UNVALIDATED", report)
+        self.assertIn("三名非程序员", report)
+        self.assertIn("不表示作品质量", report)
+
 
 if __name__ == "__main__":
     unittest.main()

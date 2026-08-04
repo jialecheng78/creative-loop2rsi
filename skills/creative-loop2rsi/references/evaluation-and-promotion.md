@@ -77,6 +77,14 @@ shadow → 与人工判断校准 → WARN → 有污染证据后才可 BLOCK
 
 优先修改最靠近根因的表面。若问题来自错误的上游事实，不要通过润色 Prompt 掩盖；若来自未决审美，不要自动改 Judge。
 
+把候选实际文件放在 `creative-system/candidates/<candidate-id>/changes/`，并按项目相对路径镜像。例如，候选要修改 `skills/my-writer/references/production.md`，则保存为：
+
+```text
+creative-system/candidates/<candidate-id>/changes/skills/my-writer/references/production.md
+```
+
+实际文件必须在 proposal 的 `changed_paths` 中，且不得额外夹带未声明或受保护文件。一个只有提案文字、没有可复核 changes 文件的候选不得晋升。
+
 ## 6. 比较基线与候选
 
 遵守固定顺序：
@@ -127,6 +135,8 @@ L4 候选只有同时满足以下条件才能晋升：
 ```
 
 把实际证据路径和哈希放入完整记录；示意字段不能替代运行证据。
+
+`promote` 不覆盖基线文件，而是保存候选文件哈希、写入晋升记录并原子更新 active version 指针。领域 Skill 运行时应读取 active version：基线时使用基线文件；候选版本时只使用与 `COMMITTED` 晋升记录匹配的 `changes/` 文件。指针、晋升记录或候选哈希不一致时返回 `BLOCK`，不能静默回退或混用版本。
 
 ## 9. 回滚
 

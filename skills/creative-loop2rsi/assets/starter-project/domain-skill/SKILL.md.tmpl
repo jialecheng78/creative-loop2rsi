@@ -9,7 +9,8 @@ description: "为“{{PROJECT_NAME_YAML}}”执行已确认的创作 Loop；在�
 
 1. 读取 `creative-system/creative-charter.md`，确认人的创作边界。
 2. 读取 `creative-system/system.json` 与目标 Loop 规范。
-3. 如果宪法未确认，停止生产并请用户确认。
+3. 读取 `project.active_version`；非基线版本只使用与 `COMMITTED` 晋升记录及哈希一致的候选 `changes/`，不覆盖或混用基线文件。
+4. 如果宪法未确认，或版本指针、晋升记录与候选哈希不一致，停止生产并请用户处理。
 
 ## 执行一轮
 
