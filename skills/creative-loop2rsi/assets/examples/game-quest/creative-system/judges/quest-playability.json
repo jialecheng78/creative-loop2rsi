@@ -1,0 +1,23 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "quest-playability",
+  "type": "model",
+  "mode": "warn",
+  "agent": "quest-playability-reviewer",
+  "rubric": [
+    "两个选择都改变后续行动或角色关系",
+    "玩家能从行动和物件推断信息而非只听解释",
+    "目标、阻碍和完成条件可以由游戏逻辑实现"
+  ],
+  "evidence_requirements": [
+    "world-rule-patch",
+    "quest-outline",
+    "quest-dialogue"
+  ],
+  "calibration": "creative-system/evals/development/playability-calibration.jsonl",
+  "promotion_requirements": [
+    "已完成 shadow 与人工校准",
+    "与人工 PASS/BLOCK 方向一致率不低于 80%"
+  ]
+}

@@ -98,6 +98,11 @@ python3 skills/creative-loop2rsi/scripts/loopctl.py init ./my-creative-project \
   --taste "喜欢克制的幽默和动作细节；不喜欢直接讲大道理" \
   --domain-skill short-story-loop
 
+# 用户明确确认后，先把其原始回复保存到以下 evidence 目录，再执行：
+python3 skills/creative-loop2rsi/scripts/loopctl.py confirm-charter ./my-creative-project \
+  --confirmed-by "project-owner" \
+  --evidence creative-system/approvals/charter-confirmations/evidence/initial-confirmation.md
+
 python3 skills/creative-loop2rsi/scripts/loopctl.py validate ./my-creative-project
 python3 skills/creative-loop2rsi/scripts/loopctl.py audit ./my-creative-project
 ```
@@ -112,15 +117,60 @@ python3 skills/creative-loop2rsi/scripts/loopctl.py --help
 
 | 命令 | 作用 |
 |---|---|
+| `confirm-charter` | 绑定宪法、外部人工确认依据、确认人和时间，生成内容寻址且不可覆盖的立宪 receipt |
+| `measure-artifact` | 由控制器生成文本哈希、字节数和字数等 governing facts；改稿后写到新的 output 时自动串联旧 facts，并推导唯一 active facts |
 | `begin-run` | 为指定 Loop 和任务创建一次可追踪 run |
-| `seal-attempt` | 封存状态、finding 和人工接受结果；封存后不可覆盖 |
-| `create-candidate` | 从多个独立 run 的重复 finding 建立隔离候选 |
+| `open-dispatch` | 为一次 Producer 执行分配唯一 allowed-writes root，隔离迟到写入 |
+| `record-dispatch-stall` | 记录精确零文件 stall；只消耗 runtime budget，不算内容 attempt |
+| `open-human-review` | 在人工反馈前冻结成品清单、active facts 的路径/哈希/字节数及机器方向，生成 `HumanReviewSubject` 和独立 open anchor |
+| `seal-attempt` | 封存状态、finding 和人工反馈 receipt；人工声明必须引用先于反馈冻结的送审版本，封存后不可覆盖 |
+| `create-candidate` | 从多个独立 run 的重复 finding 建立隔离候选，冻结 Builder receipt、安全 input boundary、本地可证的 Producer context 和只能外部作证的 Producer task |
+| `open-eval-run` / `seal-eval-run` | 写独立 no-clobber `EvalRunOpenAnchor`，绑定 preflight、evaluator receipt、`candidate_change_hashes`、预算序号、空输出根与封存哈希 |
+| `block-candidate` | 为最终失格候选写不可覆盖的 block-seal；后续只能新建候选 |
 | `promote` | 检查目标、回归、held-out 和人工批准证据后晋升 L4 候选 |
 | `rollback` | 恢复上一稳定版本，但保留所有历史证据 |
 
+人工认可的固定顺序是 `produce / evaluate / measure → open-human-review → 用户反馈 → seal-attempt`。机械计量发现问题时，先改稿，再把同一 source 测到新的 facts output；控制器会保留旧 facts、验哈并自动选择唯一 active facts，不要删除历史。先写“用户认可”、后补作品会被拒绝；送审后作品、active facts 或机器方向发生变化时，旧反馈也不能用于新版本。
+
+`role/context/task` 的真实性来自 Codex 任务记录或其他外部执行系统。本地控制器可从 dispatch 证据冻结 finding 来源 Producer context，但 Producer task 只能标为 `external-attestation-required`。控制器只冻结 attestation、检查所有已知 Producer/Builder/evaluator/attester 身份冲突并持续验哈，不能认证字符串背后是否真是独立的人或 Agent。没有外部任务回执时，L4 独立评价条件不成立。
+
+Builder receipt 必须显式声明 `finding-evidence / creative-charter / editable-surface / system-contract / evaluation-policy` 五类安全输入，且拒绝 `heldout-input / heldout-answer / mapping-table / producer-reasoning / version-identity`：
+
+```bash
+python3 skills/creative-loop2rsi/scripts/loopctl.py create-candidate ./my-creative-project \
+  --candidate-id pace-fix-v2 \
+  --finding-code PACE-MIDDLE-STALL \
+  --root-cause "中段提示缺少可观察的行动升级" \
+  --target-component prompts \
+  --change-summary "只改中段行动升级提示" \
+  --changed-path skills/short-story-loop/references/production.md \
+  --budget 3 \
+  --builder-role-id candidate-builder \
+  --builder-context-id <external-context-id> \
+  --builder-task-id <external-task-id> \
+  --builder-attested-by <orchestrator-id> \
+  --builder-input-boundary finding-evidence \
+  --builder-input-boundary creative-charter \
+  --builder-input-boundary editable-surface \
+  --builder-input-boundary system-contract \
+  --builder-input-boundary evaluation-policy
+```
+
+v0.1 的 L4 采用 `selection-safe exact-three`：每个候选只允许 targeted、regression、held-out 各写一个 `EvalRunOpenAnchor`，三条全部封存且与晋升 JSON 精确对应。任一已开启 run 失败后必须建 successor candidate，不能在同一候选内补跑或挑最好结果。
+
+晋升证据一旦明确报告 `FAIL / WORSE / hard regression / STALE_OUTPUT_CONTAMINATION / fresh-root failure`，控制器立即写不可覆盖的 candidate block-seal。之后把同一评价 JSON 改成 PASS 只会触发证据篡改，不能洗白当前候选。
+
+seal 期间输出、preflight、receipt、anchor 或候选字节发生变化时，控制器写入 `EVAL_CHANGED_DURING_SEAL` 永久 `TerminalEvalIncident`；清理迟到文件也不能恢复。sealed eval output 对包括 `measure-artifact` 在内的控制器也永久只读。新 eval run 发现 prior-run output 时写 `STALE_OUTPUT_CONTAMINATION`，整轮失效并建 successor candidate，禁止保留其他新输出继续晋升。
+
+`evaluations/`、`control/`、anchor、terminal marker 与 eval run 路径都拒绝 symlink；terminal-invalid output 与 sealed output 同样进入控制器只读状态，不能再写 facts 掩盖现场。
+
+对已开启 run 调用 `seal-eval-run` 时若输出精确为空，会写永久 `EVAL_EMPTY_OUTPUT`；之后补写文件也不能在同一候选重试。
+
 当用户要求“先做到 L4，再自动迭代 N 轮”时，前置校准 run 不计入 N。`begin-run` 会把 run 开始时的 active version、可证明成熟度和 `bootstrap / post-l4` 阶段写入封存证据；只有 `audit` 已证明 L4 后开始的 `post-l4` run 才能计数。完整路线见 Skill 的 `references/end-to-end-pilot.md`。
 
-`--charter-confirmed` 只应在使用者已经看过并明确确认创作宪法时传入。不要为了跳过 L0 而默认添加它。
+默认使用 `init → 用户看立宪 → confirm-charter` 两步流程。裸 `--charter-confirmed` 会 fail closed；只有已经存在外部人工确认依据，并同时提供 `--charter-confirmed-by / --charter-confirmation-evidence` 时才可一步初始化。不要为了跳过 L0 伪造依据或代签。
+
+所有写命令共用一个项目级 mutation lock；`creative-system/control`、run、candidate、eval、release 与 transaction 路径都拒绝项目内 symlink。`promote` 与 `rollback` 都先冻结可恢复事务 intent，再写正式 release/receipt，并按 before/after 哈希 roll-forward candidate、registry 与 system，最后写 commit marker。中途崩溃时 `validate` 返回 `PENDING_CONTROLLER_TRANSACTION`；只有与原 candidate、目标版本、批准人和评价哈希一致的 promote 重试，或 reason/evidence 一致的 rollback 重试才能恢复。任一目标出现第三哈希时返回 `TRANSACTION_DIVERGED`，不会覆盖外部改动。
 
 ## 生成的项目
 
@@ -132,6 +182,8 @@ my-creative-project/
 ├── creative-system/
 │   ├── creative-charter.md
 │   ├── system.json
+│   ├── approvals/             # raw 人工消息默认本地忽略；receipt/ledger 可追踪
+│   ├── control/               # 项目级 mutation lock 与可恢复事务
 │   ├── loops/
 │   ├── judges/
 │   ├── evals/development/
@@ -146,14 +198,14 @@ my-creative-project/
     └── references/
 ```
 
-用户输入、输出和运行轨迹默认加入生成项目的 `.gitignore`。候选定义、晋升记录和经过脱敏的评估证据可以按需版本化。不要把未发表作品放进本仓库的 issue、测试或示例。
+用户输入、输出、运行轨迹和人工确认原文默认加入生成项目的 `.gitignore`，空目录用 `.gitkeep` 保证 clone 后仍可验证。内容寻址 receipt 与 ledger 会进入 Git；clone 缺少本地原文时 `validate` 返回 `PASS` 和 `LOCAL_CONFIRMATION_EVIDENCE_UNAVAILABLE`，恢复相同原文会清除 warning，出现同路径改写、目录或符号链接仍会 `BLOCK`。不要把未发表作品放进本仓库的 issue、测试或示例。
 
 ## 从 Loop 到 RSI 的成熟度
 
 | 等级 | 公开名称 | 系统新增能力 | 晋升时最关键的证据 |
 |---|---|---|---|
-| L0 | 创作立宪 | 明确受众、最小成品、保留项、禁区、偏好和人的最终决定权 | 用户确认创作宪法 |
-| L1 | 单创作 Loop | `produce -> evaluate -> decide -> revise/commit` | 代表任务可停止、失败可定位，至少 3 次试跑中 2 次获用户认可 |
+| L0 | 创作立宪 | 明确受众、最小成品、保留项、禁区、偏好和人的最终决定权 | 内容寻址的 `CharterConfirmation` 与外部用户确认依据 |
+| L1 | 单创作 Loop | `produce -> evaluate -> decide -> revise/commit` | 代表任务可停止、失败可定位，至少 3 次试跑中 2 次具有人工反馈 receipt 的认可 |
 | L2 | 可靠有状态 Loop | Producer/Judge 分离、不可变 attempt、finding、记忆、局部恢复和发布门 | 至少 5 个样本；硬合同无假通过；人机方向一致率默认不低于 80% |
 | L3 | 嵌套多 Loop 系统 | 多 Loop 共享状态和证据，产物有唯一 owner，支持局部失效 | 局部重跑不破坏已确认上游，端到端不低于 L2 基线 |
 | L4 | 可验证自我改进系统 | 从重复 finding 形成隔离候选，执行目标集、回归集和 held-out 比较 | 至少 3 次真实 run；无硬退化；held-out 不劣于基线；人工批准 |
@@ -186,7 +238,7 @@ L4 的固定路径是：
 - `loopctl.py` 使用 Python 标准库并且不访问网络；CI 也不需要模型密钥。
 - 生成项目中的 `inputs/`、`outputs/`、`creative-system/runs/` 和未发表素材默认不入库。
 - 哈希用于发现 attempt 被改写，不是加密、访问控制或恶意攻击防护。
-- `approved_by` 只记录谁被声明为批准人，不验证现实身份；高风险使用应接入仓库外的审批与权限系统，再把只读回执作为证据。
+- `confirmed_by / feedback_by / approved_by` 只记录谁被外部声明为确认者，不验证现实身份。控制器会绑定证据、时间、对象和哈希，并固定写出 `external-attestation-not-controller-verified`；高风险使用应接入仓库外的审批与权限系统，再把只读回执作为证据。
 - Skill 和控制器不是操作系统沙箱。运行前仍应核对目标目录，不要把敏感素材复制进公开仓库。
 - 候选不会自动发布，也不能绕过人工晋升。
 

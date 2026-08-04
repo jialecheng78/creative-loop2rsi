@@ -1,7 +1,16 @@
 # 未发表输入、创作输出与运行轨迹
-inputs/
-outputs/
-creative-system/runs/
+/inputs/*
+!/inputs/.gitkeep
+/outputs/*
+!/outputs/.gitkeep
+/creative-system/runs/*
+!/creative-system/runs/.gitkeep
+
+# 原始人工消息只保留本地；相邻的结构化 receipt 与 ledger 继续纳入版本控制
+/creative-system/approvals/charter-confirmations/evidence/*
+!/creative-system/approvals/charter-confirmations/evidence/.gitkeep
+/creative-system/approvals/attempt-feedback/*
+!/creative-system/approvals/attempt-feedback/.gitkeep
 
 # 本地临时文件与秘密
 .env

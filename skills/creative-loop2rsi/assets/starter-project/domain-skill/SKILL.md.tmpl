@@ -10,20 +10,30 @@ description: "为“{{PROJECT_NAME_YAML}}”执行已确认的创作 Loop；在�
 1. 读取 `creative-system/creative-charter.md`，确认人的创作边界。
 2. 读取 `creative-system/system.json` 与目标 Loop 规范。
 3. 读取 `project.active_version`；非基线版本只使用与 `COMMITTED` 晋升记录及哈希一致的候选 `changes/`，不覆盖或混用基线文件。
-4. 如果宪法未确认，或版本指针、晋升记录与候选哈希不一致，停止生产并请用户处理。
+4. 如果宪法没有通过内容寻址确认 receipt 的校验，或版本指针、晋升记录与候选哈希不一致，停止生产并请用户处理。不得通过手改 `confirmed=true` 解锁。
 
 ## 执行一轮
 
-1. 根据 Loop 的 `reads` 取得输入，只让 Producer 生成目标产物。
-2. 让独立 Judge 按硬合同、软质量和人类立宪分别评价。
-3. 将每个判断绑定到可检查证据；无法判断核心审美时返回 `NEEDS_TASTE`。
-4. 依据 `decision_policy` 决定提交、局部修订或停止，不超过 `retry_budget`。
-5. 把产物、评价和 finding 写入当前 attempt，再封存；不要覆盖已封存 attempt。
+1. 根据 Loop 的 `reads` 取得输入；控制器先用 `open-dispatch` 冻结 allowed-writes，并为本次 Producer 分配新输出根。
+2. Producer 只写内容；控制器随后用 `measure-artifact` 把绑定 selected artifact 的 facts 写入 attempt `controller-facts/`。Producer 的机械字段自报不具治理权。
+3. 精确零文件时记录 `ZERO_FILE_DISPATCH_STALL`：只消耗 `runtime_dispatch_budget`，不启动 Judge，也不推进 content attempt、revision 或 no-improvement；下一次 dispatch 必须使用新输出根。
+4. 出现至少一个普通文件后才进入内容 attempt，让独立 Judge 按硬合同、软质量和人类立宪分别评价。
+5. 将每个判断绑定到可检查证据；无法判断核心审美时返回 `NEEDS_TASTE`。
+6. 依据 `decision_policy` 决定提交、局部修订或停止，不超过内容 `retry_budget`。
+7. 把产物、评价和 finding 写入当前 attempt；运行 `open-human-review` 冻结 `HumanReviewSubject / HumanReviewOpenAnchor` 与机器方向，再把冻结版本交给用户。只有用户反馈真实发生后，才逐字保存依据并用 `HumanFeedbackReceipt` 绑定 subject、`feedback_by / feedback_at / claims / evidence hash` 后封存；不得代签或事后对齐机器方向。不要覆盖已封存 attempt。`provisional-audit` 与最终 `block-seal` 分开；只有最终失格才运行 `block-candidate`，同 scope 的最终封印不能被后写 PASS 覆盖。
 
 ## 学习边界
 
 - 只有跨真实运行重复出现的 finding 才能生成隔离候选。
 - 候选通过目标评估、回归、held-out 盲评和人工批准前，不得替换当前版本。
+- 建候选时保存 Builder execution receipt；其 `input_boundary` 必须包含 `finding-evidence / creative-charter / editable-surface / system-contract / evaluation-policy`，禁止 `heldout-input / heldout-answer / mapping-table / producer-reasoning / version-identity`。
+- 从本地 dispatch 证据冻结来源 Producer context；Producer task 只能标记 `external-attestation-required`。本地控制器不认证 Agent 身份；独立性必须能回查外部任务记录。
+- target、regression、held-out 分别用 `open-eval-run` 写独立 no-clobber `EvalRunOpenAnchor`，绑定 preflight、execution receipt、`candidate_change_hashes`、`evaluation_run_index / max_evaluation_runs` 和 fresh empty root。已知 Producer/Builder/evaluator/attester 身份冲突时拒绝。
+- v0.1 使用 `selection-safe exact-three`：三个 phase 每候选各开一次，全部用 `seal-eval-run` 封存且与晋升 JSON 精确等集。任一已开启 run 失败就建 successor candidate，不得同候选补跑。
+- 晋升证据明确报告失败、退化、污染或 fresh-root failure 时，立即写不可覆盖的 candidate block-seal；不得后改 JSON 洗白。
+- seal 期间变化写 `EVAL_CHANGED_DURING_SEAL` 永久 `TerminalEvalIncident`；sealed eval output 对包括 `measure-artifact` 在内的控制器永久只读。出现 `STALE_OUTPUT_CONTAMINATION` 时整轮失效并建 successor candidate，不得保留其他新输出继续晋升。
+- eval 控制面与 run 路径拒绝 symlink；terminal-invalid output 和 sealed output 都对控制器永久只读。
+- eval seal 时精确零输出或清单非法会写永久 `EVAL_EMPTY_OUTPUT / EVAL_OUTPUT_INVALID`；不得补写后重封。
 - 不修改创作宪法、原始素材、held-out 答案、晋升政策或人工审批边界。
 - L5 候选始终保持实验状态。
 

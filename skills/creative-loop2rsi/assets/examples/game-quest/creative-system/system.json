@@ -1,0 +1,135 @@
+{
+  "schema_version": "0.1",
+  "kind": "CreativeSystem",
+  "project": {
+    "id": "tide-post-office-quest",
+    "name": "潮汐邮局游戏任务",
+    "domain_skill": "gentle-mystery-quest",
+    "active_version": "baseline-v1"
+  },
+  "charter": {
+    "path": "creative-system/creative-charter.md",
+    "confirmed": false,
+    "confirmed_by": null,
+    "confirmed_at": null,
+    "confirmation_receipt": null,
+    "confirmation_receipt_sha256": null
+  },
+  "maturity": {
+    "declared": "L3",
+    "evidence": []
+  },
+  "loops": [
+    "creative-system/loops/maintain-world-rule.json",
+    "creative-system/loops/design-quest-structure.json",
+    "creative-system/loops/write-quest-dialogue.json"
+  ],
+  "artifacts": [
+    {
+      "id": "quest-brief",
+      "path": "inputs/quest-brief.md",
+      "owner": "human-narrative-designer",
+      "kind": "input",
+      "protected": true
+    },
+    {
+      "id": "world-rule-patch",
+      "path": "outputs/world-rule-patch.md",
+      "owner": "world-rule-producer",
+      "kind": "intermediate",
+      "protected": false
+    },
+    {
+      "id": "quest-outline",
+      "path": "outputs/quest-outline.md",
+      "owner": "quest-structure-producer",
+      "kind": "intermediate",
+      "protected": false
+    },
+    {
+      "id": "quest-dialogue",
+      "path": "outputs/quest-dialogue.md",
+      "owner": "dialogue-producer",
+      "kind": "output",
+      "protected": false
+    }
+  ],
+  "judges": [
+    "creative-system/judges/world-consistency.json",
+    "creative-system/judges/quest-playability.json",
+    "creative-system/judges/quest-taste-gate.json"
+  ],
+  "memory": {
+    "partitions": [
+      {
+        "id": "confirmed-facts",
+        "writer": "human-narrative-designer",
+        "path": "creative-system/memory/confirmed-facts.jsonl"
+      },
+      {
+        "id": "confirmed-preferences",
+        "writer": "human-narrative-designer",
+        "path": "creative-system/memory/confirmed-preferences.jsonl"
+      },
+      {
+        "id": "run-lessons",
+        "writer": "quest-reviewer",
+        "path": "creative-system/memory/run-lessons.jsonl"
+      },
+      {
+        "id": "finding-index",
+        "writer": "loopctl",
+        "path": "creative-system/memory/finding-index.jsonl"
+      }
+    ]
+  },
+  "recovery_policy": {
+    "max_attempts": 3,
+    "stop_after_no_improvement": 2,
+    "automatic_actions": [
+      "retry-runtime-failure",
+      "deterministic-nonsemantic-repair",
+      "rerun-responsible-loop",
+      "invalidate-dependent-artifacts"
+    ],
+    "runtime_dispatch_budget": {
+      "max_zero_file_stalls": 2,
+      "on_exhausted": "escalate",
+      "zero_output_consumes_content_attempt": false
+    },
+    "mechanical_evidence": {
+      "governing_source": "loopctl.py measure-artifact",
+      "producer_self_report": "non-governing"
+    }
+  },
+  "learning_policy": {
+    "minimum_independent_runs": 3,
+    "candidate_isolation_required": true,
+    "heldout_blind_required": true
+  },
+  "promotion_policy": {
+    "human_approval_required": true,
+    "l5_auto_promotion": false
+  },
+  "protected_surfaces": [
+    "creative-system/creative-charter.md",
+    "creative-system/approvals/",
+    "inputs/",
+    "creative-system/evals/heldout/",
+    "LICENSE",
+    "promotion-policy",
+    "human-approval-boundary"
+  ],
+  "editable_surfaces": [
+    "prompts",
+    "context",
+    "loop-graph",
+    "memory-policy",
+    "recovery-policy"
+  ],
+  "statuses": {
+    "execution_status": "NOT_STARTED",
+    "quality_status": "NOT_EVALUATED",
+    "release_status": "NOT_READY"
+  }
+}

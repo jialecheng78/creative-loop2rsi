@@ -57,7 +57,7 @@ Prompt 工程可以改善 Producer 或 Judge，但只有四层共同存在，才
 
 - `creative-charter.md` 已覆盖五项 onboarding 输入；
 - 受保护项和可探索空间没有冲突；
-- 用户明确确认，而非系统自行推断为已确认。
+- 用户明确确认，并有绑定宪法与原始回复哈希的 `CharterConfirmation`；全部确认进入哈希链 ledger，不是系统自行推断或手改 boolean。
 
 常见假通过：有一份文体 Prompt，却没有最小成品、禁止项或人的决定权。
 
@@ -68,7 +68,7 @@ Prompt 工程可以改善 Producer 或 Judge，但只有四层共同存在，才
 晋升证据：
 
 - 至少三条代表任务有完整运行记录；
-- 至少两条获得用户认可；
+- 至少两条获得用户认可，且每条都先冻结 `HumanReviewSubject / HumanReviewOpenAnchor`，再由 attempt 内可验证的 `HumanFeedbackReceipt` 绑定外部反馈依据；
 - 失败能定位到当前 Loop；
 - 达到预算或连续两次无改善时能够停止。
 

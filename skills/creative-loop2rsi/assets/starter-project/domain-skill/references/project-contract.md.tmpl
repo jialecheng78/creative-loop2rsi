@@ -8,11 +8,49 @@
 
 结构或格式 `PASS` 不代表创作质量通过。遇到人类审美分歧时使用 `NEEDS_TASTE`。
 
+立宪确认以哈希链 ledger 中的 `CharterConfirmation` receipt 为机器事实源，`system.json` 中的 boolean 只是经验证镜像。人工认可或方向必须先冻结 `HumanReviewSubject / HumanReviewOpenAnchor` 和机器方向，再以 attempt 内的 `HumanFeedbackReceipt` 为事实源；裸 `human_accepted / human_direction` 不计入成熟度。两类 receipt 都声明 `identity_authentication=external-attestation-not-controller-verified`：控制器验证内容、时间、对象和哈希，真人身份仍需回查外部用户消息。
+
 ## Loop 顺序
 
 `produce → evaluate → decide → revise/commit`
 
 每个 Loop 只能写自己负责的产物。Judge 不读取 Producer 的隐藏推理或候选修改意图。达到预算或连续两次没有改善时停止。
+
+## 机械证据与运行恢复
+
+### Controller authority
+
+使用 `loopctl.py measure-artifact` 生成 governing facts；facts 只能写 attempt `controller-facts/`，source 必须属于本次 selected artifact，禁止进入 Producer root 或修改 sealed attempt。`producer_self_report_governing=false`。Controller facts 不替代 Judge 的创作质量判断。
+
+### Exact zero-file
+
+`ZERO_FILE_DISPATCH_STALL` 只在独立 Producer-owned allowed-writes root 内普通文件精确为 0 时成立；控制记录不计，0-byte 文件算 1 个内容文件。stall 使用独立 `runtime_dispatch_budget`，不算 content attempt、revision、no-improvement 或改善；已 stall 目录晚写会使 attempt 失效。
+
+### Seal monotonicity
+
+`provisional-audit` 不是 seal。最终状态只允许 `OPEN → BLOCK_SEALED`；最终失格时用 `block-candidate` 写封印。同一 scope 的 `block-seal` 不得由后写 PASS 或 last-write-wins 解封，继续时使用新 candidate/run id。
+
+### Human review ordering
+
+固定顺序是 `produce/evaluate/measure → open-human-review → 用户看冻结版本并反馈 → seal-attempt`。`review_available_at` 必须不晚于 `feedback_at`；送审后成品、Controller facts 或机器方向改变时，旧反馈失效。
+
+### Controller transaction
+
+全部 mutation 共用项目级 OS lock，控制路径逐组件拒绝 symlink。rollback 先写 `ControllerTransactionIntent`；缺少 commit marker 时 `validate` 返回 `PENDING_CONTROLLER_TRANSACTION`，只能用相同 reason/evidence roll-forward。
+
+### Selection-safe eval
+
+Builder execution receipt 的 `input_boundary` 必须包含 `finding-evidence / creative-charter / editable-surface / system-contract / evaluation-policy`，拒绝 `heldout-input / heldout-answer / mapping-table / producer-reasoning / version-identity`。候选可从本地 dispatch 证据冻结 Producer context；Producer task 只能写 `external-attestation-required`，身份真实性由外部任务记录证明。
+
+targeted、regression、held-out 分别用 `open-eval-run` 写独立 no-clobber `EvalRunOpenAnchor`，绑定 preflight、execution receipt、`candidate_change_hashes`、`evaluation_run_index / max_evaluation_runs` 和 controller-verified fresh empty root。已知 Producer/Builder/evaluator/attester 身份冲突时拒绝。
+
+v0.1 使用 `selection-safe exact-three`：三个 phase 每候选各开一次、全部用 `seal-eval-run` 封存并与晋升 JSON 精确等集。任一已开启 run 失败就建 successor candidate，不得同候选补跑或挑选。seal 期间变化写 `EVAL_CHANGED_DURING_SEAL` 永久 `TerminalEvalIncident`；sealed eval output 对包括 `measure-artifact` 在内的控制器永久只读。混入 prior-run output 即 `STALE_OUTPUT_CONTAMINATION`，整轮失效并建 successor candidate，禁止保留其他新输出继续晋升。
+
+晋升证据明确报告失败、退化、污染或 fresh-root failure 时，控制器立即写不可覆盖的 candidate block-seal。之后改同一 JSON 为 PASS 只构成证据篡改，不能恢复当前候选。
+
+eval 控制面与 run 路径拒绝 symlink；terminal-invalid output 和 sealed output 都只允许控制器复核，不允许继续写入。
+
+eval seal 时精确零输出或清单非法会写永久 `EVAL_EMPTY_OUTPUT / EVAL_OUTPUT_INVALID`。该 phase 已消耗，必须建立 successor candidate，不得补写后重封。
 
 ## 晋升门
 

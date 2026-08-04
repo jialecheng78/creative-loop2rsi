@@ -12,8 +12,30 @@
 ## 第一次运行
 
 1. 阅读并确认 `creative-system/creative-charter.md`。
-2. 如果初始化时没有确认，把 `creative-system/system.json` 中 `charter.confirmed` 改为 `true`，并填写 `confirmed_by`。
-3. 运行 `loopctl.py validate <项目目录>`。
-4. 运行 `loopctl.py audit <项目目录>`，只处理它指出的最小下一步。
+2. 只有在使用者本轮明确回复确认后，才把该回复逐字保存到 `creative-system/approvals/charter-confirmations/evidence/`，再运行 `confirm-charter`。不要手改 `system.json` 的 boolean，也不要由 Agent 推断或代签。
+3. 运行 `validate` 与 `audit`，只处理审计指出的最小下一步。
+4. 每个需要人工判断的结果先运行 `open-human-review` 冻结成品与机器方向；把该版本交给用户后，才保存反馈并运行 `seal-attempt`。
 
-`inputs/`、`outputs/` 与 `creative-system/runs/` 默认不进入 Git。不要把未发表作品、运行轨迹或个人信息提交到公开仓库。
+如果 Builder Skill 已安装到个人 Skill 目录，在本项目根目录可以直接运行：
+
+```bash
+python3 "$HOME/.codex/skills/creative-loop2rsi/scripts/loopctl.py" validate .
+python3 "$HOME/.codex/skills/creative-loop2rsi/scripts/loopctl.py" audit .
+```
+
+如果使用 Git checkout，则从 `creative-loop2rsi` 仓库根目录运行：
+
+```bash
+python3 skills/creative-loop2rsi/scripts/loopctl.py validate /absolute/path/to/this-project
+python3 skills/creative-loop2rsi/scripts/loopctl.py audit /absolute/path/to/this-project
+```
+
+立宪确认命令由 Skill 在用户明确确认后代为执行；其中 evidence 必须是项目内相对路径：
+
+```bash
+python3 "$HOME/.codex/skills/creative-loop2rsi/scripts/loopctl.py" confirm-charter . \
+  --confirmed-by "<stable-human-label>" \
+  --evidence creative-system/approvals/charter-confirmations/evidence/initial-confirmation.md
+```
+
+`inputs/`、`outputs/`、`creative-system/runs/` 与 approvals 下的原始人工消息默认不进入 Git；`.gitkeep` 保留 clone 后所需目录，内容寻址 receipt 和确认 ledger 保留可追踪。clone 缺少本地确认原文时，`validate` 会 `PASS` 并给出 `LOCAL_CONFIRMATION_EVIDENCE_UNAVAILABLE`；这只证明账本记录的摘要，原文需另行归档。恢复相同原文会清除 warning，改写或用目录、符号链接占位仍会 `BLOCK`。

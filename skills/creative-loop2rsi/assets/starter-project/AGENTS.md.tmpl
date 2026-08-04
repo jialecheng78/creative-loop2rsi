@@ -7,6 +7,8 @@
 ## 决策边界
 
 - `creative-system/creative-charter.md` 是最高层创作约束，只有人可以确认或修改。
+- Agent 只能逐字记录当前会话中已经发生的用户确认或反馈；不得从偏好、历史行为、继续运行请求或目标推断确认，不得自行创建认可结论。
+- 立宪确认必须通过 `confirm-charter` 绑定内容寻址 receipt 与哈希链 ledger；人工 acceptance/direction 必须先以 `open-human-review` 冻结 `HumanReviewSubject / HumanReviewOpenAnchor` 和机器方向，再在封存前绑定 `HumanFeedbackReceipt`。本地控制器只验哈，不认证字符串背后的真人身份。
 - 机器无法从证据判断核心审美时，返回 `NEEDS_TASTE`，不得代替人决定。
 - 候选只能在 `creative-system/candidates/` 内隔离生成；通过目标评估、回归、held-out 盲评与人工批准前，不得成为当前版本。
 - L5 只用于实验，任何 L5 候选都不得由工具晋升。
@@ -16,9 +18,21 @@
 - `inputs/`、`outputs/`、`creative-system/runs/` 保存本地创作资料和运行证据，默认不提交 Git。
 - 不在项目中保存 API key、密码、访问令牌或第三方未授权内容。
 - 已封存的 attempt 不得覆盖；需要修正时开启新 attempt。
+- 哈希、字节数、字数和行数由 `loopctl.py measure-artifact` 生成；facts 只能写当前 attempt 的 `controller-facts/` 并绑定 selected artifact，Producer 自报值不覆盖控制器 facts。
+- `ZERO_FILE_DISPATCH_STALL` 只指独立 Producer-owned allowed-writes root 内普通文件精确为 0；0-byte 文件算 1 个内容文件。stall 只消耗 `runtime_dispatch_budget`，不增加 content attempt、revision 或 no-improvement；已 stall 目录晚写会使 attempt 失效。
+- 过程审计只能写 `provisional-audit`，不得命名为 `block-seal`；最终 block-seal 一旦写入，同一 scope 不得用后写 PASS 解封。
 
 ## 运行习惯
 
 - 修改 Loop 或 Judge 后先运行 `validate`。
-- 每轮先记录产物和 finding，再 `seal-attempt`。
+- 每轮先记录产物、finding、机械 facts 和机器判断，运行 `open-human-review` 后把冻结版本交给用户；收到反馈再 `seal-attempt`。人工声明必须绑定先行 subject/anchor，并提供 `--human-feedback-by / --human-feedback-at / --human-feedback-evidence`，不得只写裸布尔或事后改机器方向。
+- 全部 mutation 共用项目级 OS lock；run/control/candidate/release/transaction 路径拒绝 symlink。rollback 的 pending transaction 只能用相同参数 roll-forward。
+- Builder receipt 的 `input_boundary` 必须包含 `finding-evidence / creative-charter / editable-surface / system-contract / evaluation-policy`，禁止 `heldout-input / heldout-answer / mapping-table / producer-reasoning / version-identity`。
+- 候选可从本地 dispatch 证据冻结 Producer context；Producer task 只能写 `external-attestation-required`。execution id 真实性由 Codex 任务或其他外部系统证明；控制器不替外部身份背书。
+- 每个 eval run 必须写独立 no-clobber `EvalRunOpenAnchor`，绑定 preflight、receipt、`candidate_change_hashes` 和 `evaluation_run_index / max_evaluation_runs`。已知 Producer/Builder/evaluator/attester 身份冲突时拒绝。
+- v0.1 采用 `selection-safe exact-three`：targeted、regression、held-out 每候选各一次并全部 sealed；任一失败必须建 successor candidate，禁止同候选补跑或挑选。
+- 晋升证据明确报告失败、退化、污染或 fresh-root failure 时，立即写不可覆盖的 candidate block-seal；不得后改 JSON 洗白。
+- seal 期间任何变化写 `EVAL_CHANGED_DURING_SEAL` 永久 `TerminalEvalIncident`。sealed eval output 对控制器也永久只读；混入 prior-run output 即 `STALE_OUTPUT_CONTAMINATION`，整轮失效并建 successor candidate。
+- eval 控制面与 run 路径拒绝 symlink；terminal-invalid output 和 sealed output 都对控制器永久只读。
+- eval seal 时精确零输出或清单非法会写永久 `EVAL_EMPTY_OUTPUT / EVAL_OUTPUT_INVALID`；不得补写后重封。
 - 每次只根据真实重复 finding 创建候选，不因为一次偶然低分改系统。

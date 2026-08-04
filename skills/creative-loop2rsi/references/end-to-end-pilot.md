@@ -41,16 +41,17 @@
 - 收集五项自然语言输入；
 - 展示立宪摘要和受保护表面；
 - 等用户明确确认；
-- 初始化项目并运行 `validate / audit`。
+- 默认先初始化未确认项目，把用户当前确认回复逐字保存到 `creative-system/approvals/charter-confirmations/evidence/`，再用 `confirm-charter` 生成内容寻址 receipt；
+- 运行 `validate / audit`。不得手改 boolean 或从“继续运行”推断确认。
 
 ### B. L1：尽早建立人工认可
 
 - 选择三个规模小、彼此不同、但能代表目标方向的完整任务；
 - 每个任务都运行真实 produce → evaluate → decide；
 - 在三个结果齐全后暂停，给用户一个批量对比包；
-- 请用户逐项给 `认可 / 不认可 / 需要调整审美`，至少两个明确认可后再封存相应人工方向证据。
+- 每个代表结果完成 Producer、Judge 与机械计数后先运行 `open-human-review`，冻结送审版本和机器方向；再请用户逐项给 `认可 / 不认可 / 需要调整审美`，至少两个明确认可后封存相应人工方向证据。
 
-不要先完成整部长篇或全部 N 轮，最后才询问是否认可。用户认可必须发生在对应 run 封存前；封存后不得补写或代签。
+不要先完成整部长篇或全部 N 轮，最后才询问是否认可。固定顺序是 `produce/evaluate/measure → open-human-review → 展示冻结版本 → 用户反馈 → seal-attempt`。把原始反馈逐字放入 `creative-system/approvals/attempt-feedback/`，用 `HumanFeedbackReceipt` 绑定 by/at/claims/evidence snapshot 与先行 subject/anchor 后再封存。反馈不得早于 `review_available_at`；封存后不得补写或代签，送审后改稿必须重新走新 attempt。
 
 ### C. L2：校准真正独立的 Judge
 
@@ -72,7 +73,8 @@
 
 - 只从至少三次独立真实 run 的重复 finding 创建候选；
 - 写出实际 `changes/` 文件，不只写提案；
-- 锁定 target、regression 和 held-out，再运行候选；
+- Builder receipt 显式锁定 `finding-evidence / creative-charter / editable-surface / system-contract / evaluation-policy` 五类输入，禁止 `heldout-input / heldout-answer / mapping-table / producer-reasoning / version-identity`；
+- 锁定 target、regression 和 held-out，用 `selection-safe exact-three` 每类恰好开启一次；
 - 由未参与候选生成的独立评价者完成盲比；
 - 把四门结果和回滚点展示给用户；
 - 只有用户明确批准范围后执行 `promote`；
@@ -101,6 +103,8 @@ active_version_at_start = <已晋升版本>
 
 每次最多展示三个可比较选项和直接证据路径。用户说“继续自动跑”不等于授权系统代签人工评价；到门点仍要暂停。
 
+两类人工 receipt 都写 `identity_authentication=external-attestation-not-controller-verified`。这不是免责占位符：控制器只能验证依据、时间、对象和哈希，维护者必须能从 Codex 用户消息或外部审批记录回查确认者；没有外部反馈就保持 `NEEDS_TASTE`，不得生成格式正确但事实虚假的 receipt。
+
 ## 5. 真实独立评价
 
 JSON 中写不同 `agent` 名称只是合同，不是执行证据。
@@ -110,10 +114,21 @@ Codex 能启动 subagent 或新任务时：
 - 为 Producer、Judge、held-out evaluator 使用不同执行上下文；
 - Judge 只读取立宪、rubric、候选作品和必要事实，不读取 Producer 推理、修改意图或版本身份；
 - held-out evaluator 不读取答案、候选 proposal 或映射表；
-- 保存 evaluator 的 task/thread id、输入边界、输出路径和时间；
+- 建候选时保存 Builder role/context/task、外部 attestation 和显式 `input_boundary`；安全必需集合为 `finding-evidence / creative-charter / editable-surface / system-contract / evaluation-policy`，不得夹带 held-out、Producer reasoning 或 version identity；
+- 候选可从本地 dispatch 记录冻结 finding 来源 Producer context；Producer task 只能标为 `external-attestation-required`，控制器不冒充已验证该 task 或身份真实性；
+- 已知 Producer、Builder、evaluator、attester 的 role/context/task 出现禁止重合时立即拒绝；每个 evaluator 保存不同的外部 role/context/task、attester、输入边界、输出路径和时间；
+- 用 `measure-artifact` 生成哈希、字节数和文本计数；Producer 的同名自报字段不作为 governing evidence；
+- 用 `open-dispatch` 为每个执行上下文分配唯一 allowed-writes root；精确零文件时用 `record-dispatch-stall`，不推进内容 attempt；
+- target、regression、held-out 分别用 `open-eval-run` 写入独立 no-clobber `EvalRunOpenAnchor`，绑定 preflight、execution receipt、`candidate_change_hashes`、`evaluation_run_index / max_evaluation_runs` 和 fresh empty root；
+- v0.1 每个候选的控制器 ledger 必须恰好三条，targeted、regression、held-out 各一次，三条全 sealed 并与晋升 JSON 精确等集；任一已开启 run 失败就改建 successor candidate，不得同候选补跑或挑选；
+- evaluator 完成后用 `seal-eval-run` 固定原始输出清单与哈希；seal 期间任何变化都写 `EVAL_CHANGED_DURING_SEAL` 永久 `TerminalEvalIncident`，sealed output 对包括 `measure-artifact` 在内的控制器也永久只读；
+- eval 控制面与 run 路径拒绝 symlink；terminal-invalid output 和 sealed output 都对控制器永久只读；
+- 已开启 eval 在 seal 时精确零输出或清单非法，写永久 `EVAL_EMPTY_OUTPUT / EVAL_OUTPUT_INVALID`，不得补写后在同一候选重封；
 - 评价者完成后再由主执行者汇总，不修改其原始输出。
 
-若当前环境不能启动独立执行者，明确把独立性标为未满足，停在相应成熟度。不要用“我切换了角色”替代独立上下文。
+若当前环境不能启动独立执行者，明确把独立性标为未满足，停在相应成熟度。不要用“我切换了角色”替代独立上下文。`loopctl.py` 能冻结外部 attestation 并阻止 role/context/task 重合，但不能认证这些 id 是否真实；审计者必须能在 Codex 任务或其他外部系统中回查。
+
+每个新 eval run 必须使用 fresh empty output root 并重新生成全部评价输出；prior-run output 不得引用、复制或补位。发现 `STALE_OUTPUT_CONTAMINATION` 时整轮失效，当前候选改建 successor candidate，不得保留其他新输出继续晋升。`provisional-audit` 不能冒充最终 `block-seal`，最终封印也不能被同 scope 的后写裁决覆盖。
 
 ## 6. 晋升后的每轮证据
 
@@ -129,6 +144,8 @@ Codex 能启动 subagent 或新任务时：
 - 与上一有效版本的可观察差异；
 - attempt manifest 和 seal。
 
+若该轮写入人工认可或方向，manifest 还必须包含通过验证的 `HumanFeedbackReceipt`，并绑定 `HumanReviewSubject / HumanReviewOpenAnchor`；没有人工判断的合法轮次保持 unknown，不为凑成熟度伪造判断。
+
 一次 run 可以合法地拒绝候选。只要它检验了一个可证伪改进并按证据作出决定，就属于系统运行；但报告必须分开“运行轮数”和“有效晋升数”。
 
 ## 7. 停止与失败处理
@@ -136,9 +153,15 @@ Codex 能启动 subagent 或新任务时：
 - 同一改进方向连续两次无改善：停止该方向；
 - 没有新的可证伪 finding：允许 `stop`，不能做无目标改写；
 - 辅助命令缺失：优先使用 Python 标准库的确定性实现，不依赖 `shuf` 等非跨平台命令；
+- 精确零文件 dispatch stall：记录并在独立 runtime budget 内换 fresh context；不算内容修订、改善或 comparison；
+- 任一 controller-opened eval run 失败、未封存或 terminal-invalid：当前候选停止，建 successor candidate；不得在同一候选重启、补跑或从旧 run 挑选结果；
+- eval seal 期间发生变化：写 `EVAL_CHANGED_DURING_SEAL` 永久 terminal incident；清理迟到文件也不能恢复；
+- 任一 prior-run output 混入新 eval run：写 `STALE_OUTPUT_CONTAMINATION`，整轮失效并建 successor candidate；
+- 晋升证据已明确报告失败、退化、污染或 fresh-root failure：写不可覆盖的 candidate block-seal；后改同一 JSON 为 PASS 不得洗白；
 - Judge 与人分歧：返回 `NEEDS_TASTE`，冻结该候选；
 - held-out 污染或身份泄露：该比较作废，重新建立未污染集合；
 - active version、晋升记录或哈希不一致：立即 `BLOCK`。
+- 最终 `block-seal` 已写入：同一候选永久失格，只能使用新候选 id；后写解释不能解封。
 
 用户要求至少 N 轮与停止条件冲突时，如实报告已完成的有效试验数和停止证据；不能重复运行凑数。
 

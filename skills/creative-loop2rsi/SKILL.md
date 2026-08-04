@@ -14,6 +14,7 @@ description: 引导 Codex 将创意写作及其他重主观创作流程，从创
 - 保留人的最终审美决定权。无法从材料推断核心偏好时，返回 `NEEDS_TASTE`，列出最小待选项，不替用户决定。
 - 不要求 API key，不接入网络或模型服务，不自动发布，不训练或修改模型权重。
 - 不覆盖非空目标目录，不改写用户原始素材，不删除历史 attempt、候选或晋升证据。
+- 过程检查只能写 `provisional-audit`；只在最终失格时写 `block-seal`，且同一 scope 的封印不允许后写裁决覆盖。
 - 不允许候选修改创作宪法、原始素材、held-out 答案、许可证、晋升政策或人工审批边界。
 - 把 L5 标为 `experimental / unvalidated`；始终保持 L5 产物为 `CANDIDATE`。
 
@@ -60,7 +61,7 @@ NEEDS_TASTE
 - 硬合同与版权、事实、品牌等边界；
 - 人的最终决定权；
 - 当前未决的审美问题；
-- 用户确认状态和日期。
+- 确认由谁决定，以及确认后哪些表面受保护；确认状态本身不写进宪法正文。
 
 先向用户展示立宪摘要和受保护项，再请求明确确认。确认前保持 L0 为 `NOT_READY`，不要替用户进入自动迭代。
 
@@ -77,7 +78,7 @@ python3 <skill-dir>/scripts/loopctl.py init <target-dir> \
   --domain-skill "<domain-skill-slug>"
 ```
 
-只有用户已明确确认立宪时才追加 `--charter-confirmed`。若命令接口与本地脚本不同，以 `python3 <skill-dir>/scripts/loopctl.py --help` 为准；不要自行重写运行器。初始化后，把确认过的立宪写入生成项目，不把用户素材塞进 Skill 本体。
+默认先生成未确认项目。只有用户在当前交互中明确确认后，才把其原始回复逐字保存到 `creative-system/approvals/charter-confirmations/evidence/`，再运行 `confirm-charter --confirmed-by ... --evidence ...`。不得从历史偏好、“继续运行”或任务目标推断确认；不得只手改 `system.json` 的 boolean。`--charter-confirmed` 只用于已经存在外部确认依据的一步初始化，并且必须同时提供确认人和依据文件。若命令接口与本地脚本不同，以 `python3 <skill-dir>/scripts/loopctl.py --help` 为准；不要自行重写运行器，不把用户素材塞进 Skill 本体。
 
 ## 完成 L1：跑通一个创作 Loop
 
@@ -89,7 +90,7 @@ produce → evaluate → decide → revise / commit
 
 为该 Loop 明确 goal、reads、writes、owner、producer、judges、decision policy、retry budget、stop conditions 和 human gate。把重试预算限制在 3 次以内，并规定连续两次没有可观察改善时停止。
 
-至少准备三条代表任务。每次运行都保留输入、产物、评价、决定和用户反馈；不要只记录最终稿。至少两条得到用户认可、失败能定位且能停止后，再建议晋升 L2。
+至少准备三条代表任务。每次运行都保留输入、产物、评价、决定和用户反馈；不要只记录最终稿。固定顺序为 `produce / evaluate / measure → open-human-review → 用户反馈 → seal-attempt`：计量发现问题时先改稿，再把同一 source 测到新的 facts output；控制器自动串联并保留旧 facts，只让唯一链尾 active。随后由控制器冻结 `HumanReviewSubject`、active facts 摘要、open anchor 和机器方向，再用 `HumanFeedbackReceipt` 绑定 `feedback_by / feedback_at / claims / evidence snapshot`。反馈时间不得早于冻结时间，送审后改稿或替换 facts 会让旧反馈失效。控制器验证证据和哈希，不认证身份字符串；没有外部用户消息就不得代签。至少两条得到有凭证的用户认可、失败能定位且能停止后，再建议晋升 L2。
 
 要查看完整字段和状态轴，读 [system-contract.md](references/system-contract.md)。
 
@@ -99,9 +100,13 @@ produce → evaluate → decide → revise / commit
 
 - 分离 Producer 与 Judge；不要让 Judge 读取 Producer 的推理或候选修改意图。
 - 把每次 attempt 封存为不可变证据，给 manifest 和内容哈希。
+- 在任何用于校准的人类反馈前冻结送审版本和机器方向，禁止事后对齐人机判断。
+- 将人工反馈依据快照进 attempt 的 `human-feedback/`；裸 `human_accepted / human_direction` 不计入成熟度。
+- 让控制器计算哈希、字节数、字数、allowed-writes 清单与预算计数；facts 只能写 attempt 的 `controller-facts/` 并绑定本次 selected artifact。重测必须写新文件并自动绑定前驱 path/hash/bytes，旧 facts 保留验哈，唯一链尾才是 active；Producer/Judge 自报只作 claim。
 - 把问题写成结构化 finding，明确证据、责任 owner 和最小建议动作。
 - 把可复用事实、已确认偏好和失败教训写入不同记忆区，不把一次主观评分当永久真理。
 - 只自动恢复传输或解析失败、确定性无语义修复，以及能定位到责任 Loop 的局部重生成。
+- `ZERO_FILE_DISPATCH_STALL` 只指独立 allowed-writes root 内普通文件精确为 0；它使用 `runtime_dispatch_budget`，不增加 content attempt、revision 或 no-improvement。
 - 增加发布门；结构通过不等于创作质量通过。
 
 至少用五个样本校准。确保硬合同无假通过、人机 `PASS/BLOCK` 方向一致率默认不低于 80%，并成功演练一次局部恢复。
@@ -111,14 +116,6 @@ produce → evaluate → decide → revise / commit
 ## 升级 L3：嵌套多个 Loop
 
 只从真实观察到的瓶颈拆分 Loop。为每个产物指定唯一 owner，让多个 Loop 通过声明式 reads/writes 和证据共享状态，不通过隐含文件约定耦合。
-
-在执行前检查：
-
-- 依赖图是否有环；若有受控循环，是否存在预算和停止条件；
-- 一个产物是否恰好有一个写入 owner；
-- 上游变化会使哪些下游产物失效；
-- 局部重跑是否保留已确认且仍有效的上游结果；
-- 端到端发布判断是否同时读取执行、质量和发布三条状态轴。
 
 至少解决一个真实观察到的问题，并证明单个 Loop 可重跑且不破坏已确认上游、端到端质量不低于 L2 基线后，再建议晋升 L4。
 
@@ -133,6 +130,15 @@ produce → evaluate → decide → revise / commit
 ```
 
 允许候选修改 Prompt、上下文装配、Loop 图、记忆策略或恢复策略。为每个候选写明根因假设、目标组件、改动、受保护约束、评估矩阵、预算和回滚方案。不要让候选读取 held-out 答案，也不要让被修改的 Judge 单独证明自身改进。
+
+- 创建候选时，控制器可从本地 dispatch 证据冻结 finding 来源 Producer context；Producer task 无本地事实源，只能标为 `external-attestation-required`，不得宣称已由控制器认证。
+- 每个 eval run 必须创建独立 no-clobber `EvalRunOpenAnchor`，绑定 preflight、execution receipt、`candidate_change_hashes`、`evaluation_run_index / max_evaluation_runs` 和 fresh empty output root。
+- v0.1 L4 采用 `selection-safe exact-three`：每个候选恰好开启 targeted、regression、held-out 各一次，三条必须全部 sealed 且与晋升 JSON 精确等集；任一已开启 run 失败、未封存或 terminal-invalid，都必须建 successor candidate，不得在同一候选补跑、丢弃失败 run 或挑选组合。
+- 晋升证据若明确报告 `FAIL / WORSE / hard regression / STALE_OUTPUT_CONTAMINATION / fresh-root failure`，立即写不可覆盖的 candidate block-seal；后改同一 JSON 为 PASS 不得恢复候选。
+- 已知 Producer、Builder、evaluator 与 attester 的 role/context/task 出现身份冲突时拒绝开跑或晋升；未知身份仍必须回查外部任务系统。held-out 不得读取候选 proposal、Producer 推理、版本身份、答案或映射表。
+- seal 期间任何证据变化都写 `EVAL_CHANGED_DURING_SEAL` 永久 terminal incident；sealed eval output 对 Producer、Judge 和包括 `measure-artifact` 在内的控制器永久只读。发现任一 prior-run output 即 `STALE_OUTPUT_CONTAMINATION`，整轮失效并建 successor candidate。
+- eval 的 `evaluations/`、`control/`、anchor、terminal marker 和 run 路径拒绝 symlink；terminal-invalid output 也立即变为控制器只读。
+- 已开启 eval 在 seal 时精确零输出，写永久 `EVAL_EMPTY_OUTPUT` 并要求 successor candidate；不得事后补文件重封。
 
 只有目标问题改善、硬合同无退化、回归集无阻断性退化、held-out 不劣于基线且人工批准齐全时，才运行 `promote`。晋升后保留前一稳定版本；失败则维持基线并记录可解释原因。
 
@@ -176,13 +182,20 @@ produce → evaluate → decide → revise / commit
 先用 `--help` 核对本地接口，再按需调用：
 
 - `init`：生成项目骨架和领域 Skill；非空目录必须拒绝覆盖。
+- `confirm-charter`：在用户明确确认后，生成内容寻址的 `CharterConfirmation` receipt，并把全部历史 receipt 写入哈希链账本；旧确认不可静默改写。
 - `validate`：检查合同、引用、owner、依赖、预算、停止条件和受保护面。
 - `audit`：报告当前可证明成熟度和下一级缺口。
+- `measure-artifact`：由控制器计算文本哈希和机械计数，写入不可覆盖的项目内 facts JSON；同 source 重测自动建立 supersession chain。
 - `begin-run`：建立 run 和首个 attempt 的证据位置。
-- `seal-attempt`：封存 attempt、manifest 和哈希；封存后不得覆盖。
-- `create-candidate`：从重复 finding 建立隔离候选及评估计划。
+- `open-dispatch`：在 open attempt 内为 Producer 分配唯一 allowed-writes root。
+- `record-dispatch-stall`：封存精确零文件事实并单独消耗 runtime budget；不消耗内容 attempt。
+- `open-human-review`：在人工反馈前冻结成品、active facts 的 path/hash/bytes 与机器方向；生成 no-clobber subject/anchor。
+- `seal-attempt`：封存 attempt、manifest 和哈希；人工声明必须同时提供先行 review subject 及 `--human-feedback-by / --human-feedback-at / --human-feedback-evidence`，封存后不得覆盖。
+- `create-candidate`：从重复 finding 建立隔离候选，冻结 Builder receipt、本地可证的 Producer context 和仅可外部作证的 Producer task 边界。
+- `open-eval-run / seal-eval-run`：为 exact-three 评价写 `EvalRunOpenAnchor`，绑定 preflight、receipt、候选哈希、预算序号、空根和原始输出；未封存 run 使当前候选失败。
+- `block-candidate`：只在最终失格时写不可覆盖的 `block-seal`；后续必须新建 successor candidate。
 - `promote`：只在四类证据和人工批准齐全时更新 active version。
-- `rollback`：切回上一稳定版本，不删除任何历史证据。
+- `rollback`：通过可恢复 transaction 切回上一稳定版本；中途崩溃只允许 roll-forward，不删除任何历史证据。
 
 每次修改系统配置后运行：
 
