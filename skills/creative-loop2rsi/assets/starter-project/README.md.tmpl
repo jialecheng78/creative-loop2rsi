@@ -1,0 +1,19 @@
+# {{PROJECT_NAME}}
+
+这是一个由 `creative-loop2rsi` 生成的本地创作系统项目。先确认创作宪法，再开始运行 Loop。
+
+## 当前入口
+
+- 创作宪法：`creative-system/creative-charter.md`
+- 系统合同：`creative-system/system.json`
+- 主 Loop：`creative-system/loops/main-loop.json`
+- 专属 Skill：`skills/{{DOMAIN_SKILL}}/SKILL.md`
+
+## 第一次运行
+
+1. 阅读并确认 `creative-system/creative-charter.md`。
+2. 如果初始化时没有确认，把 `creative-system/system.json` 中 `charter.confirmed` 改为 `true`，并填写 `confirmed_by`。
+3. 运行 `loopctl.py validate <项目目录>`。
+4. 运行 `loopctl.py audit <项目目录>`，只处理它指出的最小下一步。
+
+`inputs/`、`outputs/` 与 `creative-system/runs/` 默认不进入 Git。不要把未发表作品、运行轨迹或个人信息提交到公开仓库。

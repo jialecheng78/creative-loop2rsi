@@ -1,0 +1,48 @@
+# Operating systems and editors
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+private-denylist.txt
+*.private-denylist
+
+# Generated local artifacts (repository root only)
+/inputs/
+/outputs/
+/runs/
+*.log
+*.tmp
+*.bak
+
+# Release artifacts
+*.zip
+*.tar
+*.tar.gz
+SHA256SUMS.local

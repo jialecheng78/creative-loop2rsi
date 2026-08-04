@@ -1,0 +1,23 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "world-consistency",
+  "type": "deterministic",
+  "mode": "block",
+  "agent": "world-contract-checker",
+  "rubric": [
+    "所有可保存记忆的机制都依附于邮票",
+    "任务结构和对白没有改写已确认世界事实",
+    "明信片、潮位遗忘和邮票记忆之间没有因果矛盾"
+  ],
+  "evidence_requirements": [
+    "quest-brief",
+    "world-rule-patch",
+    "quest-outline",
+    "quest-dialogue"
+  ],
+  "calibration": "evals/development/world-contract.jsonl",
+  "promotion_requirements": [
+    "五个样本中无世界硬合同假通过"
+  ]
+}

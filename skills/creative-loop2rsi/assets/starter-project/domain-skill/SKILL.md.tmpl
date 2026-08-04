@@ -1,0 +1,29 @@
+---
+name: {{DOMAIN_SKILL}}
+description: "为“{{PROJECT_NAME_YAML}}”执行已确认的创作 Loop；在需要生产、评价、修订、记录 finding 或根据证据决定停止时使用。"
+---
+
+# {{PROJECT_NAME}} 创作 Loop
+
+## 先读取合同
+
+1. 读取 `creative-system/creative-charter.md`，确认人的创作边界。
+2. 读取 `creative-system/system.json` 与目标 Loop 规范。
+3. 如果宪法未确认，停止生产并请用户确认。
+
+## 执行一轮
+
+1. 根据 Loop 的 `reads` 取得输入，只让 Producer 生成目标产物。
+2. 让独立 Judge 按硬合同、软质量和人类立宪分别评价。
+3. 将每个判断绑定到可检查证据；无法判断核心审美时返回 `NEEDS_TASTE`。
+4. 依据 `decision_policy` 决定提交、局部修订或停止，不超过 `retry_budget`。
+5. 把产物、评价和 finding 写入当前 attempt，再封存；不要覆盖已封存 attempt。
+
+## 学习边界
+
+- 只有跨真实运行重复出现的 finding 才能生成隔离候选。
+- 候选通过目标评估、回归、held-out 盲评和人工批准前，不得替换当前版本。
+- 不修改创作宪法、原始素材、held-out 答案、晋升政策或人工审批边界。
+- L5 候选始终保持实验状态。
+
+具体字段解释见 [项目合同](references/project-contract.md)。

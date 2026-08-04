@@ -1,0 +1,21 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "story-contract",
+  "type": "deterministic",
+  "mode": "block",
+  "agent": "story-contract-checker",
+  "rubric": [
+    "字数在 900–1400 之间",
+    "包含开端、关键选择及选择后果",
+    "没有梦境复位结尾、血腥细节或真实个人信息"
+  ],
+  "evidence_requirements": [
+    "story-draft"
+  ],
+  "calibration": null,
+  "promotion_requirements": [
+    "所有规则可机械复核",
+    "硬合同无假通过"
+  ]
+}

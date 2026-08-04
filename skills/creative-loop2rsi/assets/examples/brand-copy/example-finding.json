@@ -1,0 +1,14 @@
+{
+  "code": "COPY-SCENE-ABSTRACT",
+  "category": "soft-quality",
+  "severity": "medium",
+  "confidence": 0.78,
+  "evidence": [
+    {
+      "path": "runs/example-run/attempts/001/output/brand-copy.md",
+      "note": "正文只有氛围形容词，没有人物动作或可感知物体"
+    }
+  ],
+  "owner": "copy-producer",
+  "suggested_action": "在不增加功效暗示的前提下加入一个晚间动作或物体细节"
+}

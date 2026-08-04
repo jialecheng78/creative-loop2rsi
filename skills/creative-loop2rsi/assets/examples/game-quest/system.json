@@ -1,0 +1,120 @@
+{
+  "schema_version": "0.1",
+  "kind": "CreativeSystem",
+  "project": {
+    "id": "tide-post-office-quest",
+    "name": "潮汐邮局游戏任务",
+    "domain_skill": "gentle-mystery-quest",
+    "active_version": "baseline-v1"
+  },
+  "charter": {
+    "path": "creative-charter.md",
+    "confirmed": true,
+    "confirmed_at": "2000-01-01"
+  },
+  "maturity": {
+    "declared": "L3"
+  },
+  "loops": [
+    "loops/maintain-world-rule.json",
+    "loops/design-quest-structure.json",
+    "loops/write-quest-dialogue.json"
+  ],
+  "artifacts": [
+    {
+      "id": "quest-brief",
+      "path": "inputs/quest-brief.md",
+      "owner": "human-narrative-designer",
+      "kind": "input",
+      "protected": true
+    },
+    {
+      "id": "world-rule-patch",
+      "path": "outputs/world-rule-patch.md",
+      "owner": "world-rule-producer",
+      "kind": "intermediate",
+      "protected": false
+    },
+    {
+      "id": "quest-outline",
+      "path": "outputs/quest-outline.md",
+      "owner": "quest-structure-producer",
+      "kind": "intermediate",
+      "protected": false
+    },
+    {
+      "id": "quest-dialogue",
+      "path": "outputs/quest-dialogue.md",
+      "owner": "dialogue-producer",
+      "kind": "output",
+      "protected": false
+    }
+  ],
+  "judges": [
+    "judges/world-consistency.json",
+    "judges/quest-playability.json",
+    "judges/quest-taste-gate.json"
+  ],
+  "memory": {
+    "partitions": [
+      {
+        "id": "confirmed-facts",
+        "writer": "human-narrative-designer",
+        "path": "memory/confirmed-facts.jsonl"
+      },
+      {
+        "id": "confirmed-preferences",
+        "writer": "human-narrative-designer",
+        "path": "memory/confirmed-preferences.jsonl"
+      },
+      {
+        "id": "run-lessons",
+        "writer": "quest-reviewer",
+        "path": "memory/run-lessons.jsonl"
+      },
+      {
+        "id": "finding-index",
+        "writer": "quest-reviewer",
+        "path": "memory/finding-index.jsonl"
+      }
+    ]
+  },
+  "recovery_policy": {
+    "max_attempts": 3,
+    "stop_after_no_improvement": 2,
+    "automatic_actions": [
+      "retry-runtime-failure",
+      "deterministic-parse-repair",
+      "rerun-responsible-loop",
+      "invalidate-dependent-artifacts"
+    ]
+  },
+  "learning_policy": {
+    "enabled": false,
+    "minimum_independent_runs": 3
+  },
+  "promotion_policy": {
+    "human_approval_required": true,
+    "l5_auto_promotion": false
+  },
+  "protected_surfaces": [
+    "creative-charter.md",
+    "inputs/",
+    "evals/heldout/",
+    "LICENSE",
+    "promotion-policy",
+    "human-approval-boundary"
+  ],
+  "editable_surfaces": [
+    "prompts",
+    "context",
+    "loop-graph",
+    "memory-policy",
+    "recovery-policy"
+  ],
+  "statuses": {
+    "execution_status": "NOT_STARTED",
+    "quality_status": "NOT_EVALUATED",
+    "release_status": "NOT_READY"
+  }
+}

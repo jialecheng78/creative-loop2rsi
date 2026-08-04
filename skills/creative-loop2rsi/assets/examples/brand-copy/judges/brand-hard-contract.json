@@ -1,0 +1,21 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "brand-hard-contract",
+  "type": "deterministic",
+  "mode": "block",
+  "agent": "brand-contract-checker",
+  "rubric": [
+    "正文为 45–90 字并包含标题和行动邀请",
+    "没有健康功效、绝对化用语、焦虑营销或贬损人群",
+    "内容明确描述饮品且不伪造用户证言"
+  ],
+  "evidence_requirements": [
+    "copy-brief",
+    "brand-copy"
+  ],
+  "calibration": "evals/development/hard-contract.jsonl",
+  "promotion_requirements": [
+    "五个样本中无硬合同假通过"
+  ]
+}

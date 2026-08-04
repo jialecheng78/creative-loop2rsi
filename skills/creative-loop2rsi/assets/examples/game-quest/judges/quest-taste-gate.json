@@ -1,0 +1,23 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "quest-taste-gate",
+  "type": "human",
+  "mode": "warn",
+  "agent": "human-narrative-designer",
+  "rubric": [
+    "留白是否足够但仍能理解行动目标",
+    "幽默是否温和且没有破坏悬疑",
+    "两个后果是否都值得玩家承担"
+  ],
+  "evidence_requirements": [
+    "quest-brief",
+    "world-rule-patch",
+    "quest-outline",
+    "quest-dialogue"
+  ],
+  "calibration": null,
+  "promotion_requirements": [
+    "用户明确确认值得保留的留白和后果强度"
+  ]
+}

@@ -1,0 +1,19 @@
+# 项目合同
+
+## 状态
+
+- 执行：`NOT_STARTED / RUNNING / PASS / BLOCK`
+- 质量：`NOT_EVALUATED / PASS / WARN / NEEDS_TASTE`
+- 发布：`NOT_READY / CANDIDATE / PASS / BLOCK`
+
+结构或格式 `PASS` 不代表创作质量通过。遇到人类审美分歧时使用 `NEEDS_TASTE`。
+
+## Loop 顺序
+
+`produce → evaluate → decide → revise/commit`
+
+每个 Loop 只能写自己负责的产物。Judge 不读取 Producer 的隐藏推理或候选修改意图。达到预算或连续两次没有改善时停止。
+
+## 晋升门
+
+候选必须同时具备目标评估、全量回归、held-out 盲评和人工批准。L5 候选不得晋升。

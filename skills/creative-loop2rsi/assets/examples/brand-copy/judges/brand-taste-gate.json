@@ -1,0 +1,20 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "brand-taste-gate",
+  "type": "human",
+  "mode": "warn",
+  "agent": "human-brand-editor",
+  "rubric": [
+    "这条文案是否像一个真实可发生的傍晚",
+    "行动邀请是否让人感到被尊重而非被催促"
+  ],
+  "evidence_requirements": [
+    "copy-brief",
+    "brand-copy"
+  ],
+  "calibration": null,
+  "promotion_requirements": [
+    "人工选择值得保留的版本并记录理由"
+  ]
+}

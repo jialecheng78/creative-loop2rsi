@@ -1,0 +1,24 @@
+# {{PROJECT_NAME}} 协作规则
+
+## 创作目标
+
+{{CREATIVE_GOAL}}
+
+## 决策边界
+
+- `creative-system/creative-charter.md` 是最高层创作约束，只有人可以确认或修改。
+- 机器无法从证据判断核心审美时，返回 `NEEDS_TASTE`，不得代替人决定。
+- 候选只能在 `creative-system/candidates/` 内隔离生成；通过目标评估、回归、held-out 盲评与人工批准前，不得成为当前版本。
+- L5 只用于实验，任何 L5 候选都不得由工具晋升。
+
+## 数据边界
+
+- `inputs/`、`outputs/`、`creative-system/runs/` 保存本地创作资料和运行证据，默认不提交 Git。
+- 不在项目中保存 API key、密码、访问令牌或第三方未授权内容。
+- 已封存的 attempt 不得覆盖；需要修正时开启新 attempt。
+
+## 运行习惯
+
+- 修改 Loop 或 Judge 后先运行 `validate`。
+- 每轮先记录产物和 finding，再 `seal-attempt`。
+- 每次只根据真实重复 finding 创建候选，不因为一次偶然低分改系统。

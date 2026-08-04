@@ -1,0 +1,21 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "story-taste-review",
+  "type": "human",
+  "mode": "warn",
+  "agent": "human-story-reviewer",
+  "rubric": [
+    "主角是否通过具体行动完成关键选择",
+    "选择是否付出可感知的代价",
+    "成长是否由情节体现而非旁白宣布"
+  ],
+  "evidence_requirements": [
+    "story-brief",
+    "story-draft"
+  ],
+  "calibration": null,
+  "promotion_requirements": [
+    "用户明确选择值得保留的版本"
+  ]
+}

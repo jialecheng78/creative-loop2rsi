@@ -1,0 +1,21 @@
+{
+  "schema_version": "0.1",
+  "kind": "JudgeSpec",
+  "id": "brand-quality-shadow",
+  "type": "model",
+  "mode": "shadow",
+  "agent": "brand-quality-reviewer",
+  "rubric": [
+    "至少一个具体生活动作或感官细节",
+    "幽默不依赖嘲讽或焦虑",
+    "形容词没有替代场景和动作"
+  ],
+  "evidence_requirements": [
+    "brand-copy"
+  ],
+  "calibration": "evals/development/quality-calibration.jsonl",
+  "promotion_requirements": [
+    "与人工 PASS/BLOCK 方向一致率不低于 80%",
+    "完成 shadow 分歧复盘后才可进入 warn"
+  ]
+}
