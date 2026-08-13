@@ -39,6 +39,10 @@
 python3 -m unittest discover -s tests -v
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/creative-loop2rsi
 python3 tools/audit_public_tree.py .
+python3 tools/check_dco.py . --range HEAD
+python3 tools/audit_release_archive.py . --treeish HEAD
 ```
 
 所有由 `loopctl.py init` 生成的领域 Skill 也必须通过官方 `quick_validate.py`。若缺少真实非程序员测试、外部元评估或 live forward test，必须在 README 与交付说明中标为未验证，不得用自动测试替代。
+
+GitHub CI 必须使用完整 commit SHA 固定第三方 Action，并保持 `contents: read`、`persist-credentials: false`、无 `pull_request_target` 和无仓库密钥。Gitleaks 必须扫描完整 Git 历史，并先用合成泄漏证明扫描器会正确失败；发布归档必须直接从目标 commit 生成、审计并绑定 SHA256，不得用工作树检查替代。

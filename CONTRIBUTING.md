@@ -37,6 +37,8 @@ python3 -B -m unittest discover -s tests -v
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
   skills/creative-loop2rsi
 python3 tools/audit_public_tree.py . --mode full
+python3 tools/check_dco.py . --range HEAD
+python3 tools/audit_release_archive.py . --treeish HEAD
 ```
 
 如果修改了生成器，还要初始化一个临时项目，并对生成出的领域 Skill 再运行官方 `quick_validate.py`。Pull Request 不得通过降低阈值、跳过测试或放宽受保护表面来获得通过。
@@ -58,6 +60,8 @@ Signed-off-by: Your Name <your.email@example.com>
 ```
 
 这不是 CLA。项目不会要求你转让版权。
+
+CI 会检查所选提交范围内每个 commit 至少有一条与 author 姓名和邮箱匹配的 `Signed-off-by`。托管仓库还必须启用 GitHub 的 `web_commit_signoff_required`，避免 squash 或 merge 在检查通过后新造未签署 commit；合并前应将 `DCO`、`policy`、`gitleaks-history`、`archive-audit` 和测试矩阵设为 required checks。
 
 ## 提交说明至少包含
 

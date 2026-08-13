@@ -7,29 +7,205 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python-version }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.11", "3.13"]
     runs-on: ${{ matrix.os }}
-    env:
-      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Run unit and structure tests
-        run: python -m unittest discover -s tests -v
+        run: python -X utf8 -m unittest discover -s tests -v
+
+  dco:
+    name: DCO
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout complete contributor history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Check all reachable commits on push
+        if: github.event_name != 'pull_request'
+        run: python -X utf8 tools/check_dco.py . --range HEAD
+
+      - name: Check pull request commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: python -X utf8 tools/check_dco.py . --range "$BASE_SHA..HEAD"
+
+  policy:
+    name: policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
 
       - name: Audit tracked public tree
-        run: python tools/audit_public_tree.py . --mode tracked
+        run: python -X utf8 tools/audit_public_tree.py . --mode tracked
+
+      - name: Install pinned validator dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$RUNNER_TEMP/pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+          curl --fail --location --silent --show-error \
+            --output "$wheel" \
+            "https://files.pythonhosted.org/packages/71/60/917329f640924b18ff085ab889a11c763e0b573da888e8404ff486657602/pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl"
+          echo "b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d  $wheel" | sha256sum --check
+          python -m pip install --disable-pip-version-check --no-input --no-deps "$wheel"
+
+      - name: Download pinned official Skill validator
+        shell: bash
+        run: |
+          set -euo pipefail
+          validator="$RUNNER_TEMP/quick_validate.py"
+          curl --fail --location --silent --show-error \
+            --output "$validator" \
+            "https://raw.githubusercontent.com/openai/codex/c30a3e49c9231361abeaa88d4a57bb7c3e248a50/codex-rs/skills/src/assets/samples/skill-creator/scripts/quick_validate.py"
+          echo "6cc9dc3199c935916cf6f73fcbbbb0e3bb1b58c8f5109fefa499978908164f51  $validator" | sha256sum --check
+
+      - name: Validate Builder Skill and generated domain Skill
+        shell: bash
+        run: |
+          set -euo pipefail
+          validator="$RUNNER_TEMP/quick_validate.py"
+          generated="$RUNNER_TEMP/generated-system"
+          python -X utf8 "$validator" skills/creative-loop2rsi
+          python -X utf8 skills/creative-loop2rsi/scripts/loopctl.py init "$generated" \
+            --project-name "CI story system" \
+            --creative-goal "Create short stories for young readers" \
+            --minimum-product "One complete short story" \
+            --representative-task "Write a story about repairing a kite" \
+            --constraints "Do not glorify unsafe behavior" \
+            --taste "Prefer concrete action over explanation" \
+            --domain-skill ci-story-loop
+          python -X utf8 "$validator" "$generated/skills/ci-story-loop"
+
+  gitleaks-history:
+    name: gitleaks-history
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download checksum-pinned Gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="$RUNNER_TEMP/gitleaks-8.18.4"
+          archive="$RUNNER_TEMP/gitleaks_8.18.4_linux_x64.tar.gz"
+          config="$RUNNER_TEMP/gitleaks-8.18.4.toml"
+          mkdir -p "$tool_dir"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz"
+          echo "ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d  $archive" | sha256sum --check
+          curl --fail --location --silent --show-error \
+            --output "$config" \
+            "https://raw.githubusercontent.com/gitleaks/gitleaks/v8.18.4/config/gitleaks.toml"
+          echo "b94aad1d0f105e4d7cb230872461705a4b04a7743c656836144ae6853cb33e1b  $config" | sha256sum --check
+          : > "$RUNNER_TEMP/gitleaks-empty.ignore"
+          tar -xzf "$archive" -C "$tool_dir"
+          "$tool_dir/gitleaks" version
+
+      - name: Prove the scanner blocks a synthetic leak
+        shell: bash
+        run: |
+          set -euo pipefail
+          gitleaks_bin="$RUNNER_TEMP/gitleaks-8.18.4/gitleaks"
+          set +e
+          canary_output=$(printf 'token = "ghp_%s%s"\n' \
+            "aBcDeFgHiJkLmNoPqR" "sTuVwXyZ0123456789" | \
+            "$gitleaks_bin" detect \
+              --pipe \
+              --config "$RUNNER_TEMP/gitleaks-8.18.4.toml" \
+              --gitleaks-ignore-path "$RUNNER_TEMP/gitleaks-empty.ignore" \
+              --ignore-gitleaks-allow \
+              --no-banner \
+              --no-color \
+              --redact=100 2>&1)
+          canary_rc=$?
+          set -e
+          printf '%s\n' "$canary_output"
+          test "$canary_rc" -eq 1
+          case "$canary_output" in
+            *"leaks found: 1"*) ;;
+            *) echo "Gitleaks canary did not produce the expected finding" >&2; exit 1 ;;
+          esac
+
+      - name: Scan complete Git history
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/gitleaks-8.18.4/gitleaks" detect \
+            --source . \
+            --log-opts="--all --full-history" \
+            --config "$RUNNER_TEMP/gitleaks-8.18.4.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP/gitleaks-empty.ignore" \
+            --ignore-gitleaks-allow \
+            --redact=100 \
+            --no-banner \
+            --no-color
+
+  archive-audit:
+    name: archive-audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Build and audit exact release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/creative-loop2rsi.tar"
+          manifest="$RUNNER_TEMP/creative-loop2rsi.manifest.json"
+          python -X utf8 tools/audit_release_archive.py . \
+            --treeish HEAD \
+            --output "$archive" \
+            --manifest "$manifest"
+          python -X utf8 -c 'import hashlib,json,pathlib,sys; archive=pathlib.Path(sys.argv[1]).read_bytes(); manifest=json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")); assert hashlib.sha256(archive).hexdigest() == manifest["archive_sha256"]' "$archive" "$manifest"

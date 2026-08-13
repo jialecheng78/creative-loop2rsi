@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -180,8 +181,33 @@ class RepositoryPolicyTests(unittest.TestCase):
             self.assertIn(operating_system, workflow)
         for version in ('"3.9"', '"3.11"', '"3.13"'):
             self.assertIn(version, workflow)
-        self.assertIn("python -m unittest discover -s tests -v", workflow)
+        self.assertIn("python -X utf8 -m unittest discover -s tests -v", workflow)
         self.assertIn("--mode tracked", workflow)
+        for job in ("dco:", "policy:", "gitleaks-history:", "archive-audit:"):
+            self.assertIn(job, workflow)
+        self.assertIn("--ignore-gitleaks-allow", workflow)
+        self.assertIn("--gitleaks-ignore-path", workflow)
+        self.assertIn("--config \"$RUNNER_TEMP/gitleaks-8.18.4.toml\"", workflow)
+
+    def test_ci_actions_are_pinned_and_secrets_are_not_referenced(self) -> None:
+        workflow_path = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+        workflow = workflow_path.read_text(encoding="utf-8")
+        action_references = re.findall(r"^\s*uses:\s*[^@\s]+@([^\s#]+)", workflow, re.MULTILINE)
+        self.assertTrue(action_references)
+        for reference in action_references:
+            with self.subTest(reference=reference):
+                self.assertRegex(reference, r"^[0-9a-f]{40}$")
+        self.assertNotIn("secrets.", workflow)
+        self.assertNotRegex(workflow, r"(?m)^\s*[a-z-]+:\s*write(?:-all)?\s*$")
+        checkout_blocks = re.findall(
+            r"uses:\s*actions/checkout@[0-9a-f]{40}.*?(?=\n\s*- name:|\n\s{2}[a-z-]+:|\Z)",
+            workflow,
+            re.DOTALL,
+        )
+        self.assertTrue(checkout_blocks)
+        for block in checkout_blocks:
+            with self.subTest(checkout=block.splitlines()[0].strip()):
+                self.assertIn("persist-credentials: false", block)
 
     def test_open_source_policy_files_are_present(self) -> None:
         required = (
@@ -203,6 +229,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("Apache License", license_text)
         self.assertIn("DCO", contribution_text)
         self.assertIn("不要求签署 CLA", contribution_text)
+        self.assertIn("web_commit_signoff_required", contribution_text)
         for status in ("IMPLEMENTED", "FORWARD-TESTED", "PROPOSED", "UNVALIDATED"):
             self.assertIn(status, readme)
 

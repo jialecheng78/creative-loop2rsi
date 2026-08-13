@@ -252,11 +252,15 @@ python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
   skills/creative-loop2rsi
 python3 tools/audit_public_tree.py . --mode full
 python3 tools/audit_public_tree.py . --mode tracked
+python3 tools/check_dco.py . --range HEAD
+python3 tools/audit_release_archive.py . --treeish HEAD
 ```
 
-`--mode full` 适合提交前查看整个工作目录，`--mode tracked` 只检查会进入 `git archive` 的版本化文件。可通过 `--denylist /private/path/denylist.txt` 加载不入库的私有敏感词表。发布前还应对完整 Git 历史运行 Gitleaks；本工具只审计当前工作树，不替代历史扫描。
+`--mode full` 适合提交前查看整个工作目录；`--mode tracked` 以 Git index 取得版本化路径，但读取当前工作树字节，因此只用于本地预检。真正的发布门使用 `audit_release_archive.py`：它从指定 commit 生成 `git archive`，比较 Git tree 与压缩包清单，审计压缩包内的实际字节，并绑定 commit、tree、逐文件哈希和 archive SHA256。可通过 `--denylist /private/path/denylist.txt` 加载不入库的私有敏感词表。
 
-GitHub Actions 仅使用 `contents: read`，不使用 `pull_request_target`，也不保存任何模型密钥。Release archive 应使用 `git archive` 生成，并单独计算 SHA256。
+CI 提供五类 required-check 候选：9 格 Python 测试矩阵、`DCO`、`policy`、`gitleaks-history` 和 `archive-audit`。Gitleaks 固定版本、官方规则集和下载 SHA256，不接受仓库内 `.gitleaks.toml`、`.gitleaksignore` 或 `gitleaks:allow` 弱化门禁；它会先用合成泄漏验证扫描器确实失败，再扫描完整 Git 历史。`policy` 使用固定 OpenAI Codex commit 和文件哈希下载官方 `quick_validate.py`，同时校验 Builder Skill 与一次现场生成的领域 Skill。所有 GitHub Action 都固定到完整 commit SHA；工作流只使用 `contents: read`，不使用 `pull_request_target`、仓库密钥或持久化 checkout 凭据。
+
+这些文件只定义门禁。正式发布前仍须在 GitHub private staging 实际跑绿所有 hosted-runner jobs，在仓库 ruleset 中把它们设为 required，并启用 `web_commit_signoff_required`，防止 GitHub 合并时生成未签署的新 commit；本地 PASS 不能替代 GitHub 状态检查。
 
 贡献方式、DCO 和洁净室边界见 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目采用 [Apache License 2.0](LICENSE)。
 

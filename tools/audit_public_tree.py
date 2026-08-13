@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Audit the current public tree without reading network or secret stores.
+"""Audit the current working tree without reading network or secret stores.
 
-The default mode is ``tracked`` because a release archive is built from tracked
-files. Use ``--mode full`` before staging to include untracked files. This tool
-audits the current tree only; it does not replace a full Git-history scanner.
+``tracked`` gets paths from the Git index but reads bytes from the working tree;
+``full`` also includes untracked files. Use ``audit_release_archive.py`` to bind
+an audit to the exact bytes of a commit archive. Neither mode replaces a full
+Git-history scanner.
 """
 
 from __future__ import annotations
@@ -283,14 +284,17 @@ def audit_paths(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Audit tracked release files or the full working tree for public-safety risks."
+        description="Audit tracked paths or the full working tree for public-safety risks."
     )
     parser.add_argument("root", nargs="?", default=".", help="repository root (default: current directory)")
     parser.add_argument(
         "--mode",
         choices=("tracked", "full"),
         default="tracked",
-        help="tracked checks git ls-files; full includes untracked files (default: tracked)",
+        help=(
+            "tracked gets paths from git ls-files and reads working-tree bytes; "
+            "full includes untracked files (default: tracked)"
+        ),
     )
     parser.add_argument(
         "--denylist",
