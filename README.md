@@ -1,6 +1,8 @@
 # creative-loop2rsi
 
-`creative-loop2rsi` 是一个面向 Codex 的开源 Builder Skill。它不替你规定“什么才是好作品”，而是帮助你把自己的创作标准逐步变成一套可运行、可恢复、可审计、可验证改进的系统。
+`creative-loop2rsi` 正在演进为 **Creative RSI Studio**：一套中文优先、本地优先的开源桌面应用，帮助普通用户从第一次创作开始，把自己的创作标准逐步变成一套可运行、可恢复、可审计、可验证改进的系统。
+
+原有 Codex Builder Skill 和 Python `loopctl` 治理控制器继续保留。桌面应用负责普通用户体验，DSH 负责运行 Producer、Judge 和候选工作流，Python Controller 继续负责证据、晋升和回滚。DSH 运行成功不等于候选已获准进入生产。
 
 ```text
 创作立宪
@@ -11,7 +13,21 @@
   -> RSI 实验室（仅实验，不自动晋升）
 ```
 
-当前目标版本为 `v0.1.0`，中文优先、仅面向 Codex。L0–L4 是本版本的正式实现范围；L5 始终标记为 `experimental / unvalidated`。本仓库不会训练或修改模型权重，也不会自动公开作品、修改创作宪法或替人决定核心审美。
+当前稳定基线是 Skill `v0.1.0`；应用目标版本是无签名技术预览 `studio-v1.0.0-alpha.1`。L0–L4 是可验证实现范围；L5 始终标记为 `experimental / unvalidated`。本仓库不会训练或修改模型权重，也不会自动公开作品、修改创作宪法或替人决定核心审美。
+
+应用首发目标：macOS 13+ Apple Silicon 与 Windows 10/11 x64。无签名 alpha 会触发 Gatekeeper 或 SmartScreen，不能被描述为“普通用户无警告安装”；平台签名仍是稳定版门禁。
+
+## 应用版首次使用
+
+```text
+下载安装
+  -> 输入 DeepSeek 官方 API Key
+  -> 选择 V4 Pro（推荐）或 V4 Flash（快速 / 省钱）
+  -> 回答“你想创作什么？”
+  -> 立即开始创作
+```
+
+应用不展示 Endpoint、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。Key 只由桌面主进程通过操作系统安全存储管理；作品和证据默认保留在本机。创作所需文本会发送到 DeepSeek 官方 API，完整边界见 [PRIVACY.md](PRIVACY.md)。
 
 ## 它解决什么问题
 
@@ -26,9 +42,11 @@
 
 | 层 | 负责什么 | 不负责什么 |
 |---|---|---|
+| Creative RSI Studio | 负责普通用户创作、反馈、候选比较与版本操作 | 不向用户暴露运行时和治理细节 |
 | Builder Skill | 用自然语言引导立宪、选择下一成熟度、解释阻塞原因 | 不保存运行事实，不代替控制器 |
-| 领域 Skill | 承载使用者自己的创作方法、语境和交互方式 | 不自行改变受保护规则 |
-| `loopctl.py` 与运行项目 | 保存合同、状态、证据、候选、晋升与回滚记录 | 不调用模型，不判断作品是否“有灵魂” |
+| DSH Runtime Adapter | 运行 Producer、Judge、Builder 和 Evaluator | 不决定候选能否晋升 |
+| 领域 Skill / System Recipe | 承载使用者自己的创作方法、语境和交互方式 | 不自行改变受保护规则 |
+| Python Controller 与运行项目 | 保存合同、状态、证据、候选、晋升与回滚记录 | 不调用模型，不判断作品是否“有灵魂” |
 
 因此，能跑通 Loop 的脚手架不是单靠 Prompt 工程。Prompt 会影响 Producer 和 Judge 的具体表现；Skill 负责把复杂流程变成可理解的交互；真正让 Loop 可恢复、可审计并能安全迭代的，是显式合同、持久状态、不可变证据和晋升门。三者缺一不可。
 
@@ -49,9 +67,10 @@
 | 三名非程序员在 20 分钟内完成 L0 与首个 L1 | `UNVALIDATED` | 尚未用真人测试，自动 Agent 测试不能替代 |
 | L5 修改 Judge、学习策略或改进控制器 | `UNVALIDATED` | 只生成 `CANDIDATE`；禁止自动晋升 |
 | 从 L0 到 L4、再证明晋升后运行 N 轮 | `IMPLEMENTED` | 分开 bootstrap 与 post-L4 计数；仍需真实人工门和独立评价者 |
-| 模型供应商适配器、遥测、云服务和自动训练 | `PROPOSED` / 非 v0.1 范围 | 本版本不实现，也不要求 API key |
+| Desktop monorepo、DeepSeek Gateway 与 DSH Adapter | `IN DEVELOPMENT` | 只允许 DeepSeek 官方 API；不接入遥测、云同步或自动训练 |
+| 无签名 macOS / Windows 安装包 | `PROPOSED` | 通过打包和真人安装验收前不得标为已实现 |
 
-## 安装
+## Skill 基线安装
 
 下载或克隆仓库后，把 `skills/creative-loop2rsi/` 整个目录复制到 Codex 的个人 Skills 目录；也可以直接在本仓库中让 Codex 读取这个 Skill。
 
@@ -62,11 +81,11 @@ python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
   skills/creative-loop2rsi
 ```
 
-预期输出为 `Skill is valid!`。本项目没有第三方 Python 依赖，不需要填写 API key。
+预期输出为 `Skill is valid!`。Skill 和 Python Controller 本身不访问网络，也不读取 API Key；只有桌面应用的 Model Gateway 会访问 DeepSeek 官方 API。
 
 ## 快速开始
 
-### 对话式方式（推荐）
+### 对话式方式（Skill 用户）
 
 在 Codex 中输入：
 
