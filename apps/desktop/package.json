@@ -1,0 +1,31 @@
+{
+  "name": "@creative-loop2rsi/desktop",
+  "productName": "Creative RSI Studio",
+  "version": "1.0.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "pnpm --filter @creative-loop2rsi/controller-bridge build && pnpm --filter @creative-loop2rsi/model-gateway build && pnpm --filter @creative-loop2rsi/runtime-dsh build && tsc -p tsconfig.build.json && node scripts/build-renderer.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "start": "pnpm run build && electron .",
+    "package:preview": "pnpm run build && node scripts/preview-build.mjs"
+  },
+  "dependencies": {
+    "@creative-loop2rsi/controller-bridge": "workspace:*",
+    "@creative-loop2rsi/model-gateway": "workspace:*",
+    "@creative-loop2rsi/runtime-dsh": "workspace:*",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.3",
+    "electron": "43.4.0",
+    "esbuild": "0.28.2",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  }
+}

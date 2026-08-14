@@ -37,6 +37,25 @@ class PublicTreeAuditTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("OK:", result.stdout)
 
+    def test_full_tree_prunes_dependency_and_generated_build_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hidden_value = "sk-" + "x" * 24
+            for relative in (
+                Path("node_modules") / "dependency.js",
+                Path("apps") / "desktop" / "dist" / "bundle.js",
+                Path("dist") / "sidecar" / "binary.txt",
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(hidden_value, encoding="utf-8")
+            (root / "README.md").write_text("A synthetic public example.\n", encoding="utf-8")
+
+            result = self.run_audit(root, "--mode", "full")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("audited 1 file", result.stdout)
+
     def test_secret_and_absolute_home_path_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

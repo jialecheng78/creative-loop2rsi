@@ -95,6 +95,13 @@ L4_TARGETS = {
     "recovery-policy",
 }
 L5_TARGETS = {"judge", "learning-policy", "improvement-controller"}
+SYSTEM_LAB_TARGETS = {
+    "app-scaffold",
+    "controller",
+    "model-gateway",
+    "runtime-profile",
+}
+L5_TARGETS = L5_TARGETS | SYSTEM_LAB_TARGETS
 REQUIRED_PROTECTED = {
     "creative-system/creative-charter.md",
     "creative-system/approvals/",
@@ -105,6 +112,11 @@ REQUIRED_PROTECTED = {
     "human-approval-boundary",
 }
 ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+APP_SCHEMA_VERSION = "1.0"
+INITIAL_INTENT_ROOT = "creative-system/approvals/initial-intent"
+INITIAL_INTENT_RECEIPT_PATTERN = re.compile(
+    re.escape(INITIAL_INTENT_ROOT) + r"/intent-[0-9a-f]{64}\.json"
+)
 HAN_METRIC_VERSION = "unicode-han-v1"
 HAN_RANGES = (
     (0x2E80, 0x2EF3),
@@ -153,6 +165,100 @@ def sha256_file(path: Path) -> str:
 def canonical_json_bytes(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
+    )
+
+
+def app_record_content_hash(value: Mapping[str, Any]) -> str:
+    """Hash an app record without making ``content_hash`` self-referential."""
+    core = dict(value)
+    core.pop("content_hash", None)
+    return sha256_bytes(canonical_json_bytes(core))
+
+
+def initial_intent_receipt_relative(receipt: Mapping[str, Any]) -> str:
+    return f"{INITIAL_INTENT_ROOT}/intent-{app_record_content_hash(receipt)}.json"
+
+
+def validate_initial_intent_receipt(
+    root: Path, system: Mapping[str, Any]
+) -> List[str]:
+    """Validate the direct-user intent that authorizes progressive bootstrap.
+
+    This is deliberately separate from ``CharterConfirmation``. Entering a
+    first topic authorizes a calibration run, but it does not let the
+    controller pretend that the user confirmed a complete taste charter.
+    """
+    errors: List[str] = []
+    onboarding = system.get("onboarding")
+    if onboarding is None:
+        return errors
+    if not isinstance(onboarding, dict):
+        return ["onboarding 必须是对象"]
+    if onboarding.get("mode") != "progressive-app":
+        return ["onboarding.mode 无效"]
+    if onboarding.get("state") not in {"BOOTSTRAP", "ACTIVE"}:
+        errors.append("onboarding.state 无效")
+    epoch = onboarding.get("constitution_epoch")
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        errors.append("onboarding.constitution_epoch 必须是非负整数")
+    elif epoch < 0:
+        errors.append("onboarding.constitution_epoch 必须是非负整数")
+
+    relative = onboarding.get("initial_intent_receipt")
+    expected_file_sha256 = onboarding.get("initial_intent_receipt_sha256")
+    if not isinstance(relative, str) or not INITIAL_INTENT_RECEIPT_PATTERN.fullmatch(relative):
+        errors.append("onboarding.initial_intent_receipt 必须是内容寻址凭证")
+        return errors
+    try:
+        path = regular_project_file(root, relative, "initial intent receipt")
+        receipt = load_json(path)
+    except LoopCtlError as exc:
+        errors.append(str(exc))
+        return errors
+    if not isinstance(receipt, dict):
+        return ["InitialIntentReceipt 顶层必须是对象"]
+    if receipt.get("schema_version") != APP_SCHEMA_VERSION:
+        errors.append("InitialIntentReceipt.schema_version 无效")
+    if receipt.get("kind") != "InitialIntentReceipt":
+        errors.append("InitialIntentReceipt.kind 无效")
+    receipt_id = receipt.get("id")
+    if not isinstance(receipt_id, str) or not ID_PATTERN.fullmatch(receipt_id):
+        errors.append("InitialIntentReceipt.id 无效")
+    try:
+        utc_timestamp(receipt.get("created_at"), "InitialIntentReceipt.created_at")
+    except LoopCtlError as exc:
+        errors.append(str(exc))
+    if receipt.get("source_refs") != []:
+        errors.append("InitialIntentReceipt.source_refs 必须为空；初始意图直接来自用户输入")
+    intent = receipt.get("intent")
+    if not isinstance(intent, str) or not intent.strip():
+        errors.append("InitialIntentReceipt.intent 不能为空")
+    elif len(intent) > 4000:
+        errors.append("InitialIntentReceipt.intent 超过 4000 字符")
+    if receipt.get("authority") != "direct-user-input":
+        errors.append("InitialIntentReceipt.authority 必须是 direct-user-input")
+    if receipt.get("user_action") != "start-creation":
+        errors.append("InitialIntentReceipt.user_action 必须是 start-creation")
+    project = system.get("project", {})
+    if not isinstance(project, Mapping) or receipt.get("system_id") != project.get("id"):
+        errors.append("InitialIntentReceipt.system_id 与项目不一致")
+    actual_content_hash = app_record_content_hash(receipt)
+    if receipt.get("content_hash") != actual_content_hash:
+        errors.append("InitialIntentReceipt.content_hash 不一致")
+    if initial_intent_receipt_relative(receipt) != relative:
+        errors.append("InitialIntentReceipt 路径与内容摘要不一致")
+    if not isinstance(expected_file_sha256, str) or expected_file_sha256 != sha256_file(path):
+        errors.append("InitialIntentReceipt 文件哈希与 system.json 不一致")
+    return errors
+
+
+def progressive_bootstrap_authorized(root: Path, system: Mapping[str, Any]) -> bool:
+    onboarding = system.get("onboarding")
+    return (
+        isinstance(onboarding, dict)
+        and onboarding.get("mode") == "progressive-app"
+        and onboarding.get("state") in {"BOOTSTRAP", "ACTIVE"}
+        and not validate_initial_intent_receipt(root, system)
     )
 
 
@@ -1927,6 +2033,7 @@ def validate_project(
             errors.append(str(exc))
     errors.extend(validate_charter_confirmation(root, charter, warnings))
     errors.extend(validate_charter_confirmation_history(root, warnings))
+    errors.extend(validate_initial_intent_receipt(root, system))
 
     maturity = _required_dict(system.get("maturity"), "maturity", errors)
     declared_maturity = maturity.get("declared")
@@ -2337,7 +2444,12 @@ def validate_project(
             errors.append(str(exc))
 
     if not charter.get("confirmed"):
-        warnings.append("创作宪法尚未由使用者确认；只能停在 L0 onboarding")
+        if progressive_bootstrap_authorized(root, system):
+            warnings.append(
+                "PROGRESSIVE_BOOTSTRAP：初始意图允许校准创作，但不得据此声称用户已确认完整审美宪法"
+            )
+        else:
+            warnings.append("创作宪法尚未由使用者确认；只能停在 L0 onboarding")
     status = "PASS" if not errors else "BLOCK"
     return {
         "status": status,
@@ -3274,11 +3386,15 @@ def command_begin_run_locked(
     if validation["errors"]:
         raise LoopCtlError("项目合同未通过：" + "; ".join(validation["errors"]))
     system = load_system(root)
-    if not system.get("charter", {}).get("confirmed"):
+    if not system.get("charter", {}).get("confirmed") and not progressive_bootstrap_authorized(
+        root, system
+    ):
         raise LoopCtlError("NEEDS_TASTE：创作宪法尚未由使用者确认")
     loop_id = ensure_id(args.loop, "--loop")
     loop = find_loop(root, loop_id)
     task = single_line(args.task, "--task", maximum=500)
+    raw_work_id = getattr(args, "work_id", None)
+    work_id = ensure_id(raw_work_id, "--work-id") if raw_work_id else None
     run_id = ensure_id(args.run_id or generated_run_id(), "--run-id")
     if run_id != expected_run_id:
         raise LoopCtlError("run id 在获取控制器锁期间发生变化")
@@ -3296,8 +3412,12 @@ def command_begin_run_locked(
         )
         if not isinstance(run, dict):
             raise LoopCtlError(f"run.json 无效：{run_path}")
-        if run.get("loop_id") != loop_id or run.get("task") != task:
-            raise LoopCtlError("继续已有 run 时，--loop 与 --task 必须保持不变")
+        if (
+            run.get("loop_id") != loop_id
+            or run.get("task") != task
+            or (work_id is not None and run.get("work_id") != work_id)
+        ):
+            raise LoopCtlError("继续已有 run 时，--loop、--task 与 --work-id 必须保持不变")
         previous_attempts = run.get("attempts", [])
         if not isinstance(previous_attempts, list):
             raise LoopCtlError("run.attempts 无效")
@@ -3326,6 +3446,8 @@ def command_begin_run_locked(
             "release_status": "NOT_READY",
             **snapshot,
         }
+        if work_id is not None:
+            run["work_id"] = work_id
     maximum_attempts = int(loop.get("retry_budget", {}).get("max_attempts", 0))
     if next_number > maximum_attempts:
         raise LoopCtlError(f"retry budget 已耗尽：最多 {maximum_attempts} 个 attempt")
@@ -3364,6 +3486,8 @@ def command_begin_run_locked(
             "on_exhausted": runtime_on_exhausted,
         },
     }
+    if isinstance(run.get("work_id"), str):
+        attempt_record["work_id"] = run["work_id"]
     atomic_write_json(attempt_dir / "attempt.json", attempt_record)
     (attempt_dir / "artifacts").mkdir()
     run["current_attempt"] = attempt_id
@@ -4204,6 +4328,8 @@ def command_seal_attempt_locked(
         "findings": findings,
         "files": file_entries,
     }
+    if isinstance(run.get("work_id"), str):
+        manifest["work_id"] = run["work_id"]
     feedback_errors = validate_human_feedback_receipt(root, attempt_dir, manifest)
     if feedback_errors:
         raise LoopCtlError("人工反馈凭证未通过封存前验证：" + "; ".join(feedback_errors))
@@ -4295,15 +4421,16 @@ def finding_occurrences(root: Path, code: str) -> List[Dict[str, Any]]:
             continue
         for finding in manifest.get("findings", []):
             if isinstance(finding, dict) and str(finding.get("code", "")).casefold() == code.casefold():
-                matches.append(
-                    {
-                        "run_id": manifest.get("run_id"),
-                        "attempt_id": manifest.get("attempt_id"),
-                        "task": manifest.get("task"),
-                        "manifest": manifest.get("_manifest_path"),
-                        "finding": finding,
-                    }
-                )
+                occurrence = {
+                    "run_id": manifest.get("run_id"),
+                    "attempt_id": manifest.get("attempt_id"),
+                    "task": manifest.get("task"),
+                    "manifest": manifest.get("_manifest_path"),
+                    "finding": finding,
+                }
+                if isinstance(manifest.get("work_id"), str):
+                    occurrence["work_id"] = manifest["work_id"]
+                matches.append(occurrence)
     return matches
 
 
@@ -4424,11 +4551,20 @@ def command_create_candidate_locked(
     matches = finding_occurrences(root, code)
     independent_runs = sorted({str(item.get("run_id")) for item in matches if item.get("run_id")})
     independent_tasks = sorted({str(item.get("task")) for item in matches if item.get("task")})
+    independent_works = sorted(
+        {str(item.get("work_id")) for item in matches if item.get("work_id")}
+    )
     minimum = int(system.get("learning_policy", {}).get("minimum_independent_runs", 3))
-    if len(independent_runs) < minimum or len(independent_tasks) < minimum:
+    independence_unit = system.get("learning_policy", {}).get(
+        "independence_unit", "run-and-task"
+    )
+    work_gate_failed = independence_unit == "work" and len(independent_works) < minimum
+    if len(independent_runs) < minimum or len(independent_tasks) < minimum or work_gate_failed:
+        detail = f"当前 run={len(independent_runs)}、任务={len(independent_tasks)}"
+        if independence_unit == "work":
+            detail += f"、作品={len(independent_works)}"
         raise LoopCtlError(
-            f"重复 finding 必须来自至少 {minimum} 次独立真实 run/任务；"
-            f"当前 run={len(independent_runs)}、任务={len(independent_tasks)}"
+            f"重复 finding 必须来自至少 {minimum} 次独立真实 run/任务；{detail}"
         )
     producer_context_ids = finding_source_producer_context_ids(root, matches)
     producer_context_keys = {value.casefold() for value in producer_context_ids}
@@ -4470,6 +4606,10 @@ def command_create_candidate_locked(
             "id": candidate_id,
             "level": level,
             "status": "CANDIDATE",
+            "candidate_class": "CANDIDATE_ONLY" if level == "L5" else "PROMOTABLE",
+            "execution_policy": (
+                "declarative-or-maintainer-review-only" if level == "L5" else "isolated-evaluation"
+            ),
             "created_at": utc_now(),
             "builder_receipt": {
                 "role_id": builder_role_id,
@@ -4508,6 +4648,8 @@ def command_create_candidate_locked(
                 "action": "restore-active-version-pointer-and-retain-all-evidence",
             },
         }
+        if independence_unit == "work":
+            proposal["finding_cluster"]["independent_works"] = independent_works
         proposal_path = staging / "proposal.json"
         atomic_write_json(proposal_path, proposal)
         atomic_write_json(staging / "eval-plan.json", evaluation_plan)
@@ -4516,6 +4658,8 @@ def command_create_candidate_locked(
             {
                 "status": "CANDIDATE",
                 "level": level,
+                "candidate_class": "CANDIDATE_ONLY" if level == "L5" else "PROMOTABLE",
+                "code_execution_allowed": False,
                 "proposal_sha256": sha256_file(proposal_path),
                 "automatic_promotion_allowed": False,
             },
@@ -4531,6 +4675,7 @@ def command_create_candidate_locked(
         "status": "CANDIDATE",
         "candidate_id": candidate_id,
         "level": level,
+        "candidate_class": "CANDIDATE_ONLY" if level == "L5" else "PROMOTABLE",
         "proposal": (candidate_root / "proposal.json").relative_to(root).as_posix(),
         "next_step": (
             "完成目标评估、全量回归、held-out 盲评和人工批准"
@@ -7014,6 +7159,7 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("project")
     begin.add_argument("--loop", required=True)
     begin.add_argument("--task", required=True, help="自然语言代表任务；独立任务用于成熟度审计")
+    begin.add_argument("--work-id", help="可选作品标识；应用项目用它证明跨作品独立性")
     begin.add_argument("--run-id")
     begin.add_argument("--recovery-of")
     begin.add_argument("--synthetic", action="store_true", help="演示 run，不计入 finding 聚类")

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://creative-loop2rsi.local/schemas/candidate.schema.json",
+  "title": "CandidateSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "maturity", "experimental", "state", "evaluations", "humanApproval", "revision", "createdAt", "updatedAt"],
+  "properties": {
+    "id": { "$ref": "#/$defs/stableId" },
+    "maturity": { "enum": ["L4", "L5"] },
+    "experimental": { "type": "boolean" },
+    "state": {
+      "enum": ["DRAFT", "CANDIDATE", "EVALUATING", "READY_FOR_HUMAN", "PROMOTED", "REJECTED", "BLOCKED"]
+    },
+    "evaluations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targeted", "regression", "heldout"],
+      "properties": {
+        "targeted": { "$ref": "#/$defs/evaluationState" },
+        "regression": { "$ref": "#/$defs/evaluationState" },
+        "heldout": { "$ref": "#/$defs/evaluationState" }
+      }
+    },
+    "humanApproval": { "enum": ["NOT_REQUESTED", "PENDING", "APPROVED", "REJECTED"] },
+    "revision": { "type": "integer", "minimum": 0 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "blockReason": {
+      "enum": ["TARGETED_FAILED", "REGRESSION_FAILED", "HELDOUT_WORSE", "EVALUATION_TERMINAL_INVALID", "STALE_OUTPUT_CONTAMINATION", "FRESH_OUTPUT_ROOT_FAILED", "MANUAL_BLOCK"]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "maturity": { "const": "L5" } }, "required": ["maturity"] },
+      "then": { "properties": { "experimental": { "const": true }, "state": { "not": { "const": "PROMOTED" } } } }
+    },
+    {
+      "if": { "properties": { "state": { "const": "BLOCKED" } }, "required": ["state"] },
+      "then": { "required": ["blockReason"] }
+    }
+  ],
+  "$defs": {
+    "stableId": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+    "evaluationState": { "enum": ["NOT_STARTED", "RUNNING", "PASSED"] }
+  }
+}

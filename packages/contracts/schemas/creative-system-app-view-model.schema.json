@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://creative-loop2rsi.local/schemas/creative-system-app-view-model.schema.json",
+  "title": "CreativeSystemAppViewModel",
+  "description": "Non-governing camelCase projection. Python Controller on-disk documents remain the source of truth.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sourceOfTruth", "schemaVersion", "kind", "project", "charter", "maturity", "loops", "artifacts", "judges", "protectedSurfaces", "editableSurfaces", "statuses"],
+  "properties": {
+    "sourceOfTruth": { "const": "python-controller-on-disk" },
+    "schemaVersion": { "const": "0.1" },
+    "kind": { "const": "CreativeSystem" },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "domainSkill", "activeVersion"],
+      "properties": {
+        "id": { "$ref": "#/$defs/stableId" },
+        "name": { "type": "string", "minLength": 1 },
+        "domainSkill": { "$ref": "#/$defs/stableId" },
+        "activeVersion": { "$ref": "#/$defs/stableId" }
+      }
+    },
+    "charter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "confirmed"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "confirmed": { "type": "boolean" },
+        "confirmationReceipt": { "$ref": "#/$defs/evidenceRef" }
+      }
+    },
+    "maturity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["declared", "evidence"],
+      "properties": {
+        "declared": { "enum": ["L0", "L1", "L2", "L3", "L4", "L5"] },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidenceRef" } }
+      }
+    },
+    "loops": { "type": "array", "items": { "$ref": "#/$defs/relativePath" }, "uniqueItems": true },
+    "artifacts": { "type": "array" },
+    "judges": { "type": "array", "items": { "$ref": "#/$defs/relativePath" }, "uniqueItems": true },
+    "protectedSurfaces": { "type": "array", "items": { "$ref": "#/$defs/relativePath" }, "uniqueItems": true },
+    "editableSurfaces": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+    "statuses": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["execution", "quality", "release"],
+      "properties": {
+        "execution": { "enum": ["NOT_STARTED", "RUNNING", "PASS", "BLOCK"] },
+        "quality": { "enum": ["NOT_EVALUATED", "PASS", "WARN", "NEEDS_TASTE"] },
+        "release": { "enum": ["NOT_READY", "CANDIDATE", "PASS", "BLOCK"] }
+      }
+    }
+  },
+  "$defs": {
+    "stableId": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+    "relativePath": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:[\\\\/])(?!.*(?:^|/)\\.\\.(?:/|$)).+$" },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "bytes"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "kind": { "type": "string" }
+      }
+    }
+  }
+}

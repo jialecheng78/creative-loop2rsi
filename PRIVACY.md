@@ -9,10 +9,13 @@
 - API 地址固定为 `https://api.deepseek.com`；
 - 只使用 `/models` 与 `/chat/completions`；
 - 不发送自定义 `user_id`；
+- 同一创作系统的后续作品会同时发送用户最初填写的创作方向和本次任务；尚未由用户采用的模型推测不会加入上下文；
 - 不把 API Key、完整本机路径、应用日志或无关作品自动加入请求；
 - 应用关闭后不继续调用模型。
 
 DeepSeek 如何处理 API 请求由其公开政策和用户与 DeepSeek 之间的关系决定。本项目不能替 DeepSeek 作隐私保证。
+
+当前 alpha 的受信 DSH Node 子进程尚未使用 OS 级出网沙箱。受信 Profile 不向模型提供网络工具，正常模型调用只指向本机 Gateway，但这不能从操作系统层阻止 DSH 或其依赖代码自行联网。完成强制出网隔离前，本项目不会把这一配置描述为物理安全边界。
 
 ## 保留在本机的数据
 
@@ -22,10 +25,12 @@ DeepSeek 如何处理 API 请求由其公开政策和用户与 DeepSeek 之间�
 
 模型的 `reasoning_content` 只在需要完成当前工具调用回合时暂存在内存，回合封存后不写入作品、证据或导出包。
 
+为守住这条边界，v1 的受信 DSH Profile 不挂载 JSONL Session 持久化或 checkpoint 插件。应用崩溃后可以恢复已经由 Controller 封存的作品、反馈和版本，但不会从未完成的模型推理中续跑；用户可从最后一个封存边界重新开始。
+
 ## API Key
 
 - Key 只由 Electron Main 进程读取；
-- Renderer、Preload 业务接口、DSH Worker、Python Controller 和候选都拿不到明文 Key；
+- Key 只在输入页内存中短暂停留，并通过一次性业务 IPC 交给 Main；Renderer 无法回读或持久化它，DSH Worker、Python Controller 和候选也拿不到明文 Key；
 - Key 不进入环境变量、命令行、日志、崩溃报告、Session、Git 或导出包；
 - 删除 Key 会删除本地密文，但不会删除用户在 DeepSeek 平台创建的 Key；如怀疑泄露，仍应在 DeepSeek 平台撤销并轮换。
 

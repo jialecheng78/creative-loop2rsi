@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "paths": {
+      "@creative-loop2rsi/controller-bridge": ["../../packages/controller-bridge/src/index.ts"],
+      "@creative-loop2rsi/model-gateway": ["../../packages/model-gateway/src/index.ts"],
+      "@creative-loop2rsi/runtime-dsh": ["../../packages/runtime-dsh/src/index.ts"],
+      "@creative-loop2rsi/runtime-dsh/worker-protocol": ["../../packages/runtime-dsh/src/worker-protocol.ts"]
+    },
+    "types": ["node", "electron", "vitest/globals"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts"]
+}

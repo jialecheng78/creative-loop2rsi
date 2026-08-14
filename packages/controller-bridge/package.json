@@ -1,0 +1,28 @@
+{
+  "name": "@creative-loop2rsi/controller-bridge",
+  "version": "1.0.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

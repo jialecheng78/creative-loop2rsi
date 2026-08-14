@@ -1,0 +1,271 @@
+export const CONTROLLER_PROTOCOL_VERSION = "1" as const;
+
+export type JsonPrimitive = boolean | null | number | string;
+export type JsonValue = JsonPrimitive | JsonObject | readonly JsonValue[];
+export interface JsonObject {
+  readonly [key: string]: JsonValue;
+}
+
+export const CONTROLLER_OPERATIONS = [
+  "begin_work",
+  "bootstrap_intent",
+  "candidate_summary",
+  "cancel_work",
+  "complete_work",
+  "create_system_lab_candidate",
+  "record_feedback",
+  "resume_feedback",
+  "seal_feedback",
+  "submit_feedback",
+  "system_snapshot",
+] as const;
+
+export type ControllerOperation = (typeof CONTROLLER_OPERATIONS)[number];
+
+export interface BootstrapIntentPayload {
+  readonly project: string;
+  readonly system_id: string;
+  readonly display_name: string;
+  readonly intent: string;
+  readonly domain_skill?: string;
+}
+
+export interface BeginWorkPayload {
+  readonly project: string;
+  readonly work_id: string;
+  readonly task: string;
+  readonly loop?: string;
+  readonly run_id?: string;
+  readonly recovery_of?: string;
+  readonly dispatch_id?: string;
+  readonly context_id?: string;
+  readonly context_sha256: string;
+}
+
+export interface CancelWorkPayload {
+  readonly project: string;
+  readonly run_id: string;
+  readonly dispatch_id: string;
+  readonly reason: string;
+  readonly runtime_provenance?: CompleteWorkRuntimeProvenance;
+}
+
+export interface RuntimeProvenanceParameters {
+  readonly thinking: "enabled";
+  readonly reasoning_effort: "high";
+  readonly max_tokens: 16384;
+}
+
+export interface RuntimeProvenanceUsage {
+  readonly cache_hit_tokens?: number;
+  readonly cache_miss_tokens?: number;
+  readonly completion_tokens?: number;
+  readonly prompt_tokens?: number;
+  readonly total_tokens?: number;
+}
+
+export interface CompleteWorkRuntimeProvenance {
+  readonly app_version: string;
+  readonly completed_at: string | null;
+  readonly controller_version: string;
+  readonly context_sha256: string;
+  readonly dsh_version: string;
+  readonly completed_requests: number;
+  readonly failed_requests: number;
+  readonly parameters: RuntimeProvenanceParameters;
+  readonly profile_sha256: string;
+  readonly request_count: number;
+  readonly requests: readonly RuntimeRequestProvenance[];
+  readonly requested_model: "deepseek-v4-flash" | "deepseek-v4-pro";
+  readonly response_id: string | null;
+  readonly returned_model: string | null;
+  readonly system_fingerprint: string | null;
+  readonly usage: RuntimeProvenanceUsage;
+}
+
+export interface RuntimeRequestProvenance {
+  readonly request_number: number;
+  readonly started_at: string;
+  readonly completed_at: string | null;
+  readonly status: "STARTED" | "COMPLETED" | "FAILED";
+  readonly http_status: number | null;
+  readonly error_code: string | null;
+  readonly response_id: string | null;
+  readonly returned_model: string | null;
+  readonly system_fingerprint: string | null;
+  readonly usage: RuntimeProvenanceUsage;
+}
+
+export interface CompleteWorkPayload {
+  readonly project: string;
+  readonly run_id: string;
+  readonly dispatch_id?: string;
+  readonly output: string;
+  readonly runtime_provenance: CompleteWorkRuntimeProvenance;
+}
+
+export interface SystemSnapshotPayload {
+  readonly project: string;
+}
+
+export interface RecordFeedbackPayload {
+  readonly project: string;
+  readonly run_id: string;
+  readonly event_id: string;
+  readonly action: "edit" | "keep" | "reject" | "rewrite";
+  readonly feedback_at: string;
+  readonly feedback_text?: string;
+  readonly edited_text?: string;
+}
+
+export interface SealFeedbackPayload {
+  readonly project: string;
+  readonly feedback_receipt: string;
+  readonly dispatch_id?: string;
+  readonly execution_status?: "BLOCK" | "PASS";
+  readonly quality_status?: "NEEDS_TASTE" | "NOT_EVALUATED" | "PASS" | "WARN";
+  readonly release_status?: "BLOCK" | "CANDIDATE" | "NOT_READY" | "PASS";
+  readonly decision?: "commit" | "escalate" | "revise" | "stop";
+  readonly finding_paths?: readonly string[];
+  readonly evidence_paths?: readonly string[];
+  readonly machine_direction?: "BLOCK" | "PASS" | "UNKNOWN";
+  readonly improved?: "false" | "true" | "unknown";
+  readonly stop_reason?: string;
+  readonly hard_contract_false_pass?: boolean;
+  readonly recovery_exercised?: boolean;
+  readonly local_recovery_preserved_upstream?: boolean;
+  readonly end_to_end_no_regression?: boolean;
+  readonly resolved_observed_problem?: boolean;
+}
+
+export interface SubmitFeedbackPayload {
+  readonly project: string;
+  readonly run_id: string;
+  readonly action: "edit" | "keep" | "reject" | "rewrite";
+  readonly feedback_at: string;
+  readonly feedback_text?: string;
+  readonly edited_text?: string;
+  readonly machine_direction: "BLOCK" | "PASS" | "UNKNOWN";
+}
+
+export interface ResumeFeedbackPayload {
+  readonly project: string;
+  readonly run_id: string;
+}
+
+export type SystemLabTarget =
+  | "app-scaffold"
+  | "controller"
+  | "improvement-controller"
+  | "judge"
+  | "learning-policy"
+  | "model-gateway"
+  | "runtime-profile";
+
+export interface CreateSystemLabCandidatePayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly finding_code: string;
+  readonly root_cause: string;
+  readonly target_component: SystemLabTarget;
+  readonly change_summary: string;
+  readonly changed_paths: readonly string[];
+  readonly evaluation_plan?: string;
+  readonly budget?: number;
+  readonly builder_role_id: string;
+  readonly builder_context_id: string;
+  readonly builder_task_id: string;
+  readonly builder_attested_by: string;
+}
+
+export interface CandidateSummaryPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+}
+
+interface ControllerRequestBase<
+  TOperation extends ControllerOperation,
+  TPayload extends object,
+> {
+  readonly request_id: string;
+  readonly operation: TOperation;
+  readonly payload: TPayload;
+}
+
+export type ControllerRequest =
+  | ControllerRequestBase<"begin_work", BeginWorkPayload>
+  | ControllerRequestBase<"bootstrap_intent", BootstrapIntentPayload>
+  | ControllerRequestBase<"candidate_summary", CandidateSummaryPayload>
+  | ControllerRequestBase<"cancel_work", CancelWorkPayload>
+  | ControllerRequestBase<"complete_work", CompleteWorkPayload>
+  | ControllerRequestBase<"create_system_lab_candidate", CreateSystemLabCandidatePayload>
+  | ControllerRequestBase<"record_feedback", RecordFeedbackPayload>
+  | ControllerRequestBase<"resume_feedback", ResumeFeedbackPayload>
+  | ControllerRequestBase<"seal_feedback", SealFeedbackPayload>
+  | ControllerRequestBase<"submit_feedback", SubmitFeedbackPayload>
+  | ControllerRequestBase<"system_snapshot", SystemSnapshotPayload>;
+
+export type ControllerWireRequest = ControllerRequest & {
+  readonly protocol_version: typeof CONTROLLER_PROTOCOL_VERSION;
+};
+
+export type ControllerStatus = "BLOCK" | "CANDIDATE" | "NEEDS_TASTE" | "PASS" | "WARN";
+
+export interface ControllerErrorPayload extends JsonObject {
+  readonly code: string;
+  readonly message: string;
+}
+
+export interface ControllerResponse extends JsonObject {
+  readonly protocol_version: typeof CONTROLLER_PROTOCOL_VERSION;
+  readonly request_id: string | null;
+  readonly operation: ControllerOperation | null;
+  readonly status: ControllerStatus;
+  readonly error?: ControllerErrorPayload;
+}
+
+export interface ControllerInvocation<T extends ControllerResponse = ControllerResponse> {
+  readonly exitCode: number;
+  readonly payload: T;
+}
+
+export interface ControllerExecutable {
+  /** Trusted absolute path to the bundled sidecar or a development interpreter. */
+  readonly file: string;
+  /** Trusted fixed argv, e.g. ["-m", "creative_loop2rsi"] during development. */
+  readonly fixedArguments?: readonly string[];
+  /** Trusted working directory; never populate this from Renderer input. */
+  readonly cwd?: string;
+}
+
+export interface ControllerBridgeOptions {
+  readonly maxOutputBytes?: number;
+  readonly maxRequestBytes?: number;
+  readonly timeoutMs?: number;
+}
+
+export interface ControllerInvokeOptions {
+  readonly signal?: AbortSignal;
+}
+
+export type ControllerBridgeErrorCode =
+  | "CONTROLLER_ABORTED"
+  | "CONTROLLER_NOT_FOUND"
+  | "CONTROLLER_OUTPUT_LIMIT"
+  | "CONTROLLER_PROCESS_ERROR"
+  | "CONTROLLER_PROTOCOL_ERROR"
+  | "CONTROLLER_REQUEST_LIMIT"
+  | "CONTROLLER_TIMEOUT"
+  | "INVALID_CONTROLLER_REQUEST";
+
+export class ControllerBridgeError extends Error {
+  readonly code: ControllerBridgeErrorCode;
+  readonly exitCode: number | null;
+
+  constructor(code: ControllerBridgeErrorCode, message: string, exitCode: number | null = null) {
+    super(message);
+    this.name = "ControllerBridgeError";
+    this.code = code;
+    this.exitCode = exitCode;
+  }
+}

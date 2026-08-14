@@ -1,0 +1,176 @@
+name: Preview release preflight
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "studio-v1.0.0-alpha.*"
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUTF8: "1"
+
+jobs:
+  source-evidence:
+    name: source archive evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact ref
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Build and audit exact tracked source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-evidence"
+          python tools/audit_release_archive.py . \
+            --treeish HEAD \
+            --output "$RUNNER_TEMP/source-evidence/creative-loop2rsi-source.tar" \
+            --manifest "$RUNNER_TEMP/source-evidence/source.manifest.json"
+
+      - name: Upload source evidence only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: source-evidence
+          path: ${{ runner.temp }}/source-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  controller-sidecar:
+    name: controller sidecar (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            sidecar_dir: dist/controller-sidecar-macos-arm64
+            executable: dist/controller-sidecar-macos-arm64/creative-rsi-controller
+          - name: Windows x64
+            os: windows-2025
+            sidecar_dir: dist/controller-sidecar-windows-x64
+            executable: dist/controller-sidecar-windows-x64/creative-rsi-controller.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout exact ref
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up CPython 3.11
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install hash-locked builder
+        run: python -m pip install --disable-pip-version-check --require-hashes -r python/requirements-build-hashed.txt
+
+      - name: Build and compare sidecar protocol
+        run: |
+          python tools/build_controller_sidecar.py
+          python tools/check_controller_sidecar.py "${{ matrix.executable }}"
+
+      - name: Upload unpacked sidecar evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: controller-sidecar-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            ${{ matrix.sidecar_dir }}
+            ${{ matrix.sidecar_dir }}.manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  desktop-compiled-preflight:
+    name: desktop compiled preflight (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+          - name: Windows x64
+            os: windows-2025
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout exact ref
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
+
+      - name: Set up Python for evidence audit
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned workspace
+        run: |
+          npm install --global pnpm@11.7.0
+          pnpm install --frozen-lockfile
+
+      - name: Typecheck, test and compile desktop sources
+        run: |
+          pnpm run check
+          pnpm --filter @creative-loop2rsi/runtime-dsh probe:published
+          pnpm run package:preview
+
+      - name: Audit compiled desktop evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find apps/desktop/dist -type f -name '*.map' -print -quit | grep -q .; then
+            echo "Compiled preview evidence must not contain source maps." >&2
+            exit 1
+          fi
+          python tools/audit_public_tree.py apps/desktop/dist --mode full
+
+      - name: Generate path-free dependency evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/desktop-evidence"
+          mkdir -p "$evidence"
+          pnpm list --prod --json --depth Infinity > "$RUNNER_TEMP/pnpm-list.json"
+          pnpm licenses list --prod --json > "$RUNNER_TEMP/pnpm-licenses-raw.json"
+          python tools/build_node_sbom.py \
+            --input "$RUNNER_TEMP/pnpm-list.json" \
+            --output "$evidence/creative-rsi-studio.cdx.json"
+          python tools/sanitize_pnpm_licenses.py \
+            --input "$RUNNER_TEMP/pnpm-licenses-raw.json" \
+            --output "$evidence/licenses.json"
+          python tools/audit_public_tree.py "$evidence" --mode full
+
+      - name: Upload compiled and dependency evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: desktop-compiled-preflight-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            apps/desktop/dist
+            ${{ runner.temp }}/desktop-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  release-blocker:
+    name: installer release remains blocked
+    runs-on: ubuntu-latest
+    steps:
+      - name: State the alpha packaging boundary
+        shell: bash
+        run: |
+          echo "This workflow intentionally does not create a GitHub Release."
+          echo "DMG, Windows installer, signing, notarization, packaged smoke, and human installation tests remain release blockers."

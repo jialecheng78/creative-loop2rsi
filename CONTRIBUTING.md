@@ -17,7 +17,7 @@
 - 客户资料、未发表作品、真实账号、密钥、token、`.env` 或带隐私的截图；
 - 通过复制私有项目再删减得到的内容；
 - 绕过 Model Gateway、自定义模型地址、遥测、云同步或在 CI 中使用真实 API Key 的变更；
-- 让 Renderer、DSH Worker、Controller 或候选直接读取 Key 的变更；
+- 让 Renderer 回读或持久化 Key，或让 DSH Worker、Controller、候选直接读取 Key 的变更；
 - 执行模型生成的任意代码、Shell 或动态插件的变更；
 - 自动改写创作宪法、自动晋升 L5 候选或绕过人工审批的能力。
 
@@ -39,8 +39,8 @@
 python3 -B -m unittest discover -s tests -v
 python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
   skills/creative-loop2rsi
-corepack pnpm install --frozen-lockfile
-corepack pnpm run check
+pnpm install --frozen-lockfile
+pnpm run check
 python3 tools/audit_public_tree.py . --mode full
 python3 tools/check_dco.py . --range HEAD
 python3 tools/audit_release_archive.py . --treeish HEAD

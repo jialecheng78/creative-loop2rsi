@@ -1,0 +1,45 @@
+# Trusted Creative RSI Studio profile. stdout belongs exclusively to the DSH
+# SDK JSON-RPC protocol. This composition intentionally mounts no shell,
+# filesystem, web, MCP, dynamic-code, Creator, approval, telemetry, or
+# persistent-session plugin. The pinned persistence backend stores reasoning
+# chunks losslessly, so v1 keeps DSH sessions in memory only.
+
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  config:
+    maxTokensAsSuccess: false
+
+# The value resolved from CREATIVE_RSI_GATEWAY_TOKEN is a short-lived local
+# capability, never the user's DeepSeek API key. The loopback Gateway strips
+# DSH attribution headers and injects the real key only for the official API.
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    apiKeyEnv: CREATIVE_RSI_GATEWAY_TOKEN
+    baseURL: !!js process.env.CREATIVE_RSI_GATEWAY_URL
+    thinking: enabled
+    reasoningEffort: high
+    maxTokens: 16384
+    defaultContextWindow: 128000
+    models:
+      - id: deepseek-v4-pro
+        name: DeepSeek V4 Pro
+        contextWindow: 128000
+        maxTokens: 16384
+      - id: deepseek-v4-flash
+        name: DeepSeek V4 Flash
+        contextWindow: 128000
+        maxTokens: 16384
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    dshHome: !!js process.env.DSH_HOME
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    persona: You are a creative-writing assistant. Follow the user's explicit creative direction and do not invent governing taste rules.
+    workspaceContext: false
+    skills:
+      enabled: false
+    toolBash: false
+    toolJobs: false

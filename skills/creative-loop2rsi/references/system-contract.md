@@ -258,6 +258,16 @@ python3 loopctl.py open-human-review <project> --run-id <run-id> \
 
 receipt 绑定 run、attempt、Loop、冻结 subject/anchor、两项人工判断、时间与依据快照。时间必须满足 `attempt.opened_at < review_available_at <= feedback_at <= sealed_at`；manifest 的 `machine_direction` 必须等于反馈前冻结的方向。顶层人工字段只是查询缓存；`audit` 只统计通过 receipt 校验的判断。控制器不能认证身份字符串，Skill 必须回查真实用户消息，不能让执行 Agent 自写“用户已认可”。
 
+### App 恢复快照与用户修订稿
+
+App 的 `system_snapshot.last_work` 只能暴露两类作品：已由可验证 `HumanReviewSubject / HumanReviewOpenAnchor` 冻结的送审版，或已由通过 `verify_sealed_attempt` 的 `AttemptManifest` 绑定的封存版。仅在 Producer allowed-writes 中存在 `work.md` 不构成可恢复成品；快照必须返回 `recovery_required=true` 和独立的 `interrupted_run`，且继续向前查找最近一份合法封存/冻结作品。因此后启的未完成 run 不得遮蔽之前已保存作品，也不得被 Renderer 描述为“已保存”。
+
+App 的 `edit` 反馈必须把用户逐字修订后的 UTF-8 字节另存为内容寻址、不可覆盖的 `UserRevisionArtifact`。`AppFeedbackReceipt` 同时绑定原 `HumanReviewSubject` 的哈希和修订稿的 path/sha256/bytes；Producer 原稿保持不变。当该 receipt 已与封存 manifest 的人工反馈依据对应时，快照向用户返回修订稿的精确字节，同时继续保留原稿、冻结 subject、receipt 和 manifest 作为完整证据链。
+
+App 每次 `begin_work` 还必须在受保护的 `creative-system/approvals/work-tasks/` 内不可覆盖地写入 `WorkTaskReceipt`，保存用户实际提交的最多 100 KB UTF-8 多行任务，并绑定当时 `InitialIntentReceipt` 原文的 `context_sha256`。run/attempt 只保存 `work-task-sha256:<digest>` 内容寻址引用；DSH instruction 必须由与 receipt 相同的冻结字符串及该哈希所指向的初始意图生成。Controller 响应、公共日志和运行标识不得回显原任务；重试同一 run 时必须验证原文、哈希、字节数和授权上下文完全一致。
+
+App 提交反馈必须先不可覆盖地写 `AppFeedbackTransactionIntent`，把 action、反馈原文、用户修订稿、冻结机器方向、run 与 attempt 作为一份 exact semantic 固定下来，再依次写 `recorded / sealed / committed` 证据。进程在任一阶段中断后，Renderer 只能调用 allowlisted `resume_feedback` 并传 `project + run_id`；不得重传、缓存后重构或猜测反馈原文。Controller 必须从已落盘 intent 恢复同一 semantic 并只向前补齐缺失阶段。恢复结果以 `RECOVERED / ALREADY_COMMITTED / NO_TRANSACTION` 区分；同一 run 出现多个事务、intent/marker/receipt/manifest 漂移、未声明文件或反向缺失阶段时一律 fail closed，不得选择“看起来最新”的记录。
+
 ### DispatchStallRecord
 
 零文件恢复使用与内容 `retry_budget` 独立的记录：

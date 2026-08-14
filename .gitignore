@@ -25,6 +25,16 @@ build/
 dist/
 *.egg-info/
 
+# Node / Electron
+node_modules/
+.pnpm-store/
+.webpack/
+.vite/
+coverage/
+out/
+release/
+*.tsbuildinfo
+
 # Secrets and local configuration
 .env
 .env.*
@@ -43,6 +53,9 @@ private-denylist.txt
 
 # Release artifacts
 *.zip
+*.dmg
+*.exe
+*.msi
 *.tar
 *.tar.gz
 SHA256SUMS.local

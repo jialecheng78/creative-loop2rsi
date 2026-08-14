@@ -1,0 +1,10 @@
+# Build-only dependencies for the CPython 3.11 --onedir governance sidecar.
+# Keep every transitive dependency pinned so CI does not silently change builders.
+altgraph==0.17.5
+macholib==1.16.4; sys_platform == "darwin"
+packaging==26.3
+pefile==2024.8.26; sys_platform == "win32"
+pyinstaller==6.22.0
+pyinstaller-hooks-contrib==2026.6
+pywin32-ctypes==0.2.3; sys_platform == "win32"
+setuptools==82.0.0

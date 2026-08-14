@@ -2,9 +2,10 @@
 """Audit the current working tree without reading network or secret stores.
 
 ``tracked`` gets paths from the Git index but reads bytes from the working tree;
-``full`` also includes untracked files. Use ``audit_release_archive.py`` to bind
-an audit to the exact bytes of a commit archive. Neither mode replaces a full
-Git-history scanner.
+``full`` also includes untracked source files, while pruning dependency stores
+and generated build/output roots that can never belong to the source archive.
+Use ``audit_release_archive.py`` to bind an audit to the exact bytes of a commit
+archive. Neither mode replaces a full Git-history scanner.
 """
 
 from __future__ import annotations
@@ -21,7 +22,18 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 
 DEFAULT_MAX_BYTES = 1_000_000
-IGNORED_FULL_DIRS = {".git"}
+IGNORED_FULL_DIRS = {
+    ".git",
+    ".pnpm-store",
+    ".vite",
+    ".webpack",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "out",
+    "release",
+}
 CACHE_PARTS = {
     "__pycache__",
     ".pytest_cache",

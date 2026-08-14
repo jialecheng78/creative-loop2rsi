@@ -2,7 +2,7 @@
 
 `creative-loop2rsi` 正在演进为 **Creative RSI Studio**：一套中文优先、本地优先的开源桌面应用，帮助普通用户从第一次创作开始，把自己的创作标准逐步变成一套可运行、可恢复、可审计、可验证改进的系统。
 
-原有 Codex Builder Skill 和 Python `loopctl` 治理控制器继续保留。桌面应用负责普通用户体验，DSH 负责运行 Producer、Judge 和候选工作流，Python Controller 继续负责证据、晋升和回滚。DSH 运行成功不等于候选已获准进入生产。
+原有 Codex Builder Skill 和 Python `loopctl` 治理控制器继续保留。当前应用源码已接通普通用户首次创作与反馈，DSH 只承载 Production 创作 Worker；Judge、Candidate、Evaluator 与应用内晋升/回滚仍是目标架构。Python Controller 继续负责证据与既有治理命令。即使后续 DSH 候选工作流运行成功，也不等于候选已获准进入生产。
 
 ```text
 创作立宪
@@ -42,9 +42,9 @@
 
 | 层 | 负责什么 | 不负责什么 |
 |---|---|---|
-| Creative RSI Studio | 负责普通用户创作、反馈、候选比较与版本操作 | 不向用户暴露运行时和治理细节 |
+| Creative RSI Studio | 当前负责普通用户首次创作与反馈；候选比较和版本操作为 `PROPOSED` | 不向用户暴露运行时和治理细节 |
 | Builder Skill | 用自然语言引导立宪、选择下一成熟度、解释阻塞原因 | 不保存运行事实，不代替控制器 |
-| DSH Runtime Adapter | 运行 Producer、Judge、Builder 和 Evaluator | 不决定候选能否晋升 |
+| DSH Runtime Adapter | 当前运行 Production Producer；Judge、Builder 和 Evaluator 为 `PROPOSED` | 不决定候选能否晋升 |
 | 领域 Skill / System Recipe | 承载使用者自己的创作方法、语境和交互方式 | 不自行改变受保护规则 |
 | Python Controller 与运行项目 | 保存合同、状态、证据、候选、晋升与回滚记录 | 不调用模型，不判断作品是否“有灵魂” |
 
@@ -67,8 +67,11 @@
 | 三名非程序员在 20 分钟内完成 L0 与首个 L1 | `UNVALIDATED` | 尚未用真人测试，自动 Agent 测试不能替代 |
 | L5 修改 Judge、学习策略或改进控制器 | `UNVALIDATED` | 只生成 `CANDIDATE`；禁止自动晋升 |
 | 从 L0 到 L4、再证明晋升后运行 N 轮 | `IMPLEMENTED` | 分开 bootstrap 与 post-L4 计数；仍需真实人工门和独立评价者 |
-| Desktop monorepo、DeepSeek Gateway 与 DSH Adapter | `IN DEVELOPMENT` | 只允许 DeepSeek 官方 API；不接入遥测、云同步或自动训练 |
-| 无签名 macOS / Windows 安装包 | `PROPOSED` | 通过打包和真人安装验收前不得标为已实现 |
+| Desktop monorepo、DeepSeek Gateway 与 DSH Adapter | `IMPLEMENTED` | 已通过 mock、协议和 rc.6 启停探针；尚未做真实 Key 与 GUI 打包验收 |
+| Key → 模型 → 主题 → 首个作品 → 编辑/反馈的应用闭环 | `IMPLEMENTED` | Controller 与应用服务真实联调通过；Pro/Flash 实网创作仍是 `UNVALIDATED` |
+| DSH 运行中 Session 的跨进程恢复 | `UNVALIDATED` | v1 主动禁用：rc.6 持久化会落盘 reasoning；只从 Controller 封存边界重新派发 |
+| 应用内跨作品 finding、候选三评估、采用与回滚 | `PROPOSED` | Renderer 只有诚实空态；现有 Python 治理能力尚未接成普通用户闭环 |
+| 无签名 macOS / Windows 安装包 | `PROPOSED` | 当前只完成编译和 sidecar 预检；没有可下载的 DMG、EXE 或 portable ZIP |
 
 ## Skill 基线安装
 

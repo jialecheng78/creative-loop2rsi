@@ -1,0 +1,43 @@
+{
+  "name": "@creative-loop2rsi/runtime-dsh",
+  "version": "1.0.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./worker-protocol": {
+      "types": "./src/worker-protocol.ts",
+      "default": "./dist/worker-protocol.js"
+    }
+  },
+  "files": [
+    "dist",
+    "profiles",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "probe:published": "node scripts/probe-published-runtime.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-spine-demo": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm-deepseek": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sdk-client": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sdk-jsonrpc-demo": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sdk-jsonrpc-server": "0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  }
+}

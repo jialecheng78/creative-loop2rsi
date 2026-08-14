@@ -1,5 +1,7 @@
 # Creative RSI Studio v1 威胁模型
 
+本威胁模型同时覆盖当前 alpha 与完整 v1 目标。表中 Candidate/Evaluator Worker 尚未接入应用，相关隔离与终止规则当前为 `PROPOSED`，不能据此声称已经实现。
+
 ## 受保护资产
 
 - DeepSeek API Key；
@@ -16,9 +18,9 @@
 | Preload | 参数校验与窄 IPC | 暴露 `ipcRenderer` 或通用 send |
 | Main Supervisor | 进程管理、凭证、Gateway、生产指针 | 执行模型生成代码 |
 | Model Gateway | DeepSeek 白名单请求 | 自定义 URL、跨域重定向、日志 Key |
-| DSH Production Worker | 受信 Profile 与模型能力句柄 | 明文 Key、原始网络、Shell、动态代码 |
-| Candidate Worker | 候选副本与限额模型能力 | production、held-out、晋升与发布 |
-| Evaluator Worker | 盲化输入和评价输出 | 候选修改意图、明文 Key、晋升操作 |
+| DSH Production Worker | 受信 Profile 与模型能力句柄；模型侧无网络/Shell/动态代码工具 | 明文 Key；alpha 尚未用 OS 沙箱禁止受信进程自身的原始网络 |
+| Candidate Worker（目标） | 候选副本与限额模型能力 | production、held-out、晋升与发布 |
+| Evaluator Worker（目标） | 盲化输入和评价输出 | 候选修改意图、明文 Key、晋升操作 |
 | Python Controller | 合同、证据、晋升、回滚 | 网络和凭证 |
 
 ## v1 明确不解决
@@ -28,11 +30,12 @@
 - 未签名 alpha 的发布者身份认证；
 - 对模型输出文学价值、真实性或市场结果的保证；
 - 任意不可信代码的安全执行。
+- alpha 阶段对受信 DSH Node 进程的 OS 级出网隔离；在完成前不得宣称 Main 是唯一具备原始网络能力的进程。
 
 ## Fail-closed 规则
 
 - 安全存储不可用时不保存 Key，也不启动模型调用；
 - 模型或 `system_fingerprint` 跨评价变化时阻断候选晋升；
-- Candidate、Evaluator 或 Renderer 请求越权能力时记录事件并终止该 Worker；
+- 当前 Renderer 请求越权能力时拒绝调用；完整 v1 目标是在 Candidate 或 Evaluator 越权时记录事件并终止对应 Worker；
 - 任何评价缺失、重复、旧结果污染或证据哈希变化都阻断晋升；
 - 未检测到用户点击形成的人工回执时，active release pointer 不得变化。

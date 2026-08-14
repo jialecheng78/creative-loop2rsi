@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://creative-loop2rsi.local/schemas/model-response-metadata.schema.json",
+  "title": "ModelResponseMetadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["requestedModel", "returnedModel", "systemFingerprint", "usage", "finishReason", "requestId", "parameters"],
+  "properties": {
+    "requestedModel": { "type": "string", "minLength": 1 },
+    "returnedModel": { "type": ["string", "null"] },
+    "systemFingerprint": { "type": ["string", "null"] },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["promptTokens", "completionTokens", "totalTokens"],
+      "properties": {
+        "promptTokens": { "type": "integer", "minimum": 0 },
+        "completionTokens": { "type": "integer", "minimum": 0 },
+        "totalTokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "finishReason": { "type": ["string", "null"] },
+    "requestId": { "type": ["string", "null"] },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream", "maxTokens", "temperature"],
+      "properties": {
+        "stream": { "type": "boolean" },
+        "maxTokens": { "type": ["integer", "null"], "minimum": 1 },
+        "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 2 }
+      }
+    }
+  }
+}

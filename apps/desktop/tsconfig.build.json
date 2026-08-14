@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "paths": {
+      "@creative-loop2rsi/controller-bridge": ["../../packages/controller-bridge/dist/index.d.ts"],
+      "@creative-loop2rsi/model-gateway": ["../../packages/model-gateway/dist/index.d.ts"],
+      "@creative-loop2rsi/runtime-dsh": ["../../packages/runtime-dsh/dist/index.d.ts"],
+      "@creative-loop2rsi/runtime-dsh/worker-protocol": ["../../packages/runtime-dsh/dist/worker-protocol.d.ts"]
+    },
+    "types": ["node", "electron"]
+  },
+  "include": ["src/main/**/*.ts", "src/preload/**/*.ts", "src/worker/**/*.ts"]
+}
