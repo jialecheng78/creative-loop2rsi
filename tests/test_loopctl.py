@@ -34,9 +34,11 @@ class LoopCtlTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def command(self, *arguments, expected=0):
+    def command(self, *arguments, expected=0, environment_overrides=None):
         environment = dict(os.environ)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        if environment_overrides:
+            environment.update(environment_overrides)
         result = subprocess.run(
             [sys.executable, str(SCRIPT), *map(str, arguments)],
             cwd=str(REPO),
@@ -505,6 +507,35 @@ class LoopCtlTests(unittest.TestCase):
         first = self.init_project("first", confirmed=False)
         second = self.init_project("second", confirmed=False)
         self.assertEqual(self.tree_hashes(first), self.tree_hashes(second))
+
+    def test_cli_emits_utf8_json_when_platform_stdio_is_non_utf8(self):
+        target = self.root / "non-utf8-stdio"
+        payload = self.command(
+            "init",
+            target,
+            "--project-name",
+            "纸灯故事实验",
+            "--creative-goal",
+            "创作一篇完整的成长短篇",
+            "--minimum-product",
+            "一篇有结尾的短故事",
+            "--representative-task",
+            "写一个孩子修好风筝的故事",
+            "--constraints",
+            "不得使用真实个人信息",
+            "--taste",
+            "喜欢具体动作，不喜欢说教",
+            "--domain-skill",
+            "non-utf8-story-loop",
+            environment_overrides={
+                "PYTHONIOENCODING": "cp1252",
+                "PYTHONUTF8": "0",
+            },
+        )
+        self.assertEqual(payload["status"], "PASS")
+        self.assertTrue(payload["next_step"].startswith("阅读"))
+        system = self.read_json(target / "creative-system/system.json")
+        self.assertEqual(system["project"]["name"], "纸灯故事实验")
 
     def test_measure_artifact_writes_governing_controller_facts(self):
         project = self.init_project()

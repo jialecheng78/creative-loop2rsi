@@ -618,6 +618,9 @@ def load_system(root: Path) -> Dict[str, Any]:
 
 
 def output(payload: Mapping[str, Any], *, stream: Any = sys.stdout) -> None:
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8", errors="strict")
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), file=stream)
 
 

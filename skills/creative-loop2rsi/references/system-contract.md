@@ -9,6 +9,7 @@
 - 每个产物恰好有一个写入 owner；可以有多个读取者。
 - 把事实证据与解释分开。Finding 的 `evidence` 指向可检查产物，不把 Judge 结论本身当原始证据。
 - 把成熟度视为审计结果，不允许用户配置直接宣告更高等级。
+- `loopctl.py` 的结构化输出固定为 UTF-8 JSON，不依赖 Windows 或其他平台的本地控制台编码。
 
 ## 2. CreativeSystem
 
