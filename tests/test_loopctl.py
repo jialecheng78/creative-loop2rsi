@@ -110,7 +110,11 @@ class LoopCtlTests(unittest.TestCase):
     def write_json(path, value):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        path.write_bytes(
+            (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            )
+        )
 
     @staticmethod
     def tree_hashes(root):
@@ -541,7 +545,7 @@ class LoopCtlTests(unittest.TestCase):
         project = self.init_project()
         source = project / "outputs" / "draft.md"
         source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_text("# 标题\n汉字A。\n𠀀\n", encoding="utf-8")
+        source.write_bytes("# 标题\n汉字A。\n𠀀\n".encode("utf-8"))
         output_path = "creative-system/runs/metric-run/controller-facts.json"
 
         measured = self.command(
@@ -1315,7 +1319,18 @@ class LoopCtlTests(unittest.TestCase):
             check=True,
         )
         clone = self.root / "round-trip-clone"
-        subprocess.run(["git", "clone", "--quiet", str(project), str(clone)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "-c",
+                "core.autocrlf=true",
+                str(project),
+                str(clone),
+            ],
+            check=True,
+        )
         self.assertFalse((clone / evidence_relative).exists())
         cloned = self.command("validate", clone)
         self.assertEqual(cloned["status"], "PASS")
@@ -1327,6 +1342,90 @@ class LoopCtlTests(unittest.TestCase):
         (clone / evidence_relative).write_text("确认原文已被改写。\n", encoding="utf-8")
         changed = self.command("validate", clone, expected=1)
         self.assertTrue(any("evidence 哈希不一致" in item for item in changed["errors"]))
+
+    def test_git_round_trip_preserves_crlf_content_addressed_bytes(self):
+        project = self.init_project("crlf-round-trip", confirmed=False)
+        charter = project / "creative-system/creative-charter.md"
+        charter.write_bytes(charter.read_bytes().replace(b"\n", b"\r\n"))
+        evidence = project / (
+            "creative-system/approvals/charter-confirmations/evidence/crlf-confirmation.md"
+        )
+        evidence.write_bytes("项目所有者明确确认 CRLF 保存后的当前宪法。\n".encode("utf-8"))
+        self.command(
+            "confirm-charter",
+            project,
+            "--confirmed-by",
+            "test-project-owner",
+            "--confirmed-at",
+            "2000-01-01T00:00:00Z",
+            "--evidence",
+            evidence.relative_to(project),
+        )
+        system = self.read_json(project / "creative-system/system.json")
+        receipt = project / system["charter"]["confirmation_receipt"]
+        charter_bytes = charter.read_bytes()
+        receipt_bytes = receipt.read_bytes()
+        self.assertIn(b"\r\n", charter_bytes)
+
+        subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+        subprocess.run(["git", "add", "--all"], cwd=project, check=True)
+        attributes = subprocess.run(
+            [
+                "git",
+                "check-attr",
+                "text",
+                "eol",
+                "--",
+                "creative-system/creative-charter.md",
+                "README.md",
+            ],
+            cwd=project,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout
+        self.assertIn("text: unset", attributes)
+        self.assertIn("eol: unset", attributes)
+        self.assertIn("README.md: text: unset", attributes)
+        self.assertIn("README.md: eol: unset", attributes)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Loop Test",
+                "-c",
+                "user.email=loop-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "CRLF byte-preservation fixture",
+            ],
+            cwd=project,
+            check=True,
+        )
+        clone = self.root / "crlf-round-trip-clone"
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "-c",
+                "core.autocrlf=true",
+                str(project),
+                str(clone),
+            ],
+            check=True,
+        )
+        self.assertEqual(
+            (clone / "creative-system/creative-charter.md").read_bytes(),
+            charter_bytes,
+        )
+        self.assertEqual((clone / receipt.relative_to(project)).read_bytes(), receipt_bytes)
+        cloned = self.command("validate", clone)
+        self.assertEqual(cloned["status"], "PASS")
+        self.assertIn("LOCAL_CONFIRMATION_EVIDENCE_UNAVAILABLE", cloned["warnings"])
 
     def test_local_confirmation_evidence_directory_and_symlink_still_block(self):
         project = self.init_project()
@@ -1517,6 +1616,8 @@ class LoopCtlTests(unittest.TestCase):
         )
         skill = project / "skills" / "paper-lantern-story" / "SKILL.md"
         self.assertTrue(skill.is_file())
+        attributes = (project / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn("* -text -eol", attributes)
         agents_text = (project / "AGENTS.md").read_text(encoding="utf-8")
         skill_text = skill.read_text(encoding="utf-8")
         contract_text = (skill.parent / "references" / "project-contract.md").read_text(encoding="utf-8")
@@ -2935,7 +3036,7 @@ class LoopCtlTests(unittest.TestCase):
 
         def crash_after_system(path, value):
             original_atomic_write_json(path, value)
-            if str(path).endswith("/creative-system/system.json"):
+            if Path(path).as_posix().endswith("/creative-system/system.json"):
                 raise RuntimeError("injected crash after system target")
 
         module.atomic_write_json = crash_after_system
@@ -3889,7 +3990,7 @@ class LoopCtlTests(unittest.TestCase):
 
         def crash_after_candidate_status(path, value):
             original_atomic_write_json(path, value)
-            if str(path).endswith(
+            if Path(path).as_posix().endswith(
                 "/creative-system/candidates/pace-fix/status.json"
             ) and value.get("status") == "PROMOTED":
                 raise RuntimeError("injected crash after candidate status")
@@ -3956,7 +4057,7 @@ class LoopCtlTests(unittest.TestCase):
 
                     def crash_after_registry(path, value):
                         original(path, value)
-                        if str(path).endswith(
+                        if Path(path).as_posix().endswith(
                             "/creative-system/releases/registry.json"
                         ):
                             raise RuntimeError("injected crash after registry")
@@ -3971,7 +4072,7 @@ class LoopCtlTests(unittest.TestCase):
 
                     def crash_after_target(path, value, *, expected_suffix=suffix):
                         original(path, value)
-                        if str(path).endswith(expected_suffix):
+                        if Path(path).as_posix().endswith(expected_suffix):
                             raise RuntimeError("injected crash after {}".format(phase))
 
                     module.atomic_write_json = crash_after_target
@@ -4096,7 +4197,7 @@ class LoopCtlTests(unittest.TestCase):
 
         def crash_after_candidate(path, value):
             original(path, value)
-            if str(path).endswith(
+            if Path(path).as_posix().endswith(
                 "/creative-system/candidates/pace-fix/status.json"
             ):
                 raise RuntimeError("injected crash after candidate")

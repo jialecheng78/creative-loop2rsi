@@ -1228,6 +1228,7 @@ def write_initialized_project(destination: Path, args: argparse.Namespace) -> No
     text_files = {
         "README.md": "README.md.tmpl",
         "AGENTS.md": "AGENTS.md.tmpl",
+        ".gitattributes": "gitattributes.tmpl",
         ".gitignore": "gitignore.tmpl",
         "creative-system/creative-charter.md": "creative-system/creative-charter.md.tmpl",
         f"skills/{args.domain_skill}/SKILL.md": "domain-skill/SKILL.md.tmpl",

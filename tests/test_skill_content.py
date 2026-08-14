@@ -259,6 +259,8 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("confirm-charter", starter_readme)
         self.assertIn('$HOME/.codex/skills/creative-loop2rsi/scripts/loopctl.py', starter_readme)
         self.assertNotIn("charter.confirmed` 改为 `true", starter_readme)
+        attributes = (starter / "gitattributes.tmpl").read_text(encoding="utf-8")
+        self.assertIn("* -text -eol", attributes)
 
     def test_starter_gitignore_keeps_raw_human_messages_local(self) -> None:
         template = (
