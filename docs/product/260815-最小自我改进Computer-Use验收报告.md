@@ -1,0 +1,200 @@
+# 最小可验证自我改进 Computer Use 验收报告
+
+> 状态：`IN_PROGRESS / PAUSED_BY_OS_LOCK`
+>
+> 本文只记录已经发生且有证据支持的事实。当前尚未完成三个独立作品、候选评价、人工采用、第四个作品和回滚，因此不得把本轮称为最小 RSI 已跑通。
+
+## 一、验收目标与成功条件
+
+本轮由一个没有源码、终端和历史实现上下文的 simulated-user task，通过 Computer Use 操作打包后的 macOS 应用。它不是身份认证过的真人，也不代表非程序员可用性测试。
+
+固定验收路径：
+
+1. 在同一创作系统中完成三个独立作品；
+2. 对三个作品提交完全相同的明确反馈；
+3. 系统只能在三个独立作品形成重复证据后建立方法候选；
+4. 候选必须分别完成 targeted、regression、held-out 三类评价；
+5. 用户只能在看到作品对比和代价说明后主动采用候选；
+6. 第四个作品必须绑定新方法版本；
+7. 一键回滚后恢复旧稳定版本，且历史证据仍保留。
+
+固定反馈为：
+
+> 开头进入冲突太慢；请在前两句建立异常和明确风险，同时保留结尾反转。
+
+只有以上七项全部成立，才能把本轮称为“最小可验证自我改进闭环”。它仍不等于模型权重自改、完整自主 RSI 或仓库 L4 的正式验收。
+
+## 二、测试身份与安全边界
+
+- 操作者：独立 simulated-user task；公开报告不保存可导航的内部 task 标识。
+- 操作方式：只允许 Computer Use；不读取源码、终端、API Key 或本地运行文件。
+- 模型：`deepseek-v4-flash`。
+- Key：只从既有安全存储读取；本轮修复、打包和离线 smoke 均未重新读取或输出 Key。
+- 作品：只记录 ID、字节数、哈希和状态，不在报告中保存未发表正文。
+- 程序迭代上限：5 次；当前已使用 3 次。
+- 断点原则：修复后从同一创作系统和已保存治理状态继续，不为凑证据重置系统。
+
+## 三、首次运行与保留断点
+
+simulated-user 首次输入固定创作方向并点击“开始创作”后，应用显示：
+
+> 本次创作没有开始。操作没有完成，也没有改动已保存内容。请重试；若仍失败，请重启应用。
+
+Controller 已建立但没有完成的治理记录：
+
+| 证据 | 值 |
+|---|---|
+| run | `run-185c500a-3e0f-4f4d-9904-034d2da994d9` |
+| work | `work-82c0a6be-c66e-442c-86ad-6d307dd3a32a` |
+| attempt | `attempt-001` |
+| execution | `RUNNING` |
+| requested model | `deepseek-v4-flash` |
+| Gateway requests | `0` |
+
+这一组证据证明故障发生在模型请求之前；它不能被计为作品、反馈或候选证据。应用重启后明确展示“上次运行中断，本次会重新生成并保留关联，不会续写未完成模型推理”，没有把重新生成伪装成推理续跑。
+
+## 四、程序迭代记录
+
+### 第 1/5 次：补全打包应用中的 DSH 运行依赖
+
+**现象**
+
+- 源码与开发态测试通过；
+- packaged smoke 只验证无模型启动；
+- 真实点击创作时，Gateway request ledger 仍为 0。
+
+**根因**
+
+legacy `pnpm deploy` 在桌面应用中保留了 `runtime-dsh`，但遗漏其直接 `@deepseek-ai/*` 依赖链接。Main 在解析 SDK client 和 JSON-RPC runtime 时就失败，模型请求尚未创建。
+
+**修复**
+
+- 从受信的 `runtime-dsh/package.json` 读取允许列表；
+- 只恢复 `@deepseek-ai/*` 声明依赖；
+- 要求依赖版本精确匹配；
+- 打包结束前真实执行 `require.resolve`；
+- 将 `UNSUPPORTED_DSH` 映射成固定、可行动的中文错误。
+
+**提交**
+
+`9126674 补全预览包 DSH 运行依赖`
+
+**结果**
+
+聚焦单测通过，但真实打包暴露了新的 peer-context 路径假设，未产生可运行预览包。
+
+### 第 2/5 次：去掉 pnpm 虚拟存储目录名假设
+
+**现象**
+
+新打包在恢复 DSH 包时返回 `ENOENT`。工作区和 deploy 目录安装的是同一版本，但虚拟存储目录的 peer suffix 不同。
+
+**根因**
+
+实现把工作区 `.pnpm` 下的相对路径直接映射到 deploy `.pnpm`。pnpm 的 peer-context hash 不是跨部署稳定公共合同。
+
+**修复**
+
+- 不再复制虚拟存储目录名；
+- 在 deploy 虚拟存储中按 package `name + version` 查找；
+- 只接受唯一匹配；
+- 新增“工作区和部署 peer suffix 不同”的回归用例。
+
+**提交**
+
+`35802ad 修复预览包依赖解析`
+
+**结果**
+
+聚焦单测通过；真实打包继续发现 `.pnpm` 根目录同时包含文件和目录。
+
+### 第 3/5 次：过滤 pnpm 元数据文件
+
+**现象**
+
+依赖扫描将 `.pnpm/lock.yaml` 当成包目录，触发 `ENOTDIR`。
+
+**根因**
+
+扫描器没有先验证虚拟存储 entry 是常规目录。
+
+**修复**
+
+- 只遍历常规目录；
+- 拒绝 symlink entry；
+- 在合成 fixture 中加入 `lock.yaml`，防止同类回归。
+
+**提交**
+
+`0ad697a 过滤预览依赖元数据文件`
+
+**结果**
+
+真实打包、应用 smoke 和包内 DSH 解析全部通过。
+
+## 五、第 3 次迭代后的打包证据
+
+| 项目 | 证据 |
+|---|---|
+| source commit | `0ad697aa5528da5c841c7e9b540d87f14311b04b` |
+| package tree SHA256 | `2eb4b75fc7696123bc465b3cb1de97c28e91a49463d6a4be361c14130868490e` |
+| manifest entries | `35,961` |
+| app version | `1.0.0-alpha.1` |
+| packaged smoke | `PASS` |
+| preload API | status/configure/start/feedback 均可用 |
+| Renderer Node globals | 不可见 |
+| smoke model requests | `0`，离线 smoke 没有冒充实网调用 |
+| DSH SDK client | 从 app bundle 内解析成功 |
+| DSH JSON-RPC bin | 从 app bundle 内解析成功 |
+
+Controller sidecar 已为同一 source commit 重建，并通过源码/sidecar 相同输入的结构化响应等价检查。旧 sidecar 和旧预览包只做可恢复归档，没有覆盖用户数据。
+
+## 六、当前断点
+
+新应用已使用原有本地系统打开，以下状态均被保留：
+
+- DeepSeek credential 已配置；
+- 当前选择 `V4 Flash`；
+- 原创作系统仍是 active system；
+- 上一次中断 run 仍在治理记录中；
+- UI 要求重新生成，并保留与中断 run 的关联；
+- 尚无完成作品、HumanFeedbackReceipt、候选、晋升或回滚证据。
+
+simulated-user 恢复操作时，macOS 锁屏阻止 Computer Use。该阻断没有修改应用、没有消耗模型请求，也不计入程序迭代次数。
+
+## 七、当前判断
+
+| 判断 | 状态 | 说明 |
+|---|---|---|
+| 标准 macOS 预览包可启动 | `PASS` | packaged smoke 证明 |
+| 包内 DSH Runtime 可解析 | `PASS` | 从 app bundle 真实 resolve |
+| Flash 真实创作 | `NOT_RUN_IN_THIS_FORWARD_TEST` | 首次失败发生在请求前；修复后尚未因锁屏重试 |
+| 三个独立作品 | `NOT_STARTED` | 0/3 |
+| 三份相同反馈 | `NOT_STARTED` | 0/3 |
+| 候选 exact-three 评价 | `NOT_STARTED` | 无候选 |
+| 人工采用与第四个作品 | `NOT_STARTED` | 无晋升 |
+| 回滚 | `NOT_STARTED` | 无可回滚晋升 |
+| 最小自我改进闭环 | `NOT_PROVEN` | 不得宣称已跑通 |
+
+## 八、解锁后的下一步
+
+1. 从保留的创作系统重新提交作品 1，不重置系统；
+2. 若作品 1 成功，封存并提交固定反馈；
+3. 依次完成作品 2、作品 3，核对三者拥有不同 work/run/attempt；
+4. 只在三份独立反馈齐全后检查候选；
+5. 完成 targeted、regression、held-out 盲比；
+6. 采用通过的候选，完成作品 4；
+7. 回滚并证明旧稳定版本和历史证据仍在；
+8. 若再遇程序问题，只剩 2 次修复额度；第 5 次后仍无法完成则停止并交付失败根因与下一步计划。
+
+## 九、尚不能外推的能力
+
+即使后续本轮通过，也只能证明：macOS arm64 unsigned preview 在一个独立 simulated-user 场景中跑通最小应用级自我改进闭环。它不能证明：
+
+- 真实非程序员可用性；
+- Windows、Intel Mac 或已签名安装包；
+- V4 Pro；
+- 模型权重自改；
+- L5 自主系统脚手架晋升；
+- 文学质量普遍提升；
+- 完整自主 RSI。
