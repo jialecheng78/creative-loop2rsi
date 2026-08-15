@@ -246,6 +246,7 @@ async function installPayload(resources, deployed, sidecar, source, root) {
 }
 
 async function reduceDeployedApp(directory) {
+  await removePnpmWorkspaceSelfReference(directory)
   for (const name of await readdir(directory)) {
     if (!['dist', 'node_modules', 'package.json'].includes(name)) {
       await rm(join(directory, name), { force: true, recursive: true })
@@ -262,6 +263,33 @@ async function reduceDeployedApp(directory) {
     main: 'dist/main/index.js',
     dependencies: raw.dependencies,
   })
+}
+
+export async function removePnpmWorkspaceSelfReference(directory) {
+  const link = join(
+    directory,
+    'node_modules',
+    '.pnpm',
+    'node_modules',
+    '@creative-loop2rsi',
+    'desktop',
+  )
+  if (!(await exists(link))) return false
+  const info = await lstat(link)
+  if (!info.isSymbolicLink()) {
+    throw new Error('pnpm desktop self-reference must be a symlink')
+  }
+  let packageJson
+  try {
+    packageJson = JSON.parse(await readFile(join(link, 'package.json'), 'utf8'))
+  } catch {
+    throw new Error('pnpm desktop self-reference target is invalid')
+  }
+  if (packageJson.name !== '@creative-loop2rsi/desktop') {
+    throw new Error('pnpm desktop self-reference points to an unexpected package')
+  }
+  await rm(link)
+  return true
 }
 
 async function removeBuildMetadata(directory) {

@@ -7,7 +7,11 @@ import { fileURLToPath } from 'node:url'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { inventoryTree, validateSidecarEvidence } from '../scripts/preview-build-lib.mjs'
+import {
+  inventoryTree,
+  removePnpmWorkspaceSelfReference,
+  validateSidecarEvidence,
+} from '../scripts/preview-build-lib.mjs'
 
 const temporary: string[] = []
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -44,6 +48,36 @@ describe('preview build inventory', () => {
     temporary.push(root)
     await symlink('../outside', join(root, 'escape'))
     await expect(inventoryTree(root)).rejects.toThrow('escapes preview root')
+  })
+
+  it('removes only the validated pnpm workspace self-reference', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'preview-self-link-'))
+    temporary.push(parent)
+    const deployed = join(parent, 'deployed')
+    const packageRoot = join(parent, 'workspace', 'apps', 'desktop')
+    const link = join(deployed, 'node_modules', '.pnpm', 'node_modules', '@creative-loop2rsi', 'desktop')
+    await mkdir(packageRoot, { recursive: true })
+    await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: '@creative-loop2rsi/desktop' }))
+    await mkdir(dirname(link), { recursive: true })
+    await symlink(packageRoot, link)
+
+    await expect(removePnpmWorkspaceSelfReference(deployed)).resolves.toBe(true)
+    await expect(readFile(link)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(removePnpmWorkspaceSelfReference(deployed)).resolves.toBe(false)
+  })
+
+  it('refuses to hide an unexpected package behind the self-reference path', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'preview-bad-self-link-'))
+    temporary.push(parent)
+    const deployed = join(parent, 'deployed')
+    const packageRoot = join(parent, 'unexpected')
+    const link = join(deployed, 'node_modules', '.pnpm', 'node_modules', '@creative-loop2rsi', 'desktop')
+    await mkdir(packageRoot, { recursive: true })
+    await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: 'unexpected-package' }))
+    await mkdir(dirname(link), { recursive: true })
+    await symlink(packageRoot, link)
+
+    await expect(removePnpmWorkspaceSelfReference(deployed)).rejects.toThrow('unexpected package')
   })
 
   it('binds sidecar bytes and all tracked controller inputs to the source identity', async () => {
