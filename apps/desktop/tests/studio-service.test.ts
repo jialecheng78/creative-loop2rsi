@@ -3,12 +3,13 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
-import type {
-  DshRuntimeLaunchSpec,
-  RuntimeEvent,
-  RuntimeRunHandle,
-  RuntimeRole,
-  RuntimeStatus,
+import {
+  DshRuntimeError,
+  type DshRuntimeLaunchSpec,
+  type RuntimeEvent,
+  type RuntimeRunHandle,
+  type RuntimeRole,
+  type RuntimeStatus,
 } from '@creative-loop2rsi/runtime-dsh'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -21,6 +22,7 @@ import {
   type CredentialStorePort,
   type LoopbackGatewayPort,
   type RuntimePort,
+  type RuntimeSpecFactory,
   type SettingsStorePort,
 } from '../src/main/studio-service.js'
 import type { LoopbackGatewayLease, LoopbackLeaseProvenance } from '../src/main/loopback-gateway.js'
@@ -143,6 +145,21 @@ describe('StudioService governed alpha loop', () => {
     blocked.controller.failRecoveryBegin = true
     await expect(blocked.service.startWork('不应绕过恢复')).rejects.toThrow('无法开始本次创作')
     expect(blocked.runtime.lastInput).toBeUndefined()
+  })
+
+  it('turns a missing packaged DSH runtime into an actionable fixed message', async () => {
+    const fixture = await readyFixture({
+      runtimeSpecFactory: () => {
+        throw new DshRuntimeError('UNSUPPORTED_DSH', 'synthetic package resolution detail')
+      },
+    })
+
+    await expect(fixture.service.startWork('不会发起模型请求')).rejects.toMatchObject({
+      code: 'RUNTIME_COMPONENT_MISSING',
+      message: '创作运行组件不完整。请安装包含完整 DSH Runtime 的新版后重试。',
+    })
+    expect(fixture.runtime.lastInput).toBeUndefined()
+    expect(fixture.loopback.lastLease?.revoked).toBe(true)
   })
 
   it('commits output and model provenance before emitting completed', async () => {
@@ -500,6 +517,7 @@ interface FixtureOptions {
   readonly profileDigest?: (spec: DshRuntimeLaunchSpec) => Promise<string>
   readonly runtimeStart?: (input: string) => Promise<RuntimeRunHandle>
   readonly runtimeCancel?: (runId: string) => Promise<void>
+  readonly runtimeSpecFactory?: RuntimeSpecFactory
 }
 
 async function readyFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -552,7 +570,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     idFactory: () => `id-${++nextId}`,
     credentialValidator,
     profileDigest: options.profileDigest ?? (async () => 'a'.repeat(64)),
-    runtimeSpecFactory: input => ({
+    runtimeSpecFactory: options.runtimeSpecFactory ?? (input => ({
       command: input.nodeExecutable,
       args: ['/trusted/runtime', '/trusted/profile.yml'],
       cwd: input.cwd,
@@ -563,7 +581,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
       model: input.model,
       gateway: input.gateway,
       maxTokens: input.maxTokens,
-    }),
+    })),
   })
   const service = makeService()
   return { userData, timeline, events, controller, credentials, runtime, loopback, credentialValidator, service, makeService }

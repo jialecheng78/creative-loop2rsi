@@ -11,7 +11,9 @@ import {
   inventoryTree,
   previewOutputPath,
   removePnpmWorkspaceSelfReference,
+  restoreLegacyWorkspaceRuntimeDependencies,
   validateSidecarEvidence,
+  verifyDeployedRuntimeResolution,
 } from '../scripts/preview-build-lib.mjs'
 
 const temporary: string[] = []
@@ -84,6 +86,63 @@ describe('preview build inventory', () => {
     await symlink(packageRoot, link)
 
     await expect(removePnpmWorkspaceSelfReference(deployed)).rejects.toThrow('target is unexpected')
+  })
+
+  it('restores runtime dependency links omitted by legacy workspace deploy', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'preview-runtime-links-'))
+    temporary.push(parent)
+    const workspace = join(parent, 'workspace')
+    const deployed = join(parent, 'deployed')
+    const dependencies = {
+      '@deepseek-ai/dsh-sdk-client': '0.1.0-rc.6',
+      '@deepseek-ai/dsh-sdk-jsonrpc-demo': '0.1.0-rc.6',
+    }
+    const runtimeVirtual = '@creative-loop2rsi+runtime-dsh@file+packages+runtime-dsh'
+    const workspaceRuntime = join(workspace, 'packages', 'runtime-dsh')
+    const deployedRuntime = join(
+      deployed, 'node_modules', '.pnpm', runtimeVirtual,
+      'node_modules', '@creative-loop2rsi', 'runtime-dsh',
+    )
+    await mkdir(workspaceRuntime, { recursive: true })
+    await mkdir(deployedRuntime, { recursive: true })
+    const runtimeManifest = JSON.stringify({ name: '@creative-loop2rsi/runtime-dsh', dependencies })
+    await writeFile(join(workspaceRuntime, 'package.json'), runtimeManifest)
+    await writeFile(join(deployedRuntime, 'package.json'), runtimeManifest)
+    const deployedRuntimeLink = join(deployed, 'node_modules', '@creative-loop2rsi', 'runtime-dsh')
+    await mkdir(dirname(deployedRuntimeLink), { recursive: true })
+    await symlink(relative(dirname(deployedRuntimeLink), deployedRuntime), deployedRuntimeLink)
+
+    for (const [dependency, version] of Object.entries(dependencies)) {
+      const simpleName = dependency.slice('@deepseek-ai/'.length)
+      const virtualName = `${dependency.replace('/', '+')}@${version}_fixture`
+      const workspaceTarget = join(
+        workspace, 'node_modules', '.pnpm', virtualName,
+        'node_modules', '@deepseek-ai', simpleName,
+      )
+      const deployedTarget = join(
+        deployed, 'node_modules', '.pnpm', virtualName,
+        'node_modules', '@deepseek-ai', simpleName,
+      )
+      const packageJson = dependency.endsWith('jsonrpc-demo')
+        ? { name: dependency, version, exports: { './bin': './lib/bin.js' } }
+        : { name: dependency, version, main: './lib/index.js' }
+      for (const target of [workspaceTarget, deployedTarget]) {
+        await mkdir(join(target, 'lib'), { recursive: true })
+        await writeFile(join(target, 'package.json'), JSON.stringify(packageJson))
+        await writeFile(join(target, 'lib', dependency.endsWith('jsonrpc-demo') ? 'bin.js' : 'index.js'), '')
+      }
+      const workspaceLink = join(workspaceRuntime, 'node_modules', '@deepseek-ai', simpleName)
+      await mkdir(dirname(workspaceLink), { recursive: true })
+      await symlink(relative(dirname(workspaceLink), workspaceTarget), workspaceLink)
+    }
+
+    await expect(restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace)).resolves.toBeUndefined()
+    await expect(verifyDeployedRuntimeResolution(deployed)).resolves.toBeUndefined()
+    for (const dependency of Object.keys(dependencies)) {
+      const destination = join(deployedRuntime, 'node_modules', ...dependency.split('/'))
+      await expect((await import('node:fs/promises')).lstat(destination).then(info => info.isSymbolicLink()))
+        .resolves.toBe(true)
+    }
   })
 
   it('binds sidecar bytes and all tracked controller inputs to the source identity', async () => {

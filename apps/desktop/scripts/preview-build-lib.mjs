@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -89,6 +90,8 @@ export async function buildPreview(options) {
       '--legacy',
       deployed,
     ], { cwd: workspace, timeoutMs: 300_000, env: { ...process.env, CI: 'true' } })
+    await restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace)
+    await verifyDeployedRuntimeResolution(deployed)
     await reduceDeployedApp(deployed)
 
     const electronDist = join(electronPackage, 'dist')
@@ -296,6 +299,64 @@ export async function removePnpmWorkspaceSelfReference(directory) {
   }
   await rm(link)
   return true
+}
+
+export async function restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace) {
+  const packageName = '@creative-loop2rsi/runtime-dsh'
+  const workspaceRuntime = join(workspace, 'packages', 'runtime-dsh')
+  const workspaceVirtualStore = await realpath(join(workspace, 'node_modules', '.pnpm'))
+  const deployedRoot = await realpath(deployed)
+  const deployedVirtualStore = await realpath(join(deployed, 'node_modules', '.pnpm'))
+  const deployedRuntimeLink = join(deployed, 'node_modules', '@creative-loop2rsi', 'runtime-dsh')
+  const deployedRuntime = await realpath(deployedRuntimeLink)
+  if (!inside(deployedRoot, deployedRuntime)) throw new Error('deployed runtime package escapes application root')
+  const manifest = JSON.parse(await readFile(join(workspaceRuntime, 'package.json'), 'utf8'))
+  if (manifest.name !== packageName || manifest.dependencies === null
+    || typeof manifest.dependencies !== 'object' || Array.isArray(manifest.dependencies)) {
+    throw new Error('workspace runtime dependency manifest is invalid')
+  }
+
+  for (const [dependency, expectedVersion] of Object.entries(manifest.dependencies).sort()) {
+    if (!dependency.startsWith('@deepseek-ai/') || typeof expectedVersion !== 'string') {
+      throw new Error(`runtime dependency is outside the trusted DSH scope: ${dependency}`)
+    }
+    const parts = dependency.split('/')
+    const workspaceLink = join(workspaceRuntime, 'node_modules', ...parts)
+    const sourceInfo = await lstat(workspaceLink)
+    if (!sourceInfo.isSymbolicLink()) throw new Error(`workspace runtime dependency is not a symlink: ${dependency}`)
+    const workspaceTarget = await realpath(workspaceLink)
+    if (!inside(workspaceVirtualStore, workspaceTarget)) {
+      throw new Error(`workspace runtime dependency escapes the virtual store: ${dependency}`)
+    }
+    const storeRelative = relative(workspaceVirtualStore, workspaceTarget)
+    const deployedTarget = join(deployedVirtualStore, storeRelative)
+    if (!inside(deployedRoot, deployedTarget)) throw new Error(`deployed runtime dependency escapes application root: ${dependency}`)
+    await assertRegularDirectory(deployedTarget, `deployed runtime dependency ${dependency}`)
+    const deployedManifest = JSON.parse(await readFile(join(deployedTarget, 'package.json'), 'utf8'))
+    if (deployedManifest.name !== dependency || deployedManifest.version !== expectedVersion) {
+      throw new Error(`deployed runtime dependency identity differs: ${dependency}`)
+    }
+    const destination = join(deployedRuntime, 'node_modules', ...parts)
+    if (await exists(destination)) {
+      if (await realpath(destination) !== await realpath(deployedTarget)) {
+        throw new Error(`deployed runtime dependency target differs: ${dependency}`)
+      }
+      continue
+    }
+    await mkdir(dirname(destination), { recursive: true })
+    await symlink(relative(dirname(destination), deployedTarget), destination)
+  }
+}
+
+export async function verifyDeployedRuntimeResolution(deployed) {
+  const deployedRoot = await realpath(deployed)
+  const runtimePackage = await realpath(join(deployed, 'node_modules', '@creative-loop2rsi', 'runtime-dsh'))
+  if (!inside(deployedRoot, runtimePackage)) throw new Error('deployed runtime package escapes application root')
+  const require = createRequire(join(runtimePackage, 'package.json'))
+  for (const request of ['@deepseek-ai/dsh-sdk-client', '@deepseek-ai/dsh-sdk-jsonrpc-demo/bin']) {
+    const resolved = require.resolve(request)
+    if (!inside(deployedRoot, resolved)) throw new Error(`deployed DSH resolution escapes application root: ${request}`)
+  }
 }
 
 async function removeBuildMetadata(directory) {

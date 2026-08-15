@@ -9,6 +9,7 @@ import {
   type ModelListResponse,
 } from '@creative-loop2rsi/model-gateway'
 import {
+  DshRuntimeError,
   resolvePublishedRuntime,
   SUPPORTED_DSH_VERSION,
   type DshModelId,
@@ -1565,9 +1566,17 @@ function createLaunchCompletion(): LaunchCompletion {
 }
 
 function publicServiceError(error: unknown, fallback: string): StudioServiceError {
-  return error instanceof StudioServiceError
-    ? error
-    : new StudioServiceError('STUDIO_OPERATION_FAILED', fallback)
+  if (error instanceof StudioServiceError) return error
+  if (error instanceof DshRuntimeError) {
+    if (error.code === 'UNSUPPORTED_DSH') {
+      return new StudioServiceError(
+        'RUNTIME_COMPONENT_MISSING',
+        '创作运行组件不完整。请安装包含完整 DSH Runtime 的新版后重试。',
+      )
+    }
+    return new StudioServiceError(error.code, error.message)
+  }
+  return new StudioServiceError('STUDIO_OPERATION_FAILED', fallback)
 }
 
 function credentialConnectionError(error: unknown): StudioServiceError {

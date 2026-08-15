@@ -33,6 +33,8 @@ export function buildPreview(options: PreviewBuildOptions): Promise<PreviewBuild
 export function previewOutputPath(root: string, platform: string, arch: string): string
 export function inventoryTree(root: string): Promise<readonly PreviewInventoryEntry[]>
 export function removePnpmWorkspaceSelfReference(root: string): Promise<boolean>
+export function restoreLegacyWorkspaceRuntimeDependencies(deployed: string, workspace: string): Promise<void>
+export function verifyDeployedRuntimeResolution(deployed: string): Promise<void>
 export function validateSidecarEvidence(
   directory: string,
   evidence: unknown,
