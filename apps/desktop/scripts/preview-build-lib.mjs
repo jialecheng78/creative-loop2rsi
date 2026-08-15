@@ -354,6 +354,9 @@ async function findDeployedPackage(virtualStore, dependency, expectedVersion) {
   const parts = dependency.split('/')
   const matches = []
   for (const entry of (await readdir(virtualStore)).sort()) {
+    const entryPath = join(virtualStore, entry)
+    const entryInfo = await lstat(entryPath)
+    if (!entryInfo.isDirectory() || entryInfo.isSymbolicLink()) continue
     const candidate = join(virtualStore, entry, 'node_modules', ...parts)
     if (!(await exists(candidate))) continue
     const info = await lstat(candidate)

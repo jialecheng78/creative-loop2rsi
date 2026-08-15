@@ -108,6 +108,7 @@ describe('preview build inventory', () => {
     const runtimeManifest = JSON.stringify({ name: '@creative-loop2rsi/runtime-dsh', dependencies })
     await writeFile(join(workspaceRuntime, 'package.json'), runtimeManifest)
     await writeFile(join(deployedRuntime, 'package.json'), runtimeManifest)
+    await writeFile(join(deployed, 'node_modules', '.pnpm', 'lock.yaml'), 'lockfileVersion: 9\n')
     const deployedRuntimeLink = join(deployed, 'node_modules', '@creative-loop2rsi', 'runtime-dsh')
     await mkdir(dirname(deployedRuntimeLink), { recursive: true })
     await symlink(relative(dirname(deployedRuntimeLink), deployedRuntime), deployedRuntimeLink)
