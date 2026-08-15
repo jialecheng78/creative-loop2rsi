@@ -82,6 +82,10 @@ export interface MethodCandidateSnapshot {
   readonly tradeoff: string
   readonly status: string
   readonly ready: boolean
+  /** A promotion receipt exists, but the active pointer still needs crash recovery. */
+  readonly adoptionPending: boolean
+  /** This promoted method was explicitly rolled back and is history-only in v1. */
+  readonly rolledBack: boolean
   readonly comparisons: readonly MethodComparisonSnapshot[]
 }
 

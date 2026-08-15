@@ -671,7 +671,7 @@ function CreationPage(props: Parameters<typeof StudioView>[0]): React.JSX.Elemen
   )
 }
 
-function LearningPage(props: {
+export function LearningPage(props: {
   readonly onStatusChange: (status: StudioViewStatus) => void
   readonly status: StudioViewStatus | undefined
 }): React.JSX.Element {
@@ -717,6 +717,9 @@ function LearningPage(props: {
                 <li key={item.id}>
                   <strong>{item.feedback}</strong>
                   <span>{item.independentWorks}/3 项独立创作</span>
+                  {observations.some(other => other.id !== item.id && other.feedback === item.feedback)
+                    ? <span>生成基线已变化，这些证据会分开累计。</span>
+                    : null}
                   <button
                     className="secondary-button"
                     disabled={!item.readyForCandidate || busyId !== undefined}
@@ -746,7 +749,7 @@ function LearningPage(props: {
   )
 }
 
-function NewMethodsPage(props: {
+export function NewMethodsPage(props: {
   readonly onStatusChange: (status: StudioViewStatus) => void
   readonly status: StudioViewStatus | undefined
 }): React.JSX.Element {
@@ -810,22 +813,25 @@ function NewMethodsPage(props: {
             {methods.map(method => {
               const unanswered = method.comparisons.find(item => item.choice === null)
               const answered = method.comparisons.filter(item => item.choice !== null).length
-              const adoptionIncomplete = method.status === 'PROMOTED'
-                && status?.method?.activeVersion !== method.id
+              const adoptionIncomplete = method.adoptionPending
+              const rolledBack = method.rolledBack
               const decided = method.status === 'REJECTED'
                 || (method.status === 'PROMOTED' && !adoptionIncomplete)
+                || rolledBack
               return (
                 <article className="method-card" key={method.id}>
-                  <span>{adoptionIncomplete ? '等待完成采用' : decided ? (method.status === 'PROMOTED' ? '已采用' : '已拒绝') : method.ready ? '可以决定' : `盲比 ${answered + 1}/3`}</span>
+                  <span>{rolledBack ? '历史已回滚' : adoptionIncomplete ? '等待完成采用' : decided ? (method.status === 'PROMOTED' ? '已采用' : '已拒绝') : method.ready ? '可以决定' : `盲比 ${answered + 1}/3`}</span>
                   {unanswered === undefined
                     ? <>
                         <h2>{method.title}</h2>
                         <p>{method.summary}</p>
                         <p className="tradeoff">可能的代价：{method.tradeoff}</p>
-                        <div>
-                          <button className="primary-button" disabled={(!method.ready && !adoptionIncomplete) || busy || decided} onClick={() => void decide(method.id, 'adopt')} type="button">{adoptionIncomplete ? '完成采用' : '采用新方式'}</button>
-                          <button className="secondary-button" disabled={busy || decided} onClick={() => void decide(method.id, 'reject')} type="button">拒绝</button>
-                        </div>
+                        {rolledBack
+                          ? <p>这个方式已经回滚，历史证据仍然保留；它不能直接重新采用。</p>
+                          : <div>
+                              <button className="primary-button" disabled={(!method.ready && !adoptionIncomplete) || busy || decided} onClick={() => void decide(method.id, 'adopt')} type="button">{adoptionIncomplete ? '完成采用' : '采用新方式'}</button>
+                              {!adoptionIncomplete && <button className="secondary-button" disabled={busy || decided} onClick={() => void decide(method.id, 'reject')} type="button">拒绝</button>}
+                            </div>}
                       </>
                     : <>
                         <h2>{comparisonLabel(unanswered.phase)}</h2>
@@ -924,7 +930,7 @@ function VersionsPage(props: {
 
 function comparisonLabel(phase: 'targeted' | 'regression' | 'heldout'): string {
   if (phase === 'targeted') return '比较 1：它是否解决了重复问题'
-  if (phase === 'regression') return '比较 2：它有没有伤害原本正常的作品'
+  if (phase === 'regression') return '比较 2：在另一个已知问题作品上，它是否至少不更差'
   return '比较 3：在未参与改进的新任务上是否仍然成立'
 }
 

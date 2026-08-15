@@ -1884,6 +1884,11 @@ function parseMethodHistory(value: JsonRecord): SystemSnapshot['method']['histor
 }
 
 function parseMethodCandidate(value: JsonRecord): SystemSnapshot['methodCandidates'][number] {
+  const status = requiredString(value.status)
+  const adoptionPending = requiredBoolean(value.adoption_pending)
+  const rolledBack = requiredBoolean(value.rolled_back)
+  if (adoptionPending && rolledBack) throw invalidControllerResponse()
+  if ((adoptionPending || rolledBack) && status !== 'PROMOTED') throw invalidControllerResponse()
   const comparisons = requiredRecordArray(value.comparisons).map(item => {
     const phase = item.phase
     const choice = item.choice
@@ -1903,8 +1908,10 @@ function parseMethodCandidate(value: JsonRecord): SystemSnapshot['methodCandidat
     title: requiredString(value.title),
     summary: requiredString(value.summary, true),
     tradeoff: requiredString(value.tradeoff, true),
-    status: requiredString(value.status),
+    status,
     ready: requiredBoolean(value.ready),
+    adoptionPending,
+    rolledBack,
     comparisons,
   }
 }

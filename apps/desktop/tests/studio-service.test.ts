@@ -248,6 +248,7 @@ describe('StudioService governed alpha loop', () => {
     expect(snapshot.methodCandidates).toHaveLength(1)
     expect(snapshot.methodCandidates[0]?.comparisons).toHaveLength(3)
     expect(snapshot.methodCandidates[0]?.status).toBe('EVALUATING')
+    expect(snapshot.methodCandidates[0]).toMatchObject({ adoptionPending: false, rolledBack: false })
 
     const candidateId = snapshot.methodCandidates[0]!.id
     for (const phase of ['targeted', 'regression', 'heldout'] as const) {
@@ -268,6 +269,40 @@ describe('StudioService governed alpha loop', () => {
     snapshot = await fixture.service.rollbackMethod('baseline-v1')
     expect(snapshot.method.activeVersion).toBe('baseline-v1')
     expect(snapshot.method.history.map(item => item.action)).toEqual(['PROMOTE', 'ROLLBACK'])
+    expect(snapshot.methodCandidates[0]).toMatchObject({ adoptionPending: false, rolledBack: true })
+  })
+
+  it('requires explicit and mutually exclusive method adoption projection flags', async () => {
+    const fixture = await readyFixture()
+    const candidate = {
+      id: 'method-projection',
+      title: '候选方法',
+      summary: '用行动推进。',
+      tradeoff: '可能减少解释。',
+      status: 'PROMOTED',
+      ready: false,
+      comparisons: [],
+    }
+
+    fixture.controller.primeMethodCandidate({ ...candidate, rolled_back: false })
+    await expect(fixture.service.systemSnapshot()).rejects.toMatchObject({ code: 'CONTROLLER_PROTOCOL' })
+
+    fixture.controller.primeMethodCandidate({
+      ...candidate, adoption_pending: false, rolled_back: true,
+    })
+    await expect(fixture.service.systemSnapshot()).resolves.toMatchObject({
+      methodCandidates: [{ adoptionPending: false, rolledBack: true }],
+    })
+
+    fixture.controller.primeMethodCandidate({
+      ...candidate, adoption_pending: true, rolled_back: true,
+    })
+    await expect(fixture.service.systemSnapshot()).rejects.toMatchObject({ code: 'CONTROLLER_PROTOCOL' })
+
+    fixture.controller.primeMethodCandidate({
+      ...candidate, status: 'EVALUATING', adoption_pending: true, rolled_back: false,
+    })
+    await expect(fixture.service.systemSnapshot()).rejects.toMatchObject({ code: 'CONTROLLER_PROTOCOL' })
   })
 
   it('cancels an in-flight method generation before shutdown completes', async () => {
@@ -1241,6 +1276,10 @@ class FakeController implements ControllerPort {
     }]
   }
 
+  primeMethodCandidate(value: Record<string, unknown>): void {
+    this.methodCandidates = [{ ...value }]
+  }
+
   async invoke(request: ControllerRequestLike): Promise<{ exitCode: number; payload: unknown }> {
     this.requests.push(request)
     this.timeline.push(`controller:${request.operation}`)
@@ -1322,6 +1361,8 @@ class FakeController implements ControllerPort {
           tradeoff: '只改变后续作品的创作指导，不改写既有作品。',
           status: 'CANDIDATE',
           ready: false,
+          adoption_pending: false,
+          rolled_back: false,
           comparisons: [],
         }]
         result = {
@@ -1342,6 +1383,8 @@ class FakeController implements ControllerPort {
         this.methodCandidates = this.methodCandidates.map(candidate => ({
           ...candidate,
           status: 'EVALUATING',
+          adoption_pending: false,
+          rolled_back: false,
           comparisons: [
             { phase: 'targeted', left: '目标 A', right: '目标 B', choice: null },
             { phase: 'regression', left: '回归 A', right: '回归 B', choice: null },
@@ -1368,7 +1411,9 @@ class FakeController implements ControllerPort {
         this.methodHistory.push({
           action: 'PROMOTE', version: this.activeMethodVersion, previous_version: 'baseline-v1', created_at: '2026-08-15T01:30:00.000Z',
         })
-        this.methodCandidates = this.methodCandidates.map(item => ({ ...item, status: 'PROMOTED', ready: false }))
+        this.methodCandidates = this.methodCandidates.map(item => ({
+          ...item, status: 'PROMOTED', ready: false, adoption_pending: false, rolled_back: false,
+        }))
         result = { snapshot: this.snapshot() }
         break
       }
@@ -1382,6 +1427,11 @@ class FakeController implements ControllerPort {
         })
         this.activeMethodVersion = String(payload.to_version)
         this.activeGuidance = this.activeMethodVersion === 'baseline-v1' ? null : this.activeGuidance
+        this.methodCandidates = this.methodCandidates.map(item => ({
+          ...item,
+          adoption_pending: false,
+          rolled_back: item.status === 'PROMOTED' && item.id !== this.activeMethodVersion,
+        }))
         result = { snapshot: this.snapshot() }
         break
       case 'begin_work':

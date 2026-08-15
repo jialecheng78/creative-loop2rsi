@@ -1569,6 +1569,100 @@ class AppControllerTests(unittest.TestCase):
             },
         )
         plan = created["evaluation_plan"]
+        proposal_path = (
+            project
+            / "creative-system"
+            / "app-methods"
+            / "candidates"
+            / candidate_id
+            / "proposal.json"
+        )
+        proposal_before = proposal_path.read_bytes()
+        proposal = self.read_json(proposal_path)
+        expected_source_keys = {
+            "artifact_sha256",
+            "attempt_id",
+            "feedback_receipt",
+            "feedback_receipt_sha256",
+            "feedback_transaction",
+            "feedback_transaction_sha256",
+            "manifest",
+            "manifest_sha256",
+            "method_epoch_sha256",
+            "provenance_sha256",
+            "run_id",
+            "task_receipt",
+            "task_receipt_sha256",
+            "task_sha256",
+            "work_id",
+        }
+        self.assertEqual(len(proposal["source_works"]), 3)
+        for source in proposal["source_works"]:
+            self.assertEqual(set(source), expected_source_keys)
+            for key in (
+                "artifact_sha256",
+                "feedback_receipt_sha256",
+                "feedback_transaction_sha256",
+                "manifest_sha256",
+                "method_epoch_sha256",
+                "provenance_sha256",
+                "task_receipt_sha256",
+                "task_sha256",
+            ):
+                self.assertRegex(source[key], r"^[0-9a-f]{64}$")
+
+        later = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "method-source-run-four",
+                "work_id": "method-source-work-four",
+                "task": "候选冻结后新增的第四个独立来源作品",
+            },
+        )
+        later_completed = self.request(
+            "complete_work",
+            {
+                "project": str(project),
+                "run_id": "method-source-run-four",
+                "output": "第四个后到作品：人物仍用解释推进情节。",
+                "runtime_provenance": self.runtime_provenance(
+                    context_sha256=later["context_sha256"],
+                    response_id="response-source-four-after-freeze",
+                ),
+            },
+        )
+        self.request(
+            "submit_feedback",
+            {
+                "project": str(project),
+                "run_id": "method-source-run-four",
+                "action": "rewrite",
+                "feedback_at": later_completed["review_available_at"],
+                "feedback_text": feedback_text,
+                "machine_direction": "UNKNOWN",
+            },
+        )
+        repeated_creation = self.request(
+            "create_method_candidate",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": ready[0]["id"],
+                "guidance": guidance,
+                "builder_role_id": "method-candidate-builder",
+                "builder_context_id": "method-builder-context-one",
+                "builder_task_id": "method-builder-task-one",
+                "builder_attested_by": "local-main-supervisor",
+                "builder_provenance": self.runtime_provenance(
+                    context_sha256=context["builder_context_sha256"],
+                    response_id="response-method-builder",
+                ),
+            },
+        )
+        self.assertTrue(repeated_creation["idempotent"])
+        self.assertEqual(repeated_creation["evaluation_plan"], plan)
+        self.assertEqual(proposal_path.read_bytes(), proposal_before)
 
         def generation(output, expected_context, suffix):
             return {
@@ -1615,7 +1709,7 @@ class AppControllerTests(unittest.TestCase):
                 {"project": str(project), "candidate_id": candidate_id},
             )
 
-        for phase in ("targeted", "regression", "heldout"):
+        for phase in ("targeted", "regression"):
             mapping = self.read_json(
                 project
                 / "creative-system"
@@ -1626,7 +1720,7 @@ class AppControllerTests(unittest.TestCase):
                 / phase
                 / "mapping.json"
             )
-            decision = self.request(
+            self.request(
                 "submit_method_comparison",
                 {
                     "project": str(project),
@@ -1635,7 +1729,53 @@ class AppControllerTests(unittest.TestCase):
                     "choice": mapping["candidate_label"],
                 },
             )
-        self.assertEqual(decision["lifecycle"], "READY_FOR_HUMAN")
+
+        heldout_mapping = self.read_json(
+            project
+            / "creative-system"
+            / "app-methods"
+            / "candidates"
+            / candidate_id
+            / "comparisons"
+            / "heldout"
+            / "mapping.json"
+        )
+        with mock.patch.object(
+            app_service,
+            "_candidate_status_update",
+            side_effect=RuntimeError("synthetic status projection crash"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "synthetic status projection crash"
+            ):
+                self.request(
+                    "submit_method_comparison",
+                    {
+                        "project": str(project),
+                        "candidate_id": candidate_id,
+                        "phase": "heldout",
+                        "choice": heldout_mapping["candidate_label"],
+                    },
+                )
+        stale_status = self.read_json(
+            project
+            / "creative-system"
+            / "app-methods"
+            / "candidates"
+            / candidate_id
+            / "status.json"
+        )
+        self.assertEqual(stale_status["lifecycle"], "EVALUATING")
+        recovered_snapshot = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        recovered_candidate = next(
+            item
+            for item in recovered_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(recovered_candidate["status"], "READY_FOR_HUMAN")
+        self.assertTrue(recovered_candidate["ready"])
 
         targeted_decision = (
             project
@@ -1655,6 +1795,42 @@ class AppControllerTests(unittest.TestCase):
             self.request("system_snapshot", {"project": str(project)})
         targeted_decision.write_bytes(original_decision)
 
+        controller = load_controller()
+        atomic_create_json = controller.atomic_create_json
+
+        def crash_after_promotion_receipt(path, value):
+            atomic_create_json(path, value)
+            if Path(path).parent.name == "promotions":
+                raise RuntimeError("synthetic promotion receipt crash")
+
+        with mock.patch.object(
+            controller,
+            "atomic_create_json",
+            side_effect=crash_after_promotion_receipt,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "synthetic promotion receipt crash"
+            ):
+                self.request(
+                    "adopt_method_candidate",
+                    {"project": str(project), "candidate_id": candidate_id},
+                )
+        receipt_pending_snapshot = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        receipt_pending_candidate = next(
+            item
+            for item in receipt_pending_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(receipt_pending_candidate["status"], "PROMOTED")
+        self.assertTrue(receipt_pending_candidate["adoption_pending"])
+        with self.assertRaisesRegex(AppRequestError, "已采用方法"):
+            self.request(
+                "reject_method_candidate",
+                {"project": str(project), "candidate_id": candidate_id},
+            )
+
         with mock.patch.object(
             app_service,
             "_write_method_registry",
@@ -1667,6 +1843,16 @@ class AppControllerTests(unittest.TestCase):
                 )
         still_stable = self.request("production_context", {"project": str(project)})
         self.assertEqual(still_stable["method_version"], "baseline-v1")
+        pending_snapshot = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        pending_candidate = next(
+            item
+            for item in pending_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertTrue(pending_candidate["adoption_pending"])
+        self.assertFalse(pending_candidate["rolled_back"])
         adopted = self.request(
             "adopt_method_candidate",
             {"project": str(project), "candidate_id": candidate_id},
@@ -1695,11 +1881,58 @@ class AppControllerTests(unittest.TestCase):
         self.assertEqual(
             fourth_task["method_guidance_sha256"], production["guidance_sha256"]
         )
-
-        rolled_back = self.request(
-            "rollback_method",
-            {"project": str(project), "to_version": "baseline-v1"},
+        completed_fourth = self.request(
+            "complete_work",
+            {
+                "project": str(project),
+                "run_id": "method-run-four",
+                "output": "第四个作品实际使用了候选方法：她把门卡留在警报器上。",
+                "runtime_provenance": self.runtime_provenance(
+                    context_sha256=fourth_task["context_sha256"],
+                    response_id="response-method-work-four",
+                ),
+            },
         )
+        self.request(
+            "submit_feedback",
+            {
+                "project": str(project),
+                "run_id": "method-run-four",
+                "action": "keep",
+                "feedback_at": completed_fourth["review_available_at"],
+                "machine_direction": "UNKNOWN",
+            },
+        )
+        restarted_with_fourth = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        self.assertEqual(restarted_with_fourth["last_work"]["run_id"], "method-run-four")
+        self.assertTrue(restarted_with_fourth["last_work"]["sealed"])
+        self.assertEqual(
+            restarted_with_fourth["last_work"]["method_version"], candidate_id
+        )
+        self.assertIsNotNone(
+            restarted_with_fourth["last_work"]["runtime_provenance_sha256"]
+        )
+
+        with mock.patch.object(
+            app_service,
+            "_write_method_registry",
+            side_effect=RuntimeError("synthetic rollback projection crash"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "synthetic rollback projection crash"
+            ):
+                self.request(
+                    "rollback_method",
+                    {"project": str(project), "to_version": "baseline-v1"},
+                )
+        rolled_back = {
+            "active_method_version": "baseline-v1",
+            "snapshot": self.request(
+                "system_snapshot", {"project": str(project)}
+            ),
+        }
         self.assertEqual(rolled_back["active_method_version"], "baseline-v1")
         final_snapshot = rolled_back["snapshot"]
         self.assertTrue(
@@ -1714,8 +1947,328 @@ class AppControllerTests(unittest.TestCase):
                 for item in final_snapshot["method"]["history"]
             )
         )
+        historical_candidate = next(
+            item
+            for item in final_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertFalse(historical_candidate["adoption_pending"])
+        self.assertTrue(historical_candidate["rolled_back"])
+        history_before_rejected_reactivation = list(
+            final_snapshot["method"]["history"]
+        )
+        with self.assertRaisesRegex(AppRequestError, "已显式回滚"):
+            self.request(
+                "adopt_method_candidate",
+                {"project": str(project), "candidate_id": candidate_id},
+            )
+        after_rejected_reactivation = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        self.assertEqual(
+            after_rejected_reactivation["method"]["history"],
+            history_before_rejected_reactivation,
+        )
+        baseline = self.request("production_context", {"project": str(project)})
+        self.assertEqual(baseline["method_version"], "baseline-v1")
+        fifth = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "method-run-five",
+                "work_id": "method-work-five",
+                "task": "回滚后验证基线方法上下文",
+                "context_sha256": baseline["context_sha256"],
+            },
+        )
+        fifth_run = self.read_json(
+            project / "creative-system/runs/method-run-five/run.json"
+        )
+        self.assertEqual(
+            fifth_run.get("app_method_version_at_start", "baseline-v1"),
+            "baseline-v1",
+        )
+        self.request(
+            "terminate_work",
+            {
+                "project": str(project),
+                "run_id": "method-run-five",
+                "dispatch_id": fifth["dispatch_id"],
+                "outcome": "CANCELLED",
+                "reason": "test-cleanup-after-baseline-context-verification",
+            },
+        )
+        explicitly_restored = self.request(
+            "rollback_method",
+            {"project": str(project), "to_version": candidate_id},
+        )
+        self.assertEqual(
+            explicitly_restored["active_method_version"], candidate_id
+        )
+        active_again = next(
+            item
+            for item in explicitly_restored["snapshot"]["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertFalse(active_again["adoption_pending"])
+        self.assertFalse(active_again["rolled_back"])
+        rolled_back_again = self.request(
+            "rollback_method",
+            {"project": str(project), "to_version": "baseline-v1"},
+        )
+        rollback_history = [
+            item
+            for item in rolled_back_again["snapshot"]["method"]["history"]
+            if item.get("action") == "ROLLBACK"
+        ]
+        self.assertEqual(len(rollback_history), 3)
+        self.assertEqual(
+            len({item["receipt"] for item in rollback_history}), 3
+        )
+        self.assertEqual(
+            rolled_back_again["active_method_version"], "baseline-v1"
+        )
         audit = self.command("audit", project)
         self.assertNotEqual(audit["provable_maturity"], "L4")
+
+    def test_method_observations_are_partitioned_by_runtime_epoch(self):
+        project, _ = self.bootstrap()
+        feedback_text = "让开头更快建立可见风险。"
+
+        def seal(number, *, model="deepseek-v4-pro", fingerprint="fp-epoch-a"):
+            run_id = f"epoch-run-{number}"
+            begun = self.request(
+                "begin_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "work_id": f"epoch-work-{number}",
+                    "task": f"epoch 独立任务 {number}",
+                },
+            )
+            completed = self.request(
+                "complete_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "output": f"epoch 基线作品 {number}",
+                    "runtime_provenance": self.runtime_provenance(
+                        context_sha256=begun["context_sha256"],
+                        model=model,
+                        fingerprint=fingerprint,
+                        response_id=f"response-epoch-{number}",
+                    ),
+                },
+            )
+            self.request(
+                "submit_feedback",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "action": "rewrite",
+                    "feedback_at": completed["review_available_at"],
+                    "feedback_text": feedback_text,
+                    "machine_direction": "UNKNOWN",
+                },
+            )
+
+        seal(1)
+        seal(2)
+        seal(3, model="deepseek-v4-flash")
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        observations = snapshot["learning"]["observations"]
+        self.assertEqual(
+            sorted(item["independent_works"] for item in observations), [1, 2]
+        )
+        self.assertFalse(any(item["ready_for_candidate"] for item in observations))
+
+        seal(4)
+        seal(5, fingerprint="fp-epoch-b")
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        observations = snapshot["learning"]["observations"]
+        self.assertEqual(
+            sorted(item["independent_works"] for item in observations), [1, 1, 3]
+        )
+        ready = [item for item in observations if item["ready_for_candidate"]]
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0]["epoch"]["method_version"], "baseline-v1")
+        self.assertEqual(ready[0]["epoch"]["returned_model"], "deepseek-v4-pro")
+        self.assertEqual(ready[0]["epoch"]["system_fingerprint"], "fp-epoch-a")
+
+        candidate_id = "method-epoch-isolated-v1"
+        context = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": ready[0]["id"],
+            },
+        )
+        self.assertEqual(
+            {item["run_id"] for item in context["source_works"]},
+            {"epoch-run-1", "epoch-run-2", "epoch-run-4"},
+        )
+        with self.assertRaisesRegex(AppRequestError, "Candidate Builder"):
+            self.request(
+                "create_method_candidate",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "observation_id": ready[0]["id"],
+                    "guidance": "在开头两句建立异常和风险。",
+                    "builder_role_id": "method-candidate-builder",
+                    "builder_context_id": "epoch-builder-context",
+                    "builder_task_id": "epoch-builder-task",
+                    "builder_attested_by": "local-main-supervisor",
+                    "builder_provenance": self.runtime_provenance(
+                        context_sha256=context["builder_context_sha256"],
+                        fingerprint="fp-epoch-b",
+                        response_id="response-wrong-epoch-builder",
+                    ),
+                },
+            )
+        self.assertFalse(
+            (
+                project
+                / "creative-system/app-methods/candidates"
+                / candidate_id
+            ).exists()
+        )
+        created = self.request(
+            "create_method_candidate",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": ready[0]["id"],
+                "guidance": "在开头两句建立异常和风险。",
+                "builder_role_id": "method-candidate-builder",
+                "builder_context_id": "epoch-builder-context",
+                "builder_task_id": "epoch-builder-task",
+                "builder_attested_by": "local-main-supervisor",
+                "builder_provenance": self.runtime_provenance(
+                    context_sha256=context["builder_context_sha256"],
+                    fingerprint="fp-epoch-a",
+                    response_id="response-correct-epoch-builder",
+                ),
+            },
+        )
+        plan = created["evaluation_plan"]
+
+        def generation(label, context_sha256, *, profile="a" * 64):
+            provenance = self.runtime_provenance(
+                context_sha256=context_sha256,
+                fingerprint="fp-epoch-a",
+                response_id=f"response-{label}",
+            )
+            provenance["profile_sha256"] = profile
+            return {"output": f"{label} 输出", "runtime_provenance": provenance}
+
+        with self.assertRaisesRegex(AppRequestError, "Profile"):
+            self.request(
+                "stage_method_comparisons",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "generations": {
+                        "targeted_candidate": generation(
+                            "targeted",
+                            plan["targeted"]["candidate_context_sha256"],
+                        ),
+                        "regression_candidate": generation(
+                            "regression",
+                            plan["regression"]["candidate_context_sha256"],
+                            profile="b" * 64,
+                        ),
+                        "heldout_baseline": generation(
+                            "heldout-baseline",
+                            plan["heldout"]["baseline_context_sha256"],
+                        ),
+                        "heldout_candidate": generation(
+                            "heldout-candidate",
+                            plan["heldout"]["candidate_context_sha256"],
+                        ),
+                    },
+                },
+            )
+        self.assertFalse(
+            (
+                project
+                / "creative-system/app-methods/candidates"
+                / candidate_id
+                / "comparisons"
+            ).exists()
+        )
+
+    def test_unverified_legacy_app_feedback_findings_never_form_method_candidate(self):
+        project, _ = self.bootstrap("legacy-method-evidence")
+        fake_feedback = "伪造但相同的历史反馈"
+        fake_finding = self.root / "fake-app-feedback.json"
+        self.write_json(
+            fake_finding,
+            {
+                "code": "APP-FEEDBACK-DEADBEEF0001",
+                "category": "soft-quality",
+                "severity": "medium",
+                "confidence": 1.0,
+                "evidence": [
+                    {"path": "legacy", "note": "not AppFeedbackReceipt"}
+                ],
+                "owner": "creative-producer",
+                "suggested_action": fake_feedback,
+            },
+        )
+        for number in range(1, 4):
+            run_id = f"legacy-run-{number}"
+            begun = self.request(
+                "begin_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "work_id": f"legacy-work-{number}",
+                    "task": f"legacy 独立任务 {number}",
+                },
+            )
+            completed = self.request(
+                "complete_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "output": f"legacy 作品 {number}",
+                    "runtime_provenance": self.runtime_provenance(
+                        context_sha256=begun["context_sha256"],
+                        response_id=f"response-legacy-{number}",
+                    ),
+                },
+            )
+            receipt = self.request(
+                "record_feedback",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "event_id": f"legacy-keep-{number}",
+                    "action": "keep",
+                    "feedback_at": completed["review_available_at"],
+                },
+            )
+            self.request(
+                "seal_feedback",
+                {
+                    "project": str(project),
+                    "feedback_receipt": receipt["receipt"],
+                    "machine_direction": "UNKNOWN",
+                    "finding_paths": [str(fake_finding)],
+                },
+            )
+
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        observations = snapshot["learning"]["observations"]
+        self.assertFalse(
+            any(
+                item.get("finding_code") == "APP-FEEDBACK-DEADBEEF0001"
+                for item in observations
+            )
+        )
+        self.assertNotIn(fake_feedback, json.dumps(snapshot, ensure_ascii=False))
 
     def test_progressive_candidate_requires_three_distinct_works_not_three_runs(self):
         project, _ = self.bootstrap()

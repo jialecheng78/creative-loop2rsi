@@ -63,6 +63,8 @@ const STATUS: StudioStatus = {
       tradeoff: '可能减少必要解释。',
       status: 'PROMOTED',
       ready: false,
+      adoptionPending: false,
+      rolledBack: false,
       comparisons: [{ phase: 'targeted', left: 'A', right: 'B', choice: 'A' }],
     }],
   },
@@ -82,6 +84,7 @@ describe('renderer business adapter', () => {
     })
     expect(view.learning?.adoptedPrinciples[0]?.active).toBe(true)
     expect(view.newMethods?.[0]?.comparisons[0]?.choice).toBe('A')
+    expect(view.newMethods?.[0]).toMatchObject({ adoptionPending: false, rolledBack: false })
     expect(view.method).toMatchObject({
       activeVersion: 'method-one',
       activeGuidance: '用可见行动推进。',
