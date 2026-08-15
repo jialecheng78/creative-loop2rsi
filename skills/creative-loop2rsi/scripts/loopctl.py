@@ -2657,6 +2657,7 @@ def command_measure_artifact(args: argparse.Namespace) -> Dict[str, Any]:
         output_path = safe_relative(root, args.output, "--output")
         output_attempt = containing_attempt(root, output_path)
         if output_attempt is not None:
+            ensure_attempt_not_terminated(output_attempt)
             ensure_attempt_not_terminal_invalid(output_attempt)
             return command_measure_artifact_locked(args, root)
         output_eval_run = containing_eval_run(root, output_path)
@@ -2680,6 +2681,7 @@ def command_measure_artifact_locked(args: argparse.Namespace, root: Path) -> Dic
     if output_attempt is not None:
         if not (output_attempt / "attempt.json").is_file():
             raise LoopCtlError("--output 指向不存在的 attempt")
+        ensure_attempt_not_terminated(output_attempt)
         if (output_attempt / ".sealed.json").is_file():
             raise LoopCtlError("--output 不得写入已封存 attempt")
         run_path = output_attempt.parent.parent / "run.json"
@@ -3079,9 +3081,27 @@ def open_attempt_context(
     guard_project_directory(root, attempt_dir, "attempt root")
     if not (attempt_dir / "attempt.json").is_file():
         raise LoopCtlError(f"attempt 不存在：{attempt_dir}")
+    ensure_attempt_not_terminated(attempt_dir)
     if (attempt_dir / ".sealed.json").exists():
         raise LoopCtlError(f"attempt 已封存：{attempt_id}")
     return run_id, run_dir, run_path, run, attempt_id, attempt_dir
+
+
+def ensure_attempt_not_terminated(attempt_dir: Path) -> None:
+    """Reject every post-terminal mutation, including a projection crash window.
+
+    ``.terminated.json`` is the failure-side commit point.  ``run.json`` may
+    still say RUNNING until recovery rolls its query projection forward, so
+    mutators must judge the monotonic marker directly rather than trusting the
+    mutable projection.
+    """
+
+    marker = attempt_dir / ".terminated.json"
+    if not os.path.lexists(str(marker)):
+        return
+    if marker.is_symlink() or not marker.is_file():
+        raise LoopCtlError("TerminatedAttempt marker 不是普通文件")
+    raise LoopCtlError(f"attempt 已终止，拒绝继续写入或封存：{attempt_dir.name}")
 
 
 def human_review_paths(root: Path, attempt_dir: Path) -> Tuple[Path, Path]:
@@ -4195,6 +4215,7 @@ def command_seal_attempt_locked(
     attempt_dir = run_dir / "attempts" / attempt_id
     if not (attempt_dir / "attempt.json").is_file():
         raise LoopCtlError(f"attempt 不存在：{attempt_dir}")
+    ensure_attempt_not_terminated(attempt_dir)
     if (attempt_dir / ".sealed.json").exists():
         raise LoopCtlError(f"attempt 已封存，拒绝覆盖：{attempt_id}")
     ensure_attempt_not_terminal_invalid(attempt_dir)

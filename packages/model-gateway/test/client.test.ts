@@ -347,39 +347,186 @@ describe("strict DeepSeek SSE", () => {
   });
 
   it("settles an aborted SSE read even when reader cancellation never settles", async () => {
-    let markReadStarted!: () => void;
-    const readStarted = new Promise<void>((resolve) => {
-      markReadStarted = resolve;
-    });
-    const cancel = vi.fn(() => new Promise<void>(() => {}));
-    const stream = new ReadableStream<Uint8Array>({
-      pull() {
-        markReadStarted();
-        return new Promise<void>(() => {});
-      },
-      cancel,
-    });
-    const gateway = new DeepSeekGateway({
-      keyStore: keyStore(),
-      fetch: vi.fn<typeof fetch>().mockResolvedValue(
-        new Response(stream, { headers: { "content-type": "text/event-stream" } }),
-      ),
-      budget: { timeoutMs: 10_000 },
-    });
-    const abortController = new AbortController();
-    const collect = (async () => {
-      for await (const _event of gateway.streamChatCompletion(request(), {
-        signal: abortController.signal,
-      })) {
-        // The source deliberately never emits an event.
+    vi.useFakeTimers();
+    try {
+      let markReadStarted!: () => void;
+      const readStarted = new Promise<void>((resolve) => {
+        markReadStarted = resolve;
+      });
+      const cancel = vi.fn(() => new Promise<void>(() => {}));
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {
+          markReadStarted();
+          return new Promise<void>(() => {});
+        },
+        cancel,
+      });
+      const gateway = new DeepSeekGateway({
+        keyStore: keyStore(),
+        fetch: vi.fn<typeof fetch>().mockResolvedValue(
+          new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+        ),
+        budget: {
+          firstEventTimeoutMs: 10_000,
+          streamIdleTimeoutMs: 10_000,
+          totalTimeoutMs: 10_000,
+        },
+      });
+      const abortController = new AbortController();
+      const collect = (async () => {
+        for await (const _event of gateway.streamChatCompletion(request(), {
+          signal: abortController.signal,
+        })) {
+          // The source deliberately never emits an event.
+        }
+      })();
+
+      await readStarted;
+      abortController.abort(new Error("test-abort"));
+
+      await expect(collect).rejects.toMatchObject({ code: "NETWORK_ERROR" });
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a progressing stream alive beyond the former 120-second total limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const source = controlledSseResponse();
+      const fetchCalled = promiseSignal();
+      const gateway = new DeepSeekGateway({
+        keyStore: keyStore(),
+        fetch: vi.fn<typeof fetch>().mockImplementation(async () => {
+          fetchCalled.resolve();
+          return source.response;
+        }),
+        budget: {
+          firstEventTimeoutMs: 60_000,
+          streamIdleTimeoutMs: 50_000,
+          totalTimeoutMs: 300_000,
+        },
+      });
+      const collecting = collectStream(gateway);
+      await fetchCalled.promise;
+      source.send(sseChunk("one"));
+      for (const id of ["two", "three", "four", "five"]) {
+        await vi.advanceTimersByTimeAsync(40_000);
+        source.send(sseChunk(id));
       }
-    })();
+      source.send("data: [DONE]\n\n");
+      source.close();
 
-    await readStarted;
-    abortController.abort(new Error("test-abort"));
+      const events = await collecting;
+      expect(events[0]).toMatchObject({ type: "chunk" });
+      expect(events.at(-1)).toEqual({ type: "done" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
-    await expect(settleWithin(collect, 250)).rejects.toMatchObject({ code: "NETWORK_ERROR" });
-    expect(cancel).toHaveBeenCalledOnce();
+  it("classifies silence before the first validated SSE event", async () => {
+    vi.useFakeTimers();
+    try {
+      const source = controlledSseResponse();
+      const fetchCalled = promiseSignal();
+      const gateway = new DeepSeekGateway({
+        keyStore: keyStore(),
+        fetch: vi.fn<typeof fetch>().mockImplementation(async () => {
+          fetchCalled.resolve();
+          return source.response;
+        }),
+        budget: {
+          firstEventTimeoutMs: 120_000,
+          streamIdleTimeoutMs: 90_000,
+          totalTimeoutMs: 600_000,
+        },
+      });
+      const collecting = capturePromise(collectStream(gateway));
+      await fetchCalled.promise;
+      // A transport comment is activity, but not a validated model event.
+      source.send(": keepalive\n\n");
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      await expect(collecting).resolves.toMatchObject({
+        ok: false,
+        error: { code: "FIRST_EVENT_TIMEOUT" },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("classifies stream idle after a validated event", async () => {
+    vi.useFakeTimers();
+    try {
+      const source = controlledSseResponse();
+      const fetchCalled = promiseSignal();
+      const gateway = new DeepSeekGateway({
+        keyStore: keyStore(),
+        fetch: vi.fn<typeof fetch>().mockImplementation(async () => {
+          fetchCalled.resolve();
+          return source.response;
+        }),
+        budget: {
+          firstEventTimeoutMs: 120_000,
+          streamIdleTimeoutMs: 90_000,
+          totalTimeoutMs: 600_000,
+        },
+      });
+      const collecting = capturePromise(collectStream(gateway));
+      await fetchCalled.promise;
+      source.send(sseChunk("first"));
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      await expect(collecting).resolves.toMatchObject({
+        ok: false,
+        error: { code: "STREAM_IDLE_TIMEOUT" },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("enforces the absolute total even while valid events keep arriving", async () => {
+    vi.useFakeTimers();
+    try {
+      const source = controlledSseResponse();
+      const fetchCalled = promiseSignal();
+      const gateway = new DeepSeekGateway({
+        keyStore: keyStore(),
+        fetch: vi.fn<typeof fetch>().mockImplementation(async () => {
+          fetchCalled.resolve();
+          return source.response;
+        }),
+        budget: {
+          firstEventTimeoutMs: 100_000,
+          streamIdleTimeoutMs: 90_000,
+          totalTimeoutMs: 250_000,
+        },
+      });
+      const collecting = capturePromise(collectStream(gateway));
+      await fetchCalled.promise;
+      source.send(sseChunk("one"));
+      for (const id of ["two", "three", "four"]) {
+        await vi.advanceTimersByTimeAsync(80_000);
+        source.send(sseChunk(id));
+      }
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(collecting).resolves.toMatchObject({
+        ok: false,
+        error: { code: "TOTAL_TIMEOUT" },
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects malformed usage rather than logging it", async () => {
@@ -420,21 +567,27 @@ describe("strict DeepSeek SSE", () => {
   });
 });
 
-async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error("operation did not settle within the test bound")), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout !== undefined) clearTimeout(timeout);
-  }
-}
-
 describe("budgets and redaction", () => {
+  it("uses canonical layered defaults and keeps legacy timeout input out of snapshots", () => {
+    const legacy = new DeepSeekGateway({
+      keyStore: keyStore(),
+      fetch: vi.fn<typeof fetch>(),
+      budget: { timeoutMs: 321 },
+    });
+    expect(legacy.budget.snapshot().limits).toMatchObject({
+      firstEventTimeoutMs: 321,
+      streamIdleTimeoutMs: 321,
+      totalTimeoutMs: 321,
+    });
+    expect(legacy.budget.snapshot().limits).not.toHaveProperty("timeoutMs");
+
+    expect(() => new DeepSeekGateway({
+      keyStore: keyStore(),
+      fetch: vi.fn<typeof fetch>(),
+      budget: { timeoutMs: 321, totalTimeoutMs: 654 },
+    })).toThrow(/timeoutMs.*混用/u);
+  });
+
   it("enforces request count and response byte budgets", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({ data: [] }));
     const oneRequest = new DeepSeekGateway({
@@ -489,7 +642,7 @@ describe("budgets and redaction", () => {
     expect(String(caught)).not.toContain(localPath);
   });
 
-  it("aborts fetch at the configured timeout", async () => {
+  it("uses the first-event bound for the non-streaming model-list check", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_url: RequestInfo | URL, init?: RequestInit) => {
       await new Promise((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
@@ -499,10 +652,46 @@ describe("budgets and redaction", () => {
     const gateway = new DeepSeekGateway({
       keyStore: keyStore(),
       fetch: fetchMock,
-      budget: { timeoutMs: 10 },
+      budget: {
+        firstEventTimeoutMs: 10,
+        streamIdleTimeoutMs: 20,
+        totalTimeoutMs: 1_000,
+      },
     });
 
-    await expect(gateway.listModels()).rejects.toMatchObject({ code: "TIMEOUT" });
+    await expect(gateway.listModels()).rejects.toMatchObject({ code: "FIRST_EVENT_TIMEOUT" });
+  });
+
+  it("uses the absolute-total bound for a non-streaming chat response", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        await new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+        throw new Error("unreachable");
+      });
+      const gateway = new DeepSeekGateway({
+        keyStore: keyStore(),
+        fetch: fetchMock,
+        budget: {
+          firstEventTimeoutMs: 10,
+          streamIdleTimeoutMs: 20,
+          totalTimeoutMs: 30,
+        },
+      });
+      const pending = gateway.createChatCompletion(request());
+      let settled = false;
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(pending).rejects.toMatchObject({ code: "TOTAL_TIMEOUT" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("also applies the timeout while consuming a response body", async () => {
@@ -516,6 +705,50 @@ describe("budgets and redaction", () => {
       budget: { timeoutMs: 10 },
     });
 
-    await expect(gateway.listModels()).rejects.toMatchObject({ code: "TIMEOUT" });
+    await expect(gateway.listModels()).rejects.toMatchObject({ code: "FIRST_EVENT_TIMEOUT" });
   });
 });
+
+function controlledSseResponse(): {
+  readonly response: Response;
+  send(value: string): void;
+  close(): void;
+} {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const stream = new ReadableStream<Uint8Array>({
+    start(value) {
+      controller = value;
+    },
+  });
+  return {
+    response: new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+    send: value => controller.enqueue(new TextEncoder().encode(value)),
+    close: () => controller.close(),
+  };
+}
+
+function sseChunk(id: string): string {
+  return `data: {"id":"${id}","model":"deepseek-returned","choices":[]}\n\n`;
+}
+
+function promiseSignal(): { readonly promise: Promise<void>; resolve(): void } {
+  let resolvePromise!: () => void;
+  const promise = new Promise<void>(resolve => { resolvePromise = resolve; });
+  return { promise, resolve: resolvePromise };
+}
+
+async function collectStream(gateway: DeepSeekGateway): Promise<unknown[]> {
+  const events: unknown[] = [];
+  for await (const event of gateway.streamChatCompletion(request())) events.push(event);
+  return events;
+}
+
+function capturePromise<T>(promise: Promise<T>): Promise<
+  { readonly ok: true; readonly value: T } |
+  { readonly ok: false; readonly error: unknown }
+> {
+  return promise.then(
+    value => ({ ok: true as const, value }),
+    error => ({ ok: false as const, error }),
+  );
+}

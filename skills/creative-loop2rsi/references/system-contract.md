@@ -293,6 +293,41 @@ App 提交反馈必须先不可覆盖地写 `AppFeedbackTransactionIntent`，把
 
 控制器只能机械证明 allowed-writes 精确零文件；执行上下文确已停止属于 orchestrator attestation，两层不得混写。每次 dispatch 使用 `open-dispatch` 分配的新目录；seal 后、run commit 前仍会复查完整 attempt。commit 窗口内若已 stall 目录或其他 attempt 文件变化，整个 attempt 写入单调 terminal incident，永久失效且不消耗 content attempt。
 
+### TerminatedAttempt
+
+`DispatchStallRecord` 只表示一次执行上下文已停止且没有产出文件，不是 run 终态。桌面应用已向用户结束的失败或取消必须另外写入 attempt 内不可覆盖的 `.terminated.json`；它是失败侧与 `.sealed.json` 对称的 commit point。`attempt.json.execution_status=RUNNING` 与 `dispatch.json.state=OPEN` 是不可变的开始快照，不得原地改写为终态；查询时必须以 `.sealed.json / .terminated.json / terminal-invalid` 三类单调记录判断 attempt 的有效状态。
+
+```json
+{
+  "kind": "TerminatedAttempt",
+  "outcome": "FAILED",
+  "execution_status": "BLOCK",
+  "quality_status": "NOT_EVALUATED",
+  "release_status": "BLOCK",
+  "lifecycle_reason": "runtime-failed-before-commit",
+  "error_code": "DEEPSEEK_TOTAL_TIMEOUT",
+  "termination_class": "ZERO_FILE_RUNTIME_FAILURE",
+  "dispatch_id": "producer-a",
+  "dispatch_stall": {
+    "path": "creative-system/runs/run-x/attempts/attempt-001/dispatches/producer-a/stall.json",
+    "sha256": "<sha256>"
+  },
+  "runtime_provenance": {
+    "path": "creative-system/runs/run-x/attempts/attempt-001/runtime-provenance-producer-a.json",
+    "sha256": "<sha256>"
+  },
+  "content_attempt_consumed": false,
+  "finding_eligible": false,
+  "successor_run_required": true
+}
+```
+
+`terminate_work` 必须在项目 mutation lock 内按以下顺序执行：完成或复核 runtime provenance，零文件时完成或复核 stall，原子创建 `.terminated.json`，再将 run 和 system 的可变查询投影收敛到 `BLOCK`。marker 之前崩溃时，同一 semantic 的请求可幂等补齐；marker 之后崩溃时，`system_snapshot` 或下一次 `begin_work` 必须先按 marker roll-forward run/system 投影。所有可能继续写 attempt 的入口——包括 dispatch、作品提交、送审、反馈与 seal——都必须在各自 mutation lock 内直接检查 marker，不能因为 `run.json` 尚未 roll-forward 仍显示 `RUNNING` 就继续。已终止 run 不得再开 dispatch、写作品或封存；只能创建新 run 并用 `recovery_of` 保留关联。
+
+`system_snapshot.interrupted_run` 对 terminated run 必须返回 `state=TERMINATED_FAILED | TERMINATED_CANCELLED`、`reason_code`、`outcome`、`execution_status=BLOCK`、`termination_class`、`terminal_receipt/path+sha256`、`content_attempt_consumed` 和 `finding_eligible=false`。这些字段使 Main 在没有原始 `terminate_work` 响应的重启或 legacy stall 迁移场景中，仍能核对 Controller 已写入不可覆盖终态，而不是仅凭一个状态字符串猜测收敛。
+
+零文件 runtime 失败必须绑定 `DispatchStallRecord`，且 `content_attempt_consumed=false`。如果 `complete_work` 在产物落盘后、送审冻结前失败，不得伪造 zero-file stall；此时 `termination_class=UNCOMMITTED_OUTPUT_FAILURE`，receipt 必须绑定未提交产物清单与哈希，并保持 `finding_eligible=false`。终态校验覆盖整个 attempt：除 receipt 指定的未提交产物 dispatch 外，所有更早 dispatch 都必须已有 zero-file stall 且持续精确零文件；任一旧 stalled root 或 legacy artifacts root 在 marker 后出现文件，都按 `LATE_WRITE_CONTAMINATION` 阻断，不能被忽略。两类 terminated attempt 都不得写入 finding index、独立作品计数或候选证据聚类。同一 run 只能有 `.sealed.json` 或 `.terminated.json` 之一；两者并存、receipt 哈希漂移或幂等重试改变 outcome/reason/provenance 时一律 fail closed。
+
 ### EvalRunOpenAnchor / EvalRunPreflight / EvalRunManifest
 
 `open-eval-run` 必须产生两份独立的 no-clobber 开跑证据：

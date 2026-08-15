@@ -94,6 +94,12 @@ describe('DshRuntimeAdapter', () => {
     [{ code: 'QUOTA', status: 402 }, 'ACCOUNT_BALANCE', '请充值后重试'],
     [{ code: 'RATE_LIMIT', status: 429 }, 'RATE_LIMITED', '请稍后重试'],
     [{ code: 'HTTP_ERROR', status: 503 }, 'DEEPSEEK_UNAVAILABLE', '服务暂时不可用'],
+    [{ code: 'FIRST_EVENT_TIMEOUT' }, 'DEEPSEEK_FIRST_EVENT_TIMEOUT', '开始返回内容前超时'],
+    [{ code: 'STREAM_IDLE_TIMEOUT' }, 'DEEPSEEK_STREAM_IDLE_TIMEOUT', '长时间没有新进展'],
+    [{ code: 'TOTAL_TIMEOUT' }, 'DEEPSEEK_TOTAL_TIMEOUT', '最长等待时间'],
+    [{ code: 'DEEPSEEK_FIRST_EVENT_TIMEOUT', status: 504 }, 'DEEPSEEK_FIRST_EVENT_TIMEOUT', '开始返回内容前超时'],
+    [{ code: 'DEEPSEEK_STREAM_IDLE_TIMEOUT' }, 'DEEPSEEK_STREAM_IDLE_TIMEOUT', '长时间没有新进展'],
+    [{ code: 'DEEPSEEK_TOTAL_TIMEOUT' }, 'DEEPSEEK_TOTAL_TIMEOUT', '最长等待时间'],
     [{ code: 'TIMEOUT' }, 'DEEPSEEK_TIMEOUT', '响应超时'],
   ] as const)(
     'turn/end failures are terminal and sanitized: %o -> %s',

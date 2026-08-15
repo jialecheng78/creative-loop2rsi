@@ -286,6 +286,36 @@ function publicResolvedModelError(failure: Record<string, unknown>): DshRuntimeE
   if (status === 429 || code === 'RATE_LIMIT') {
     return new DshRuntimeError('RATE_LIMITED', 'DeepSeek 当前请求较多，请稍后重试。')
   }
+  if (
+    code === 'FIRST_EVENT_TIMEOUT'
+    || code === 'DEEPSEEK_FIRST_EVENT_TIMEOUT'
+    || code === 'CREATIVE_RSI_FIRST_EVENT_TIMEOUT'
+  ) {
+    return new DshRuntimeError(
+      'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+      'DeepSeek 在开始返回内容前超时，本次未保存。请稍后重试。',
+    )
+  }
+  if (
+    code === 'STREAM_IDLE_TIMEOUT'
+    || code === 'DEEPSEEK_STREAM_IDLE_TIMEOUT'
+    || code === 'CREATIVE_RSI_STREAM_IDLE_TIMEOUT'
+  ) {
+    return new DshRuntimeError(
+      'DEEPSEEK_STREAM_IDLE_TIMEOUT',
+      'DeepSeek 已开始生成，但长时间没有新进展；未完成内容不会保存。',
+    )
+  }
+  if (
+    code === 'TOTAL_TIMEOUT'
+    || code === 'DEEPSEEK_TOTAL_TIMEOUT'
+    || code === 'CREATIVE_RSI_TOTAL_TIMEOUT'
+  ) {
+    return new DshRuntimeError(
+      'DEEPSEEK_TOTAL_TIMEOUT',
+      'DeepSeek 生成超过本次最长等待时间；未完成内容不会保存。',
+    )
+  }
   if (status !== undefined && status >= 500 && status <= 599) {
     return new DshRuntimeError('DEEPSEEK_UNAVAILABLE', 'DeepSeek 服务暂时不可用，请稍后重试。')
   }

@@ -6,6 +6,7 @@ import {
   creationInputIssue,
   feedbackSubmissionMessage,
   feedbackSuccessMessage,
+  isConfirmedLaunchCancellation,
   NAVIGATION,
   progressMessage,
   recoveryPresentation,
@@ -27,6 +28,36 @@ describe('renderer user-facing decisions', () => {
     expect(actionableError(new Error('429 rate limit'))).toContain('稍等一分钟')
     expect(actionableError(new Error('network offline'))).toContain('检查网络')
     expect(actionableError(new Error('ENOSPC disk write failed'))).toContain('磁盘空间')
+  })
+
+  it('keeps all three timeout classes and pending termination actionable', () => {
+    expect(actionableError(new Error('generic'), 'DEEPSEEK_FIRST_EVENT_TIMEOUT')).toContain('两分钟')
+    expect(actionableError(new Error('generic'), 'DEEPSEEK_STREAM_IDLE_TIMEOUT')).toContain('九十秒')
+    expect(actionableError(new Error('generic'), 'DEEPSEEK_TOTAL_TIMEOUT')).toContain('十分钟')
+    expect(actionableError(new Error('generic'), 'WORK_TERMINATION_PENDING')).toContain('不会计为作品')
+    expect(actionableError(new Error('生成已经停止，但失败记录还没有安全封存；本次不会计为作品或学习证据。')))
+      .toContain('请重启应用恢复')
+  })
+
+  it('preserves only a bounded sanitized request count in timeout guidance', () => {
+    expect(actionableError(
+      new Error('internal path omitted（本次共发起 3 次请求）'),
+      'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+    )).toContain('本次共发起 3 次请求')
+    expect(actionableError(
+      new Error('本次共发起 999 次请求'),
+      'DEEPSEEK_TOTAL_TIMEOUT',
+    )).not.toContain('999')
+  })
+
+  it('only treats the exact launch-cancel acknowledgement as confirmed', () => {
+    expect(isConfirmedLaunchCancellation(new Error('本次创作已停止。'))).toBe(true)
+    expect(isConfirmedLaunchCancellation(
+      new Error("Error invoking remote method 'studio:works:start': Error: 本次创作已停止。"),
+    )).toBe(true)
+    expect(isConfirmedLaunchCancellation(
+      new Error('生成已经停止，但失败记录还没有安全封存。'),
+    )).toBe(false)
   })
 
   it('does not report a missing preview capability as success', () => {
@@ -97,5 +128,25 @@ describe('renderer user-facing decisions', () => {
     expect(interrupted?.message).toContain('重新生成')
     expect(interrupted?.message).toContain('不会续写未完成的模型推理')
     expect(interrupted?.message).not.toContain('继续恢复')
+
+    const totalTimeout = recoveryPresentation({
+      feedbackRecoveryState: 'none',
+      activeSystem: {
+        feedbackRecoveryRequired: false,
+        interruptedRun: { reasonCode: 'DEEPSEEK_TOTAL_TIMEOUT' },
+      },
+    } as never)
+    expect(totalTimeout?.message).toContain('十分钟')
+    expect(totalTimeout?.message).toContain('不会计入学习')
+  })
+
+  it('blocks every creative mutation while a work termination still needs replay', () => {
+    const pending = recoveryPresentation({
+      feedbackRecoveryState: 'none',
+      workRecoveryState: 'retry-required',
+      activeSystem: { feedbackRecoveryRequired: false, interruptedRun: null },
+    } as never)
+    expect(pending).toMatchObject({ blocked: true, canRetry: true, tone: 'attention' })
+    expect(pending?.message).toContain('失败记录安全封存')
   })
 })

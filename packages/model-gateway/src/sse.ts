@@ -6,6 +6,8 @@ import { assertDeepSeekUsage } from "./usage.js";
 interface SseParserOptions {
   signal: AbortSignal;
   maxLineBytes: number;
+  /** Called only after a complete SSE event passes structural validation. */
+  onEvent?: () => void;
 }
 
 export async function* parseDeepSeekSse(
@@ -98,7 +100,10 @@ export async function* parseDeepSeekSse(
         buffer = buffer.slice(newline + 1);
         if (line.endsWith("\r")) line = line.slice(0, -1);
         const event = processLine(line);
-        if (event !== undefined) yield event;
+        if (event !== undefined) {
+          options.onEvent?.();
+          yield event;
+        }
         newline = buffer.indexOf("\n");
       }
     }
@@ -111,11 +116,17 @@ export async function* parseDeepSeekSse(
       let line = buffer;
       if (line.endsWith("\r")) line = line.slice(0, -1);
       const event = processLine(line);
-      if (event !== undefined) yield event;
+      if (event !== undefined) {
+        options.onEvent?.();
+        yield event;
+      }
     }
     if (dataLines.length > 0 || eventName !== undefined) {
       const event = dispatch();
-      if (event !== undefined) yield event;
+      if (event !== undefined) {
+        options.onEvent?.();
+        yield event;
+      }
     }
     if (!sawDone) throw invalidResponse("SSE 响应在 [DONE] 前结束");
   } finally {

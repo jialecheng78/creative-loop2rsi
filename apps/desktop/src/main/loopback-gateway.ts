@@ -20,7 +20,9 @@ const DEFAULT_WORKER_BUDGET: Partial<GatewayBudgetPolicy> = {
   maxResponseBytes: 32 * 1024 * 1024,
   maxSingleRequestBytes: MAX_BODY_BYTES,
   maxSingleResponseBytes: 16 * 1024 * 1024,
-  timeoutMs: 120_000,
+  firstEventTimeoutMs: 120_000,
+  streamIdleTimeoutMs: 90_000,
+  totalTimeoutMs: 600_000,
 }
 
 interface GatewayStream {
@@ -483,8 +485,26 @@ function publicGatewayError(error: unknown): GatewayRequestError {
   if (error.status !== undefined && error.status >= 500 && error.status <= 599) {
     return new GatewayRequestError(error.status, 'DEEPSEEK_UNAVAILABLE', 'DeepSeek 服务暂时不可用，请稍后重试。')
   }
-  if (error.code === 'TIMEOUT') {
-    return new GatewayRequestError(504, 'DEEPSEEK_TIMEOUT', 'DeepSeek 响应超时，请重试。')
+  if (error.code === 'FIRST_EVENT_TIMEOUT') {
+    return new GatewayRequestError(
+      504,
+      'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+      'DeepSeek 在两分钟内没有开始返回内容，本次未保存。请稍后重试。',
+    )
+  }
+  if (error.code === 'STREAM_IDLE_TIMEOUT') {
+    return new GatewayRequestError(
+      504,
+      'DEEPSEEK_STREAM_IDLE_TIMEOUT',
+      'DeepSeek 已开始生成，但九十秒没有新进展；未完成内容不会保存。',
+    )
+  }
+  if (error.code === 'TOTAL_TIMEOUT') {
+    return new GatewayRequestError(
+      504,
+      'DEEPSEEK_TOTAL_TIMEOUT',
+      'DeepSeek 生成已达到十分钟上限；未完成内容不会保存。',
+    )
   }
   if (error.code === 'NETWORK_ERROR') {
     return new GatewayRequestError(502, 'DEEPSEEK_NETWORK', '无法连接 DeepSeek，请检查网络后重试。')

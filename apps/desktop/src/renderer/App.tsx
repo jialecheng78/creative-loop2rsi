@@ -28,6 +28,7 @@ import {
   canSubmitEdit,
   creationInputIssue,
   feedbackSubmissionMessage,
+  isConfirmedLaunchCancellation,
   NAVIGATION,
   primaryFeedbackAction,
   progressMessage,
@@ -107,7 +108,7 @@ export function App(): React.JSX.Element {
         setReviewClosed(false)
       }
       if (event.type === 'error') {
-        setError(actionableError(new Error(event.message)))
+        setError(actionableError(new Error(event.message), event.code))
         setMessage('本次创作没有完成。')
       }
       if (event.type === 'state' && event.state === 'completed') {
@@ -167,7 +168,7 @@ export function App(): React.JSX.Element {
     } catch (caught) {
       setRun(undefined)
       setWorkState('failed')
-      if (launchCancellationRequested.current) {
+      if (launchCancellationRequested.current && isConfirmedLaunchCancellation(caught)) {
         setError('')
         setMessage('本次创作已停止，没有保存为完成版本。')
       } else {
@@ -241,7 +242,7 @@ export function App(): React.JSX.Element {
     if (recoveryBusy) return
     setRecoveryBusy(true)
     setError('')
-    setMessage('正在恢复上次已经保存的反馈与编辑…')
+    setMessage('正在恢复上次未完成的本地记录…')
     try {
       const nextStatus = await getStudioStatus()
       setStatus(nextStatus)
@@ -253,13 +254,13 @@ export function App(): React.JSX.Element {
       setWorkState(savedOutput === '' ? 'empty' : 'ready')
       setReviewClosed(savedWork?.frozen ?? false)
       const recovery = recoveryPresentation(nextStatus)
-      setMessage(recovery?.message ?? '上次反馈已经恢复。')
+      setMessage(recovery?.message ?? '上次未完成的本地记录已经恢复。')
       if (recovery?.blocked === true) {
-        setError('还没有确认恢复完成。原编辑仍保留在本机，请再次重试。')
+        setError('还没有确认恢复完成。已保存内容仍保留在本机，请再次重试。')
       }
     } catch (caught) {
       setError(actionableError(caught))
-      setMessage('还没有确认恢复完成。原编辑仍保留在本机，请重试。')
+      setMessage('还没有确认恢复完成。已保存内容仍保留在本机，请重试。')
     } finally {
       setRecoveryBusy(false)
     }

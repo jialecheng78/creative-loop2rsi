@@ -15,4 +15,23 @@ describe('trusted DSH profile', () => {
     expect(profile).not.toContain('DEEPSEEK_API_KEY')
     expect(profile).not.toContain('https://api.deepseek.com')
   })
+
+  it('lets Main own classified timeouts and retries only pre-stream server pressure', async () => {
+    const profile = await readFile(new URL('../profiles/studio.cordis.yml', import.meta.url), 'utf8')
+    expect(profile).toContain('streamIdleTimeoutMs: 660000')
+    expect(profile).toContain([
+      'retryPolicy:',
+      '      mode: normal',
+      '      maxRetries: 2',
+      '      retryableCodes:',
+      '        - RATE_LIMIT',
+      '        - SERVER',
+      '      backoff:',
+      '        initialDelayMs: 500',
+      '        maxDelayMs: 10000',
+      '        jitterRatio: 0.1',
+    ].join('\n'))
+    const retryBlock = profile.slice(profile.indexOf('    retryPolicy:'), profile.indexOf('    models:'))
+    expect(retryBlock).not.toMatch(/^\s*- (?:TIMEOUT|TRANSPORT)$/mu)
+  })
 })

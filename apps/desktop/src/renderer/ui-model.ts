@@ -18,9 +18,26 @@ export const NAVIGATION: readonly {
   { id: 'versions', label: '版本', number: '04' },
 ]
 
-export function actionableError(error: unknown): string {
+export function actionableError(error: unknown, code?: string): string {
   const raw = error instanceof Error ? error.message : String(error)
   const text = raw.toLocaleLowerCase('zh-CN')
+  const requestAttempts = safeRequestAttemptSuffix(raw)
+
+  if (code === 'DEEPSEEK_FIRST_EVENT_TIMEOUT') {
+    return `DeepSeek 在两分钟内没有开始返回内容${requestAttempts}。本次没有保存，请稍后重新开始。`
+  }
+  if (code === 'DEEPSEEK_STREAM_IDLE_TIMEOUT') {
+    return `DeepSeek 已开始生成，但九十秒没有新进展${requestAttempts}。未完成内容不会保存，请重新开始。`
+  }
+  if (code === 'DEEPSEEK_TOTAL_TIMEOUT') {
+    return `本次生成已达到十分钟上限${requestAttempts}。未完成内容不会保存；可以缩短任务后重新开始。`
+  }
+  if (code === 'WORK_TERMINATION_PENDING') {
+    return '生成已经停止，但失败记录还没有安全封存。请重启应用恢复；本次不会计为作品或学习证据。'
+  }
+  if (/失败记录.*封存|不会计为作品或学习证据/u.test(raw)) {
+    return '生成已经停止，但失败记录还没有安全封存。请重启应用恢复；本次不会计为作品或学习证据。'
+  }
 
   if (raw === 'credential') {
     return '当前安装包还没有接通安全保存。请安装包含“安全连接”功能的更新后再试。'
@@ -73,6 +90,19 @@ export function actionableError(error: unknown): string {
   return '操作没有完成，也没有改动已保存内容。请重试；若仍失败，请重启应用。'
 }
 
+export function isConfirmedLaunchCancellation(error: unknown): boolean {
+  const raw = error instanceof Error ? error.message : String(error)
+  return raw === '本次创作已停止。' || /:\s*本次创作已停止。$/u.test(raw)
+}
+
+function safeRequestAttemptSuffix(raw: string): string {
+  const match = /本次共发起 ([1-9]\d*) 次请求/u.exec(raw)
+  if (match === null) return ''
+  const count = Number(match[1])
+  if (!Number.isSafeInteger(count) || count > 12) return ''
+  return `（本次共发起 ${count} 次请求）`
+}
+
 export function progressMessage(phase: 'queued' | 'working' | 'idle'): string {
   if (phase === 'queued') return '已收到，正在准备创作…'
   if (phase === 'working') return '正在写第一个版本，你可以随时停止。'
@@ -114,6 +144,14 @@ export function creationInputIssue(value: string): string {
 
 export function recoveryPresentation(status: StudioViewStatus | undefined): RecoveryPresentation | null {
   const system = status?.activeSystem
+  if (status?.workRecoveryState === 'retry-required') {
+    return {
+      blocked: true,
+      canRetry: true,
+      message: '上次创作已经停止，但本机还没有确认失败记录安全封存。请重试恢复；完成前不会开始新创作或修改方法。',
+      tone: 'attention',
+    }
+  }
   if (status?.feedbackRecoveryState === 'retry-required' || system?.feedbackRecoveryRequired === true) {
     return {
       blocked: true,
@@ -132,7 +170,41 @@ export function recoveryPresentation(status: StudioViewStatus | undefined): Reco
       tone: 'recovered',
     }
   }
+  if (status?.workRecoveryState === 'recovered'
+    && (system?.interruptedRun === null || system?.interruptedRun === undefined)) {
+    return {
+      blocked: false,
+      canRetry: false,
+      message: '上次未完成的创作记录已经安全收敛；已封存作品没有被改动。',
+      tone: 'recovered',
+    }
+  }
   if (system?.interruptedRun !== null && system?.interruptedRun !== undefined) {
+    const reason = system.interruptedRun.reasonCode
+    if (reason === 'DEEPSEEK_FIRST_EVENT_TIMEOUT') {
+      return {
+        blocked: false,
+        canRetry: false,
+        message: '上次创作因为 DeepSeek 两分钟内没有开始返回内容而结束。本次会重新生成，并保留失败记录；不会把它计为作品或学习证据。',
+        tone: 'attention',
+      }
+    }
+    if (reason === 'DEEPSEEK_STREAM_IDLE_TIMEOUT') {
+      return {
+        blocked: false,
+        canRetry: false,
+        message: '上次创作在开始生成后九十秒没有新进展，因此已安全结束。本次会重新生成；未完成内容不会计入学习。',
+        tone: 'attention',
+      }
+    }
+    if (reason === 'DEEPSEEK_TOTAL_TIMEOUT') {
+      return {
+        blocked: false,
+        canRetry: false,
+        message: '上次创作达到十分钟总时限后已安全结束。本次会重新生成；未完成内容不会计入学习。',
+        tone: 'attention',
+      }
+    }
     return {
       blocked: false,
       canRetry: false,

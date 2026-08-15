@@ -115,6 +115,10 @@ python3 <skill-dir>/scripts/loopctl.py record-dispatch-stall <project-dir> \
 
 stall 只减少 `runtime_dispatch_budget.max_zero_file_stalls`，不增加 `content_attempt_index`、`revision_index` 或 `max_no_improvement`。预算耗尽后 `stop/escalate`，不得伪装成创作质量退化。
 
+stall 与用户看到的失败终态必须分层：前者允许 orchestrator 在同一 open attempt 内换新 dispatch 重派；后者由 App Controller `terminate_work` 写入 `.terminated.json`，表示本次用户操作已结束且旧 run 不得再开。桌面 Main 不得在只写了 stall 后就对 Renderer 宣称失败已完全收敛，也不得吞掉 Controller 终止失败。下次用户重试使用全新 run，通过 `recovery_of` 关联 terminated run；terminated attempt 不属于 sealed content attempts，不参与 finding 、独立作品或候选门槛计数。
+
+`.terminated.json` 是 commit point，`run.json` 与 `system.json` 只是可恢复的查询投影。崩溃发生在 marker 之前时，保留已写 provenance/stall 并由相同请求幂等补齐；发生在 marker 之后时，状态读取或下次 begin 先 roll-forward 为 `run.execution_status=BLOCK`、`current_attempt=null`、`last_decision=stop`。任何 dispatch、作品提交、送审、反馈或 seal mutator 都必须在自己的 mutation lock 内直接拒绝 marker，不能利用投影尚未更新的崩溃窗口继续写。终态复核同时扫描该 attempt 的全部 dispatch：旧 stalled root 的任何晚写都按 `LATE_WRITE_CONTAMINATION` 阻断。恢复多条历史 receipt 时，system 状态只按最新 run 的有效终态投影，不得让旧失败覆盖更新的成功。
+
 `begin-run` 会把 runtime budget 冻结进 attempt；后改系统配置不能重新打开 `BUDGET_EXHAUSTED`。全部 mutation 命令共享项目级 fail-fast OS lock；不同 run、candidate、release 的写入也不能交叉覆盖 `system.json`。CLI `validate/audit` 获取同一锁读取一致快照；并发调用返回 `CONTROLLER_BUSY` 或读取到已提交终态。锁文件永久存在，进程崩溃时由操作系统自动释放。
 
 promote 与 rollback 都先写 `creative-system/control/transactions/<id>/intent.json`，把 candidate status、registry 和 system 的 before/after 哈希及目标快照一次冻结。promote 还在同一事务中冻结 release bundle 清单、评价哈希、目标版本和批准人，并在 intent 落盘后才生成正式 release。未写 `committed.json` 前，`validate` 固定返回 `PENDING_CONTROLLER_TRANSACTION`；只有绑定参数一致的同操作重试才能按 intent roll-forward。恢复会先检查全部目标，若任一目标既非 before 也非 after 哈希，则返回 `TRANSACTION_DIVERGED`，不会先推进其他目标或覆盖外部改动。历史 committed transaction 只校验冻结快照和 receipt，不要求当前可变状态永远停在旧 after 状态。

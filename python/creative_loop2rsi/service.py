@@ -42,6 +42,7 @@ ALLOWED_OPERATIONS = {
     "submit_method_comparison",
     "submit_feedback",
     "system_snapshot",
+    "terminate_work",
 }
 SENSITIVE_FIELD_NAMES = {
     "api_key",
@@ -68,6 +69,22 @@ SYSTEM_LAB_TARGETS = {
 METHOD_PHASES = ("targeted", "regression", "heldout")
 METHOD_CHOICES = {"A", "B", "TIE"}
 METHOD_REGISTRY_RELATIVE = "creative-system/app-methods/registry.json"
+TERMINATION_OUTCOMES = {"FAILED", "CANCELLED"}
+LEGACY_APP_TERMINATION_REASONS = {
+    "application-closed",
+    "completion-evidence-or-commit-failed",
+    "runtime-cancelled-before-commit",
+    "runtime-failed-before-commit",
+    "runtime-launch-failed-before-output",
+    "user-cancelled",
+    "user-cancelled-during-launch",
+}
+LEGACY_APP_CANCELLED_REASONS = {
+    "application-closed",
+    "runtime-cancelled-before-commit",
+    "user-cancelled",
+    "user-cancelled-during-launch",
+}
 
 
 class AppRequestError(RuntimeError):
@@ -518,6 +535,8 @@ def _begin_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
     )
     core = load_controller()
     project = _project_path(payload.get("project"))
+    with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
     validation = core.validate_project(project)
     if validation["errors"]:
         raise AppRequestError("项目合同未通过：" + "; ".join(validation["errors"]))
@@ -561,6 +580,20 @@ def _begin_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
         project / "creative-system" / "runs" / run_id
     )
     if existing_run_dir.is_dir():
+        existing_record = core.load_json(
+            core.regular_project_file(
+                project,
+                (existing_run_dir / "run.json").relative_to(project).as_posix(),
+                "existing app run record",
+            )
+        )
+        if isinstance(existing_record, dict) and (
+            existing_record.get("terminal_receipt") is not None
+            or existing_record.get("terminal_attempt") is not None
+        ):
+            raise AppRequestError(
+                "run 已终止，必须使用新 run_id 并通过 recovery_of 关联"
+            )
         existing_id, _, _, existing, attempt_id, attempt_dir = core.open_attempt_context(
             project, run_id
         )
@@ -674,65 +707,853 @@ def _cancel_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
     run_id = _id(payload.get("run_id"), "run_id")
     dispatch_id = _id(payload.get("dispatch_id"), "dispatch_id")
     reason = _text(payload.get("reason"), "reason", maximum=500)
-    _, _, _, _, attempt_id, attempt_dir = core.open_attempt_context(project, run_id)
-    dispatch_dir = attempt_dir / "dispatches" / dispatch_id
-    record = core.load_dispatch_record(project, attempt_dir, dispatch_dir)
-    provenance_relative: Optional[str] = None
-    provenance_sha256: Optional[str] = None
-    if payload.get("runtime_provenance") is not None:
-        provenance = _runtime_provenance(
-            core,
-            payload.get("runtime_provenance"),
-            run_id,
-            require_completed=False,
-            fallback_created_at=record.get("opened_at"),
-            expected_context_sha256=_work_task_context_sha256(
-                core, project, run_id
-            ),
+    with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
+        _, _, _, _, attempt_id, attempt_dir = core.open_attempt_context(
+            project, run_id
         )
-        provenance_relative = (
-            attempt_dir / f"runtime-provenance-{dispatch_id}.json"
-        ).relative_to(project).as_posix()
-        provenance_path = project / provenance_relative
-        provenance_bytes = (
-            json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        if os.path.lexists(str(provenance_path)):
-            if provenance_path.is_symlink() or not provenance_path.is_file():
-                raise AppRequestError("取消运行来源路径被非普通文件占用")
-            if provenance_path.read_bytes() != provenance_bytes:
-                raise AppRequestError("同一 dispatch 已绑定不同取消运行来源")
+        dispatch_dir = attempt_dir / "dispatches" / dispatch_id
+        record = core.load_dispatch_record(project, attempt_dir, dispatch_dir)
+        provenance_relative: Optional[str] = None
+        provenance_sha256: Optional[str] = None
+        if payload.get("runtime_provenance") is not None:
+            provenance = _runtime_provenance(
+                core,
+                payload.get("runtime_provenance"),
+                run_id,
+                require_completed=False,
+                fallback_created_at=record.get("opened_at"),
+                expected_context_sha256=_work_task_context_sha256(
+                    core, project, run_id
+                ),
+            )
+            provenance_relative = (
+                attempt_dir / f"runtime-provenance-{dispatch_id}.json"
+            ).relative_to(project).as_posix()
+            provenance_path = project / provenance_relative
+            provenance_bytes = (
+                json.dumps(
+                    provenance, ensure_ascii=False, indent=2, sort_keys=True
+                )
+                + "\n"
+            ).encode("utf-8")
+            if os.path.lexists(str(provenance_path)):
+                if provenance_path.is_symlink() or not provenance_path.is_file():
+                    raise AppRequestError("取消运行来源路径被非普通文件占用")
+                if provenance_path.read_bytes() != provenance_bytes:
+                    raise AppRequestError("同一 dispatch 已绑定不同取消运行来源")
+            else:
+                core.atomic_create_bytes(provenance_path, provenance_bytes)
+            provenance_sha256 = core.sha256_bytes(provenance_bytes)
+        existing = core.load_dispatch_stall(
+            project, attempt_dir, dispatch_dir, record
+        )
+        if existing is not None:
+            if existing.get("orchestrator_attestation", {}).get("reason") != reason:
+                raise AppRequestError("dispatch 已由不同原因结束，拒绝覆盖")
+            return {
+                "status": (
+                    "PASS"
+                    if existing.get("state") != "BUDGET_EXHAUSTED"
+                    else "BLOCK"
+                ),
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "dispatch_id": dispatch_id,
+                "reason_code": existing.get("reason_code"),
+                "state": existing.get("state"),
+                "runtime_provenance": provenance_relative,
+                "runtime_provenance_sha256": provenance_sha256,
+                "idempotent": True,
+            }
+        result = core.command_record_dispatch_stall_locked(
+            Namespace(
+                project=str(project),
+                run_id=run_id,
+                dispatch_id=dispatch_id,
+                context_stopped=True,
+                reason=reason,
+            ),
+            project,
+            run_id,
+        )
+        result["idempotent"] = False
+        result["runtime_provenance"] = provenance_relative
+        result["runtime_provenance_sha256"] = provenance_sha256
+        return result
+
+
+def _termination_receipt_path(attempt_dir: Path) -> Path:
+    return attempt_dir / ".terminated.json"
+
+
+def _termination_context(
+    core: Any, project: Path, run_id: str, dispatch_id: str
+) -> tuple[Dict[str, Any], Path, str, Path, Path, Dict[str, Any]]:
+    run_dir = project / "creative-system" / "runs" / run_id
+    run_path = core.regular_project_file(
+        project, (run_dir / "run.json").relative_to(project).as_posix(), "run record"
+    )
+    run = core.load_json(run_path)
+    if not isinstance(run, dict) or run.get("run_id") != run_id:
+        raise AppRequestError("terminate_work run record 无效")
+    attempt_id = run.get("current_attempt") or run.get("terminal_attempt")
+    if not isinstance(attempt_id, str) or not re.fullmatch(r"attempt-[0-9]{3}", attempt_id):
+        raise AppRequestError("该 run 没有可终止的 attempt")
+    attempt_dir = run_dir / "attempts" / attempt_id
+    if attempt_dir.is_symlink() or not attempt_dir.is_dir():
+        raise AppRequestError("terminate_work attempt 不是普通目录")
+    core.regular_project_file(
+        project,
+        (attempt_dir / "attempt.json").relative_to(project).as_posix(),
+        "attempt record",
+    )
+    dispatch_dir = attempt_dir / "dispatches" / dispatch_id
+    dispatch = core.load_dispatch_record(project, attempt_dir, dispatch_dir)
+    return run, run_path, attempt_id, attempt_dir, dispatch_dir, dispatch
+
+
+def _evidence_ref(core: Any, project: Path, path: Path, label: str) -> Dict[str, str]:
+    relative = path.relative_to(project).as_posix()
+    verified = core.regular_project_file(project, relative, label)
+    return {"path": relative, "sha256": core.sha256_file(verified)}
+
+
+def _validate_runtime_provenance_record(
+    core: Any, project: Path, run_id: str, path: Path
+) -> Dict[str, Any]:
+    relative = path.relative_to(project).as_posix()
+    verified = core.regular_project_file(project, relative, "termination runtime provenance")
+    raw = core.load_json(verified)
+    if (
+        not isinstance(raw, dict)
+        or raw.get("kind") != "RuntimeProvenance"
+        or raw.get("run_id") != run_id
+        or raw.get("authority") != "main-observed-model-gateway"
+        or raw.get("reasoning_content_persisted") is not False
+        or raw.get("content_hash") != core.app_record_content_hash(raw)
+        or raw.get("context_sha256")
+        != _work_task_context_sha256(core, project, run_id)
+    ):
+        raise AppRequestError("termination runtime provenance 与 work 绑定不一致")
+    return raw
+
+
+def _persist_termination_provenance_locked(
+    core: Any,
+    project: Path,
+    run_id: str,
+    attempt_dir: Path,
+    dispatch_id: str,
+    dispatch: Mapping[str, Any],
+    raw_provenance: Any,
+) -> Optional[Dict[str, str]]:
+    canonical = attempt_dir / "runtime-provenance.json"
+    dispatch_specific = attempt_dir / f"runtime-provenance-{dispatch_id}.json"
+    existing = [
+        path
+        for path in (canonical, dispatch_specific)
+        if os.path.lexists(str(path))
+    ]
+    if len(existing) > 1:
+        raise AppRequestError("同一 attempt 存在多份 runtime provenance")
+    if raw_provenance is None:
+        if not existing:
+            return None
+        _validate_runtime_provenance_record(core, project, run_id, existing[0])
+        return _evidence_ref(
+            core, project, existing[0], "termination runtime provenance"
+        )
+
+    provenance = _runtime_provenance(
+        core,
+        raw_provenance,
+        run_id,
+        require_completed=False,
+        fallback_created_at=dispatch.get("opened_at"),
+        expected_context_sha256=_work_task_context_sha256(core, project, run_id),
+    )
+    encoded = (
+        json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    path = existing[0] if existing else dispatch_specific
+    if os.path.lexists(str(path)):
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+            raise AppRequestError("同一 run 已绑定不同 runtime provenance")
+    else:
+        core.atomic_create_bytes(path, encoded)
+    _validate_runtime_provenance_record(core, project, run_id, path)
+    return _evidence_ref(core, project, path, "termination runtime provenance")
+
+
+def _termination_semantic(record: Mapping[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "run_id",
+        "work_id",
+        "attempt_id",
+        "dispatch_id",
+        "outcome",
+        "execution_status",
+        "quality_status",
+        "release_status",
+        "lifecycle_reason",
+        "error_code",
+        "termination_class",
+        "dispatch_stall",
+        "runtime_provenance",
+        "artifact_inventory",
+        "content_attempt_consumed",
+        "finding_eligible",
+        "successor_run_required",
+    )
+    return {key: record.get(key) for key in keys}
+
+
+def _build_termination_receipt(
+    core: Any,
+    *,
+    run: Mapping[str, Any],
+    run_id: str,
+    attempt_id: str,
+    dispatch_id: str,
+    outcome: str,
+    reason: str,
+    error_code: Optional[str],
+    termination_class: str,
+    stall_ref: Optional[Mapping[str, str]],
+    provenance_ref: Optional[Mapping[str, str]],
+    artifact_inventory: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    source_refs = [
+        str(reference["path"])
+        for reference in (stall_ref, provenance_ref)
+        if isinstance(reference, Mapping)
+    ]
+    return _record(
+        core,
+        "TerminatedAttempt",
+        f"termination-{attempt_id}",
+        {
+            "source_refs": source_refs,
+            "run_id": run_id,
+            "work_id": run.get("work_id", run_id),
+            "attempt_id": attempt_id,
+            "dispatch_id": dispatch_id,
+            "outcome": outcome,
+            "execution_status": "BLOCK",
+            "quality_status": "NOT_EVALUATED",
+            "release_status": "BLOCK",
+            "lifecycle_reason": reason,
+            "error_code": error_code,
+            "termination_class": termination_class,
+            "dispatch_stall": dict(stall_ref) if stall_ref is not None else None,
+            "runtime_provenance": (
+                dict(provenance_ref) if provenance_ref is not None else None
+            ),
+            "artifact_inventory": artifact_inventory,
+            "content_attempt_consumed": termination_class
+            == "UNCOMMITTED_OUTPUT_FAILURE",
+            "finding_eligible": False,
+            "successor_run_required": True,
+        },
+    )
+
+
+def _load_termination_receipt(
+    core: Any, project: Path, attempt_dir: Path
+) -> Dict[str, Any]:
+    path = _termination_receipt_path(attempt_dir)
+    verified = core.regular_project_file(
+        project, path.relative_to(project).as_posix(), "terminated attempt receipt"
+    )
+    receipt = core.load_json(verified)
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("kind") != "TerminatedAttempt"
+        or receipt.get("id") != f"termination-{attempt_dir.name}"
+        or receipt.get("content_hash") != core.app_record_content_hash(receipt)
+    ):
+        raise AppRequestError("TerminatedAttempt 合同或内容哈希无效")
+    return receipt
+
+
+def _verify_termination_receipt(
+    core: Any, project: Path, attempt_dir: Path, receipt: Mapping[str, Any]
+) -> None:
+    run_id = attempt_dir.parent.parent.name
+    if (
+        receipt.get("run_id") != run_id
+        or receipt.get("attempt_id") != attempt_dir.name
+        or receipt.get("outcome") not in TERMINATION_OUTCOMES
+        or receipt.get("execution_status") != "BLOCK"
+        or receipt.get("quality_status") != "NOT_EVALUATED"
+        or receipt.get("release_status") != "BLOCK"
+        or receipt.get("finding_eligible") is not False
+        or receipt.get("successor_run_required") is not True
+    ):
+        raise AppRequestError("TerminatedAttempt 身份或终态字段无效")
+    if receipt.get("outcome") == "FAILED":
+        if not isinstance(receipt.get("error_code"), str) or not receipt.get("error_code"):
+            raise AppRequestError("FAILED TerminatedAttempt 缺少 error_code")
+    elif receipt.get("error_code") is not None:
+        raise AppRequestError("CANCELLED TerminatedAttempt 不得含 error_code")
+    if (attempt_dir / ".sealed.json").exists():
+        raise AppRequestError("attempt 不得同时 sealed 与 terminated")
+    review_subject, review_anchor = core.human_review_paths(project, attempt_dir)
+    if os.path.lexists(str(review_subject)) or os.path.lexists(str(review_anchor)):
+        raise AppRequestError("terminated attempt 不得存在送审版本或评审锚点")
+    core.ensure_attempt_not_terminal_invalid(attempt_dir)
+    dispatch_id = _id(receipt.get("dispatch_id"), "TerminatedAttempt.dispatch_id")
+    dispatch_dir = attempt_dir / "dispatches" / dispatch_id
+    inventory = _termination_attempt_inventory(
+        core,
+        project,
+        attempt_dir,
+        dispatch_id,
+    )
+    recorded_inventory = receipt.get("artifact_inventory")
+    if not isinstance(recorded_inventory, list) or inventory != recorded_inventory:
+        raise AppRequestError("TerminatedAttempt artifact inventory 已变化")
+
+    termination_class = receipt.get("termination_class")
+    stall_ref = receipt.get("dispatch_stall")
+    if termination_class == "ZERO_FILE_RUNTIME_FAILURE":
+        if inventory or receipt.get("content_attempt_consumed") is not False:
+            raise AppRequestError("zero-file termination 的内容计数无效")
+        if not isinstance(stall_ref, dict):
+            raise AppRequestError("zero-file termination 缺少 dispatch stall")
+        expected_stall = (dispatch_dir / "stall.json").relative_to(project).as_posix()
+        if stall_ref.get("path") != expected_stall:
+            raise AppRequestError("TerminatedAttempt dispatch stall 路径无效")
+        stall_path = core.regular_project_file(project, expected_stall, "dispatch stall")
+        if stall_ref.get("sha256") != core.sha256_file(stall_path):
+            raise AppRequestError("TerminatedAttempt dispatch stall 哈希无效")
+        stall = core.load_json(stall_path)
+        attestation = stall.get("orchestrator_attestation") if isinstance(stall, dict) else None
+        if (
+            not isinstance(attestation, dict)
+            or attestation.get("reason") != receipt.get("lifecycle_reason")
+        ):
+            raise AppRequestError("TerminatedAttempt 与 dispatch stall reason 不一致")
+    elif termination_class == "UNCOMMITTED_OUTPUT_FAILURE":
+        if not inventory or receipt.get("content_attempt_consumed") is not True:
+            raise AppRequestError("uncommitted-output termination 缺少产物清单")
+        if stall_ref is not None:
+            raise AppRequestError("uncommitted-output termination 不得伪造 zero-file stall")
+    else:
+        raise AppRequestError("TerminatedAttempt.termination_class 无效")
+
+    provenance_ref = receipt.get("runtime_provenance")
+    if provenance_ref is not None:
+        if not isinstance(provenance_ref, dict) or not isinstance(
+            provenance_ref.get("path"), str
+        ):
+            raise AppRequestError("TerminatedAttempt runtime provenance 引用无效")
+        provenance_path = core.regular_project_file(
+            project, provenance_ref["path"], "termination runtime provenance"
+        )
+        try:
+            provenance_path.relative_to(attempt_dir)
+        except ValueError as exc:
+            raise AppRequestError("termination runtime provenance 不属于当前 attempt") from exc
+        if provenance_ref.get("sha256") != core.sha256_file(provenance_path):
+            raise AppRequestError("TerminatedAttempt runtime provenance 哈希无效")
+        _validate_runtime_provenance_record(core, project, run_id, provenance_path)
+
+
+def _termination_attempt_inventory(
+    core: Any,
+    project: Path,
+    attempt_dir: Path,
+    terminal_dispatch_id: str,
+) -> list[Dict[str, Any]]:
+    """Verify that a terminal receipt covers the only non-empty dispatch.
+
+    Earlier dispatches may exist only as mechanically zero-file stalls.  A
+    write that arrives in any of those roots after the terminal marker is a
+    late-write contamination of the whole attempt, not ignorable content.
+    """
+
+    legacy_inventory = core.regular_file_inventory(
+        attempt_dir / "artifacts", label="terminated legacy artifacts"
+    )
+    if legacy_inventory:
+        raise AppRequestError(
+            "LATE_WRITE_CONTAMINATION：terminated attempt 的 legacy artifacts 出现产物"
+        )
+
+    terminal_inventory: Optional[list[Dict[str, Any]]] = None
+    for dispatch_dir in core.dispatch_directories(attempt_dir):
+        dispatch = core.load_dispatch_record(
+            project, attempt_dir, dispatch_dir
+        )
+        inventory = core.regular_file_inventory(
+            dispatch_dir / "artifacts",
+            label=f"terminated dispatch artifacts {dispatch_dir.name}",
+        )
+        stall = core.load_dispatch_stall(
+            project, attempt_dir, dispatch_dir, dispatch
+        )
+        if dispatch_dir.name == terminal_dispatch_id:
+            terminal_inventory = inventory
+            continue
+        if stall is None:
+            raise AppRequestError(
+                "terminated attempt 存在未结束的其他 dispatch"
+            )
+        if inventory:
+            raise AppRequestError(
+                "LATE_WRITE_CONTAMINATION：已 stall dispatch 后出现产物"
+            )
+    if terminal_inventory is None:
+        raise AppRequestError("TerminatedAttempt 指向不存在的 dispatch")
+    return terminal_inventory
+
+
+def _apply_termination_run_projection_locked(
+    core: Any, project: Path, receipt_path: Path, receipt: Mapping[str, Any]
+) -> None:
+    run_id = str(receipt["run_id"])
+    attempt_id = str(receipt["attempt_id"])
+    run_path = project / "creative-system" / "runs" / run_id / "run.json"
+    run = core.load_json(
+        core.regular_project_file(
+            project, run_path.relative_to(project).as_posix(), "terminated run record"
+        )
+    )
+    if not isinstance(run, dict) or run.get("run_id") != run_id:
+        raise AppRequestError("terminated run record 无效")
+    if attempt_id in run.get("attempts", []):
+        raise AppRequestError("terminated attempt 不得同时进入 sealed attempts")
+    current = run.get("current_attempt")
+    if current not in {attempt_id, None}:
+        raise AppRequestError("run.current_attempt 与 TerminatedAttempt 冲突")
+    terminated = run.get("terminated_attempts", [])
+    if not isinstance(terminated, list) or any(
+        not isinstance(item, str) for item in terminated
+    ):
+        raise AppRequestError("run.terminated_attempts 无效")
+    if attempt_id not in terminated:
+        terminated = [*terminated, attempt_id]
+    relative = receipt_path.relative_to(project).as_posix()
+    digest = core.sha256_file(receipt_path)
+    projected = dict(run)
+    projected.update(
+        {
+            "current_attempt": None,
+            "execution_status": "BLOCK",
+            "quality_status": "NOT_EVALUATED",
+            "release_status": "BLOCK",
+            "last_decision": "stop",
+            "terminated_attempts": terminated,
+            "terminal_attempt": attempt_id,
+            "terminal_outcome": receipt.get("outcome"),
+            "terminal_error_code": receipt.get("error_code"),
+            "terminal_receipt": relative,
+            "terminal_receipt_sha256": digest,
+        }
+    )
+    if projected != run:
+        core.atomic_write_json(run_path, projected)
+
+
+def _project_system_from_latest_run_locked(core: Any, project: Path) -> None:
+    runs_root = project / "creative-system" / "runs"
+    latest: Optional[tuple[str, Dict[str, Any]]] = None
+    if runs_root.is_dir() and not runs_root.is_symlink():
+        for run_path in runs_root.glob("*/run.json"):
+            if run_path.is_symlink() or not run_path.is_file():
+                continue
+            run = core.load_json(run_path)
+            if not isinstance(run, dict) or not isinstance(run.get("created_at"), str):
+                continue
+            ordering = f"{run['created_at']}\x00{run_path.parent.name}"
+            if latest is None or ordering > latest[0]:
+                latest = (ordering, run)
+    if latest is None:
+        return
+    run = latest[1]
+    statuses = {
+        "execution_status": run.get("execution_status"),
+        "quality_status": run.get("quality_status"),
+        "release_status": run.get("release_status"),
+    }
+    if (
+        statuses["execution_status"] not in {"NOT_STARTED", "RUNNING", "PASS", "BLOCK"}
+        or statuses["quality_status"]
+        not in {"NOT_EVALUATED", "PASS", "WARN", "NEEDS_TASTE"}
+        or statuses["release_status"]
+        not in {"NOT_READY", "CANDIDATE", "PASS", "BLOCK"}
+    ):
+        raise AppRequestError("最新 run 状态无效，无法恢复 system 投影")
+    system = core.load_system(project)
+    if system.get("statuses") != statuses:
+        system["statuses"] = statuses
+        core.atomic_write_json(core.system_path(project), system)
+
+
+def _legacy_error_code_from_provenance(provenance: Mapping[str, Any]) -> str:
+    requests = provenance.get("requests")
+    if isinstance(requests, list) and requests:
+        item = requests[-1]
+        if (
+            isinstance(item, dict)
+            and item.get("status") == "FAILED"
+            and isinstance(item.get("error_code"), str)
+            and item.get("error_code")
+        ):
+            return str(item["error_code"])
+    return "RUNTIME_FAILED"
+
+
+def _migrate_legacy_app_terminations_locked(core: Any, project: Path) -> None:
+    runs_root = project / "creative-system" / "runs"
+    if not runs_root.is_dir() or runs_root.is_symlink():
+        return
+    for run_path in sorted(runs_root.glob("*/run.json")):
+        run = core.load_json(run_path)
+        if not isinstance(run, dict) or not isinstance(run.get("work_id"), str):
+            continue
+        attempt_id = run.get("current_attempt")
+        if not isinstance(attempt_id, str):
+            continue
+        attempt_dir = run_path.parent / "attempts" / attempt_id
+        marker = _termination_receipt_path(attempt_dir)
+        if marker.exists() or (attempt_dir / ".sealed.json").exists():
+            continue
+        stalled: list[tuple[str, Path, Dict[str, Any], Dict[str, Any]]] = []
+        has_open = False
+        for dispatch_dir in core.dispatch_directories(attempt_dir):
+            dispatch = core.load_dispatch_record(project, attempt_dir, dispatch_dir)
+            stall = core.load_dispatch_stall(project, attempt_dir, dispatch_dir, dispatch)
+            if stall is None:
+                has_open = True
+                break
+            stalled.append((str(stall.get("recorded_at", "")), dispatch_dir, dispatch, stall))
+        if has_open or not stalled:
+            continue
+        _, dispatch_dir, dispatch, stall = sorted(stalled, key=lambda item: item[0])[-1]
+        attestation = stall.get("orchestrator_attestation")
+        reason = attestation.get("reason") if isinstance(attestation, dict) else None
+        if reason not in LEGACY_APP_TERMINATION_REASONS:
+            continue
+        provenance_path = attempt_dir / f"runtime-provenance-{dispatch_dir.name}.json"
+        if not provenance_path.is_file() or provenance_path.is_symlink():
+            continue
+        provenance = _validate_runtime_provenance_record(
+            core, project, str(run.get("run_id", run_path.parent.name)), provenance_path
+        )
+        inventory = core.regular_file_inventory(
+            dispatch_dir / "artifacts", label="legacy terminated dispatch artifacts"
+        )
+        if inventory:
+            continue
+        outcome = (
+            "CANCELLED"
+            if reason in LEGACY_APP_CANCELLED_REASONS
+            else "FAILED"
+        )
+        receipt = _build_termination_receipt(
+            core,
+            run=run,
+            run_id=str(run.get("run_id", run_path.parent.name)),
+            attempt_id=attempt_id,
+            dispatch_id=dispatch_dir.name,
+            outcome=outcome,
+            reason=str(reason),
+            error_code=(
+                None
+                if outcome == "CANCELLED"
+                else _legacy_error_code_from_provenance(provenance)
+            ),
+            termination_class="ZERO_FILE_RUNTIME_FAILURE",
+            stall_ref=_evidence_ref(core, project, dispatch_dir / "stall.json", "dispatch stall"),
+            provenance_ref=_evidence_ref(
+                core, project, provenance_path, "termination runtime provenance"
+            ),
+            artifact_inventory=[],
+        )
+        core.atomic_create_json(marker, receipt)
+
+
+def _reconcile_terminated_attempts_locked(core: Any, project: Path) -> None:
+    _migrate_legacy_app_terminations_locked(core, project)
+    runs_root = project / "creative-system" / "runs"
+    if runs_root.is_dir() and not runs_root.is_symlink():
+        for receipt_path in sorted(runs_root.glob("*/attempts/attempt-*/.terminated.json")):
+            attempt_dir = receipt_path.parent
+            receipt = _load_termination_receipt(core, project, attempt_dir)
+            _verify_termination_receipt(core, project, attempt_dir, receipt)
+            _apply_termination_run_projection_locked(
+                core, project, receipt_path, receipt
+            )
+    _project_system_from_latest_run_locked(core, project)
+
+
+def _assert_run_not_terminated_locked(
+    core: Any, project: Path, run_id: str
+) -> Dict[str, Any]:
+    run_path = core.regular_project_file(
+        project,
+        f"creative-system/runs/{run_id}/run.json",
+        "mutable app run",
+    )
+    run = core.load_json(run_path)
+    if not isinstance(run, dict) or run.get("run_id") != run_id:
+        raise AppRequestError("run.json 无效")
+    if run.get("terminal_receipt") is not None or run.get("terminal_attempt") is not None:
+        raise AppRequestError("run 已终止，拒绝继续写入、反馈或封存")
+    current_attempt = run.get("current_attempt")
+    if isinstance(current_attempt, str):
+        marker = run_path.parent / "attempts" / current_attempt / ".terminated.json"
+        if os.path.lexists(str(marker)):
+            raise AppRequestError("run 已有 TerminatedAttempt marker，拒绝继续修改")
+    return run
+
+
+def _assert_existing_termination_matches_request(
+    core: Any,
+    project: Path,
+    run_id: str,
+    dispatch: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    *,
+    dispatch_id: str,
+    outcome: str,
+    reason: str,
+    error_code: Optional[str],
+    raw_provenance: Any,
+) -> None:
+    """Compare a retry against the immutable terminal fact without writing.
+
+    A ``.terminated.json`` marker is the commit point.  Once it exists, even a
+    conflicting retry must be a zero-side-effect rejection: in particular it
+    must not create a new runtime provenance file before discovering that the
+    first writer already committed a different semantic.
+    """
+
+    if (
+        receipt.get("dispatch_id") != dispatch_id
+        or receipt.get("outcome") != outcome
+        or receipt.get("lifecycle_reason") != reason
+        or receipt.get("error_code") != error_code
+    ):
+        raise AppRequestError("同一 attempt 已绑定不同终止语义")
+    if raw_provenance is None:
+        return
+    provenance_ref = receipt.get("runtime_provenance")
+    if not isinstance(provenance_ref, dict) or not isinstance(
+        provenance_ref.get("path"), str
+    ):
+        raise AppRequestError("同一 attempt 已绑定不同终止语义")
+    provenance = _runtime_provenance(
+        core,
+        raw_provenance,
+        run_id,
+        require_completed=False,
+        fallback_created_at=dispatch.get("opened_at"),
+        expected_context_sha256=_work_task_context_sha256(core, project, run_id),
+    )
+    encoded = (
+        json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    provenance_path = core.regular_project_file(
+        project,
+        provenance_ref["path"],
+        "termination runtime provenance",
+    )
+    if provenance_path.read_bytes() != encoded:
+        raise AppRequestError("同一 attempt 已绑定不同终止语义")
+
+
+def _terminate_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(
+        payload,
+        "payload",
+        {
+            "dispatch_id",
+            "error_code",
+            "outcome",
+            "project",
+            "reason",
+            "run_id",
+            "runtime_provenance",
+        },
+    )
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    run_id = _id(payload.get("run_id"), "run_id")
+    dispatch_id = _id(payload.get("dispatch_id"), "dispatch_id")
+    outcome = _text(payload.get("outcome"), "outcome", maximum=20)
+    if outcome not in TERMINATION_OUTCOMES:
+        raise AppRequestError("outcome 必须是 FAILED 或 CANCELLED")
+    reason = _text(payload.get("reason"), "reason", maximum=500)
+    raw_error_code = payload.get("error_code")
+    error_code = (
+        None
+        if raw_error_code is None
+        else _text(raw_error_code, "error_code", maximum=160)
+    )
+    if outcome == "FAILED" and error_code is None:
+        raise AppRequestError("FAILED terminate_work 必须提供 error_code")
+    if outcome == "CANCELLED" and error_code is not None:
+        raise AppRequestError("CANCELLED terminate_work 不得提供 error_code")
+
+    with core.exclusive_controller_lock(project):
+        validation = core.validate_project(project)
+        if validation["errors"]:
+            raise AppRequestError("项目合同未通过：" + "; ".join(validation["errors"]))
+        run, _, attempt_id, attempt_dir, dispatch_dir, dispatch = _termination_context(
+            core, project, run_id, dispatch_id
+        )
+        if (attempt_dir / ".sealed.json").exists():
+            raise AppRequestError("已封存作品不得转为 terminated")
+        core.ensure_attempt_not_terminal_invalid(attempt_dir)
+        receipt_path = _termination_receipt_path(attempt_dir)
+        if os.path.lexists(str(receipt_path)):
+            if receipt_path.is_symlink() or not receipt_path.is_file():
+                raise AppRequestError("TerminatedAttempt 路径被非普通文件占用")
+            receipt = _load_termination_receipt(core, project, attempt_dir)
+            _verify_termination_receipt(core, project, attempt_dir, receipt)
+            _assert_existing_termination_matches_request(
+                core,
+                project,
+                run_id,
+                dispatch,
+                receipt,
+                dispatch_id=dispatch_id,
+                outcome=outcome,
+                reason=reason,
+                error_code=error_code,
+                raw_provenance=payload.get("runtime_provenance"),
+            )
+            _apply_termination_run_projection_locked(
+                core, project, receipt_path, receipt
+            )
+            _project_system_from_latest_run_locked(core, project)
+            return {
+                "status": "PASS",
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "dispatch_id": dispatch_id,
+                "outcome": outcome,
+                "execution_status": "BLOCK",
+                "terminal_receipt": receipt_path.relative_to(project).as_posix(),
+                "terminal_receipt_sha256": core.sha256_file(receipt_path),
+                "content_attempt_consumed": receipt.get(
+                    "content_attempt_consumed"
+                ),
+                "finding_eligible": False,
+                "idempotent": True,
+                "next_action": "使用新 run_id 并通过 recovery_of 关联本 run",
+            }
+        try:
+            core.verify_human_review_subject(project, attempt_dir)
+        except core.LoopCtlError:
+            pass
         else:
-            core.atomic_create_bytes(provenance_path, provenance_bytes)
-        provenance_sha256 = core.sha256_bytes(provenance_bytes)
-    existing = core.load_dispatch_stall(project, attempt_dir, dispatch_dir, record)
-    if existing is not None:
-        if existing.get("orchestrator_attestation", {}).get("reason") != reason:
-            raise AppRequestError("dispatch 已由不同原因结束，拒绝覆盖")
+            raise AppRequestError("已冻结送审作品不得转为 terminated")
+
+        provenance_ref = _persist_termination_provenance_locked(
+            core,
+            project,
+            run_id,
+            attempt_dir,
+            dispatch_id,
+            dispatch,
+            payload.get("runtime_provenance"),
+        )
+        inventory = core.regular_file_inventory(
+            dispatch_dir / "artifacts", label="terminate_work dispatch artifacts"
+        )
+        stall = core.load_dispatch_stall(project, attempt_dir, dispatch_dir, dispatch)
+        stall_ref: Optional[Dict[str, str]] = None
+        if inventory:
+            if stall is not None:
+                raise AppRequestError(
+                    "LATE_WRITE_CONTAMINATION：已 stall dispatch 后出现产物"
+                )
+            termination_class = "UNCOMMITTED_OUTPUT_FAILURE"
+        else:
+            termination_class = "ZERO_FILE_RUNTIME_FAILURE"
+            if stall is None:
+                core.command_record_dispatch_stall_locked(
+                    Namespace(
+                        project=str(project),
+                        run_id=run_id,
+                        dispatch_id=dispatch_id,
+                        context_stopped=True,
+                        reason=reason,
+                    ),
+                    project,
+                    run_id,
+                )
+            else:
+                attestation = stall.get("orchestrator_attestation")
+                if (
+                    not isinstance(attestation, dict)
+                    or attestation.get("reason") != reason
+                ):
+                    raise AppRequestError("dispatch 已由不同原因结束，拒绝覆盖")
+            stall_ref = _evidence_ref(
+                core, project, dispatch_dir / "stall.json", "dispatch stall"
+            )
+
+        verified_inventory = _termination_attempt_inventory(
+            core,
+            project,
+            attempt_dir,
+            dispatch_id,
+        )
+        if verified_inventory != inventory:
+            raise AppRequestError(
+                "terminate_work artifact inventory 在终态提交前发生变化"
+            )
+
+        candidate = _build_termination_receipt(
+            core,
+            run=run,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            dispatch_id=dispatch_id,
+            outcome=outcome,
+            reason=reason,
+            error_code=error_code,
+            termination_class=termination_class,
+            stall_ref=stall_ref,
+            provenance_ref=provenance_ref,
+            artifact_inventory=inventory,
+        )
+        receipt_path = _termination_receipt_path(attempt_dir)
+        idempotent = os.path.lexists(str(receipt_path))
+        if idempotent:
+            if receipt_path.is_symlink() or not receipt_path.is_file():
+                raise AppRequestError("TerminatedAttempt 路径被非普通文件占用")
+            receipt = _load_termination_receipt(core, project, attempt_dir)
+            if _termination_semantic(receipt) != _termination_semantic(candidate):
+                raise AppRequestError("同一 attempt 已绑定不同终止语义")
+        else:
+            core.atomic_create_json(receipt_path, candidate)
+            receipt = candidate
+        _verify_termination_receipt(core, project, attempt_dir, receipt)
+        _apply_termination_run_projection_locked(
+            core, project, receipt_path, receipt
+        )
+        _project_system_from_latest_run_locked(core, project)
         return {
-            "status": "PASS" if existing.get("state") != "BUDGET_EXHAUSTED" else "BLOCK",
+            "status": "PASS",
             "run_id": run_id,
             "attempt_id": attempt_id,
             "dispatch_id": dispatch_id,
-            "reason_code": existing.get("reason_code"),
-            "state": existing.get("state"),
-            "runtime_provenance": provenance_relative,
-            "runtime_provenance_sha256": provenance_sha256,
-            "idempotent": True,
+            "outcome": outcome,
+            "execution_status": "BLOCK",
+            "terminal_receipt": receipt_path.relative_to(project).as_posix(),
+            "terminal_receipt_sha256": core.sha256_file(receipt_path),
+            "content_attempt_consumed": receipt.get("content_attempt_consumed"),
+            "finding_eligible": False,
+            "idempotent": idempotent,
+            "next_action": "使用新 run_id 并通过 recovery_of 关联本 run",
         }
-    result = core.command_record_dispatch_stall(
-        Namespace(
-            project=str(project),
-            run_id=run_id,
-            dispatch_id=dispatch_id,
-            context_stopped=True,
-            reason=reason,
-        )
-    )
-    result["idempotent"] = False
-    result["runtime_provenance"] = provenance_relative
-    result["runtime_provenance_sha256"] = provenance_sha256
-    return result
 
 
 def _runtime_provenance(
@@ -1046,6 +1867,7 @@ def _complete_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
     ).encode("utf-8")
 
     with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
         validation = core.validate_project(project)
         if validation["errors"]:
             raise AppRequestError("项目合同未通过：" + "; ".join(validation["errors"]))
@@ -1222,6 +2044,10 @@ def _attempt_snapshot(
     attempt_dir: Path,
 ) -> Optional[Dict[str, Any]]:
     attempt_id = attempt_dir.name
+    if _termination_receipt_path(attempt_dir).is_file():
+        receipt = _load_termination_receipt(core, project, attempt_dir)
+        _verify_termination_receipt(core, project, attempt_dir, receipt)
+        return None
     sealed = (attempt_dir / ".sealed.json").is_file()
     manifest: Dict[str, Any] = {}
     review_available_at: Optional[str] = None
@@ -1292,6 +2118,26 @@ def _interrupted_attempt(
     run_dir: Path,
     attempt_dir: Path,
 ) -> Dict[str, Any]:
+    termination_path = _termination_receipt_path(attempt_dir)
+    if termination_path.is_file():
+        receipt = _load_termination_receipt(core, project, attempt_dir)
+        _verify_termination_receipt(core, project, attempt_dir, receipt)
+        return {
+            "run_id": run.get("run_id", run_dir.name),
+            "work_id": run.get("work_id", run_dir.name),
+            "attempt_id": attempt_dir.name,
+            "dispatch_id": receipt.get("dispatch_id"),
+            "state": f"TERMINATED_{receipt.get('outcome')}",
+            "reason_code": receipt.get("error_code")
+            or receipt.get("lifecycle_reason"),
+            "outcome": receipt.get("outcome"),
+            "execution_status": "BLOCK",
+            "termination_class": receipt.get("termination_class"),
+            "terminal_receipt": termination_path.relative_to(project).as_posix(),
+            "terminal_receipt_sha256": core.sha256_file(termination_path),
+            "content_attempt_consumed": receipt.get("content_attempt_consumed"),
+            "finding_eligible": False,
+        }
     reason_code = "OPEN_ATTEMPT"
     state = "INTERRUPTED"
     dispatch_id: Optional[str] = None
@@ -1709,6 +2555,15 @@ def _system_snapshot(payload: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _system_snapshot_request(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"project"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
+        return _system_snapshot({"project": str(project)})
+
+
 def _feedback_claims(action: str) -> Dict[str, Any]:
     if action == "keep":
         return {"human_accepted": True, "human_direction": "PASS"}
@@ -1740,6 +2595,8 @@ def _record_feedback(payload: Mapping[str, Any]) -> Dict[str, Any]:
     feedback_at = core.utc_timestamp(payload.get("feedback_at"), "feedback_at")
 
     with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
+        _assert_run_not_terminated_locked(core, project, run_id)
         validation = core.validate_project(project)
         if validation["errors"]:
             raise AppRequestError("项目合同未通过：" + "; ".join(validation["errors"]))
@@ -2114,6 +2971,9 @@ def _seal_feedback(payload: Mapping[str, Any]) -> Dict[str, Any]:
         / "attempts"
         / attempt_id
     )
+    with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
+        _assert_run_not_terminated_locked(core, project, run_id)
     if (attempt_dir / ".sealed.json").is_file():
         errors = core.verify_sealed_attempt(project, attempt_dir)
         manifest = core.load_json(attempt_dir / "manifest.json")
@@ -2639,6 +3499,10 @@ def _submit_feedback(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if machine_direction not in {"BLOCK", "PASS", "UNKNOWN"}:
         raise AppRequestError("machine_direction 无效")
 
+    with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
+        _assert_run_not_terminated_locked(core, project, run_id)
+
     run_path = core.regular_project_file(
         project,
         f"creative-system/runs/{run_id}/run.json",
@@ -2749,6 +3613,9 @@ def _resume_feedback(payload: Mapping[str, Any]) -> Dict[str, Any]:
     core = load_controller()
     project = _project_path(payload.get("project"))
     run_id = _id(payload.get("run_id"), "run_id")
+    with core.exclusive_controller_lock(project):
+        _reconcile_terminated_attempts_locked(core, project)
+        _assert_run_not_terminated_locked(core, project, run_id)
     validation = core.validate_project(project)
     if validation["errors"]:
         raise AppRequestError("项目合同未通过：" + "; ".join(validation["errors"]))
@@ -3846,7 +4713,8 @@ def handle_request(request: Mapping[str, Any]) -> Dict[str, Any]:
         "submit_feedback": _submit_feedback,
         "create_system_lab_candidate": _create_system_lab_candidate,
         "candidate_summary": _candidate_summary,
-        "system_snapshot": _system_snapshot,
+        "system_snapshot": _system_snapshot_request,
+        "terminate_work": _terminate_work,
     }
     result = handlers[str(operation)](payload)
     return {

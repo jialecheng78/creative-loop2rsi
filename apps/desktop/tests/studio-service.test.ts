@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -21,11 +21,13 @@ import {
   type ControllerRequestLike,
   type CredentialStorePort,
   type LoopbackGatewayPort,
+  type PendingWorkStorePort,
   type RuntimePort,
   type RuntimeSpecFactory,
   type SettingsStorePort,
 } from '../src/main/studio-service.js'
 import type { LoopbackGatewayLease, LoopbackLeaseProvenance } from '../src/main/loopback-gateway.js'
+import { PendingWorkStore } from '../src/main/pending-work-store.js'
 
 const temporaryDirectories: string[] = []
 
@@ -143,7 +145,9 @@ describe('StudioService governed alpha loop', () => {
     const blocked = await readyFixture()
     blocked.controller.primeInterruptedRun()
     blocked.controller.failRecoveryBegin = true
-    await expect(blocked.service.startWork('不应绕过恢复')).rejects.toThrow('无法开始本次创作')
+    await expect(blocked.service.startWork('不应绕过恢复')).rejects.toMatchObject({
+      code: 'WORK_TERMINATION_PENDING',
+    })
     expect(blocked.runtime.lastInput).toBeUndefined()
   })
 
@@ -291,7 +295,7 @@ describe('StudioService governed alpha loop', () => {
     await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'completed' })
 
     expect(fixture.controller.requests.some(item => item.operation === 'complete_work')).toBe(false)
-    expect(fixture.controller.requests.some(item => item.operation === 'cancel_work')).toBe(true)
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(true)
     expect(fixture.events).toContainEqual({
       type: 'state', runId: handle.runId, state: 'failed',
     })
@@ -305,7 +309,7 @@ describe('StudioService governed alpha loop', () => {
     await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'completed' })
 
     expect(fixture.controller.requests.some(item => item.operation === 'complete_work')).toBe(false)
-    expect(fixture.controller.requests.some(item => item.operation === 'cancel_work')).toBe(true)
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(true)
     expect(fixture.events).toContainEqual({
       type: 'state', runId: handle.runId, state: 'failed',
     })
@@ -330,7 +334,9 @@ describe('StudioService governed alpha loop', () => {
     await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'completed' })
 
     expect(fixture.controller.requests.filter(item => item.operation === 'complete_work')).toHaveLength(2)
-    expect(fixture.controller.requests.some(item => item.operation === 'cancel_work')).toBe(true)
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(true)
+    expect(fixture.controller.requests.find(item => item.operation === 'terminate_work')?.payload)
+      .toMatchObject({ outcome: 'FAILED', error_code: 'COMMIT_FAILED' })
     expect(fixture.events).toContainEqual({ type: 'state', runId: handle.runId, state: 'failed' })
     expect(fixture.events.some(item => item.type === 'state' && item.state === 'completed')).toBe(false)
   })
@@ -355,6 +361,417 @@ describe('StudioService governed alpha loop', () => {
     expect(fixture.events).toContainEqual({ type: 'state', runId: handle.runId, state: 'failed' })
   })
 
+  it('restores a classified gateway timeout from request evidence after DSH flattens the HTTP error', async () => {
+    const fixture = await readyFixture({
+      provenance: {
+        requestCount: 3,
+        completedRequests: 0,
+        failedRequests: 3,
+        returnedModels: [],
+        systemFingerprints: [],
+        usage: {},
+        requests: [1, 2, 3].map(number => ({
+          requestNumber: number,
+          startedAt: `2026-08-15T00:2${number}:00.000Z`,
+          completedAt: `2026-08-15T00:2${number}:02.000Z`,
+          status: 'FAILED' as const,
+          httpStatus: 504,
+          errorCode: 'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+          usage: {},
+        })),
+      },
+    })
+    const handle = await fixture.service.startWork('写一段场景')
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error',
+      runId: 'runtime-one',
+      code: 'DEEPSEEK_UNAVAILABLE',
+      message: 'DeepSeek 服务暂时不可用，请稍后重试。',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'failed' })
+
+    expect(fixture.events).toContainEqual(expect.objectContaining({
+      type: 'error',
+      runId: handle.runId,
+      code: 'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+      message: expect.stringContaining('共发起 3 次请求'),
+    }))
+    expect(fixture.controller.requests.find(item => item.operation === 'terminate_work')?.payload)
+      .toMatchObject({ outcome: 'FAILED', error_code: 'DEEPSEEK_FIRST_EVENT_TIMEOUT' })
+  })
+
+  it('uses only the final request as timeout evidence after an earlier timeout recovered', async () => {
+    const fixture = await readyFixture({
+      provenance: {
+        requestCount: 2,
+        completedRequests: 1,
+        failedRequests: 1,
+        completedAt: '2026-08-15T00:25:00.000Z',
+        responseId: 'response-recovered',
+        returnedModels: ['deepseek-v4-pro'],
+        systemFingerprints: ['fingerprint-recovered'],
+        usage: { prompt_tokens: 11, completion_tokens: 22, total_tokens: 33 },
+        requests: [
+          {
+            requestNumber: 1,
+            startedAt: '2026-08-15T00:21:00.000Z',
+            completedAt: '2026-08-15T00:23:00.000Z',
+            status: 'FAILED',
+            httpStatus: 504,
+            errorCode: 'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+            usage: {},
+          },
+          {
+            requestNumber: 2,
+            startedAt: '2026-08-15T00:24:00.000Z',
+            completedAt: '2026-08-15T00:25:00.000Z',
+            status: 'COMPLETED',
+            responseId: 'response-recovered',
+            returnedModel: 'deepseek-v4-pro',
+            systemFingerprint: 'fingerprint-recovered',
+            usage: { prompt_tokens: 11, completion_tokens: 22, total_tokens: 33 },
+          },
+        ],
+      },
+    })
+    const handle = await fixture.service.startWork('写一段场景')
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error',
+      runId: 'runtime-one',
+      code: 'OUTPUT_TRUNCATED',
+      message: '内容达到本次生成上限，未保存为完整版本；请缩小本次任务后重试。',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'failed' })
+
+    expect(fixture.events).toContainEqual({
+      type: 'error',
+      runId: handle.runId,
+      code: 'OUTPUT_TRUNCATED',
+      message: '内容达到本次生成上限，未保存为完整版本；请缩小本次任务后重试。',
+    })
+    expect(fixture.controller.requests.find(item => item.operation === 'terminate_work')?.payload)
+      .toMatchObject({ error_code: 'OUTPUT_TRUNCATED' })
+  })
+
+  it('retries the exact begin after its committed response is lost', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.loseFirstBeginResponse = true
+
+    const handle = await fixture.service.startWork('响应丢失后仍只打开一个 run')
+
+    const begins = fixture.controller.requests.filter(item => item.operation === 'begin_work')
+    expect(begins).toHaveLength(2)
+    expect(begins[1]?.payload).toEqual(begins[0]?.payload)
+    expect(fixture.controller.uniqueBeginOpenCount).toBe(1)
+    expect(fixture.runtime.lastInput).toContain('响应丢失后仍只打开一个 run')
+    await fixture.service.cancelWork(handle.runId)
+  })
+
+  it('does not recover its own durable LAUNCHING intent while createLaunching is returning', async () => {
+    const launchingWritten = deferred<void>()
+    const releaseCreateLaunching = deferred<void>()
+    const fixture = await readyFixture({
+      pendingWorkStoreFactory: userData => {
+        const store = new PendingWorkStore(userData)
+        return {
+          load: async () => await store.load(),
+          createLaunching: async input => {
+            const intent = await store.createLaunching(input)
+            launchingWritten.resolve(undefined)
+            await releaseCreateLaunching.promise
+            return intent
+          },
+          requireTermination: async (pending, expectation) => await store.requireTermination(pending, expectation),
+          clear: async pending => await store.clear(pending),
+        }
+      },
+    })
+
+    const launching = fixture.service.startWork('持久化尾部并发状态查询不能误杀当前启动')
+    await launchingWritten.promise
+    const status = await fixture.service.getStatus()
+
+    expect(status.workRecoveryState).toBe('none')
+    expect(fixture.controller.requests.some(item => item.operation === 'begin_work')).toBe(false)
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(false)
+
+    releaseCreateLaunching.resolve(undefined)
+    const handle = await launching
+    expect(fixture.controller.requests.filter(item => item.operation === 'begin_work')).toHaveLength(1)
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(false)
+    await fixture.service.cancelWork(handle.runId)
+  })
+
+  it('keeps LAUNCHING durable when begin never arrived and replays it before restart termination', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.failBeginWorkBeforeCommit = true
+
+    await expect(fixture.service.startWork('Controller 恢复后再封存')).rejects.toMatchObject({
+      code: 'WORK_TERMINATION_PENDING',
+    })
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    const pending = JSON.parse(await readFile(pendingPath, 'utf8')) as Record<string, unknown>
+    expect(pending.phase).toBe('LAUNCHING')
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(false)
+
+    fixture.controller.failBeginWorkBeforeCommit = false
+    const restarted = fixture.makeService()
+    const status = await restarted.getStatus()
+
+    expect(status.workRecoveryState).toBe('recovered')
+    expect(status.activeSystem?.interruptedRun).toMatchObject({
+      state: 'TERMINATED_CANCELLED',
+      reasonCode: 'application-restarted-before-terminal-commit',
+    })
+    expect(fixture.controller.uniqueBeginOpenCount).toBe(1)
+    await expect(access(pendingPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('persists the precise timeout before a hanging runtime stop and replays it after restart', async () => {
+    const stopEntered = deferred<void>()
+    const releaseStop = deferred<void>()
+    const fixture = await readyFixture({
+      provenance: failedTimeoutProvenance('DEEPSEEK_TOTAL_TIMEOUT'),
+      runtimeStop: async () => {
+        stopEntered.resolve(undefined)
+        await releaseStop.promise
+      },
+    })
+    const handle = await fixture.service.startWork('停止进程挂起也不能丢失失败类别')
+    fixture.controller.failBeginWorkBeforeCommit = true
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error', runId: 'runtime-one', code: 'DEEPSEEK_UNAVAILABLE', message: 'flattened runtime error',
+    })
+    const failing = fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'failed' })
+    await stopEntered.promise
+
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    const pending = JSON.parse(await readFile(pendingPath, 'utf8')) as {
+      phase: string
+      termination_expectation: { outcome: string; error_code: string }
+    }
+    expect(pending).toMatchObject({
+      phase: 'TERMINATION_REQUIRED',
+      termination_expectation: { outcome: 'FAILED', error_code: 'DEEPSEEK_TOTAL_TIMEOUT' },
+    })
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(false)
+
+    const restarted = fixture.makeService()
+    const status = await restarted.getStatus()
+    expect(status.workRecoveryState).toBe('recovered')
+    expect(status.activeSystem?.interruptedRun).toMatchObject({
+      runId: handle.runId,
+      outcome: 'FAILED',
+      reasonCode: 'DEEPSEEK_TOTAL_TIMEOUT',
+    })
+    expect(fixture.controller.requests.find(item => item.operation === 'terminate_work')?.payload)
+      .toMatchObject({ outcome: 'FAILED', error_code: 'DEEPSEEK_TOTAL_TIMEOUT' })
+
+    releaseStop.resolve(undefined)
+    await failing
+  })
+
+  it('keeps an observed timeout FAILED before a hanging shutdown cancel and replays it after restart', async () => {
+    const cancelEntered = deferred<void>()
+    const releaseCancel = deferred<void>()
+    const fixture = await readyFixture({
+      provenance: failedTimeoutProvenance('DEEPSEEK_STREAM_IDLE_TIMEOUT'),
+      runtimeCancel: async () => {
+        cancelEntered.resolve(undefined)
+        await releaseCancel.promise
+      },
+    })
+    const handle = await fixture.service.startWork('关闭应用也不能把已知超时改成取消')
+    fixture.controller.failBeginWorkBeforeCommit = true
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error', runId: 'runtime-one', code: 'DEEPSEEK_UNAVAILABLE', message: 'flattened runtime error',
+    })
+    const shuttingDown = fixture.service.shutdown()
+    await cancelEntered.promise
+
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    const pending = JSON.parse(await readFile(pendingPath, 'utf8')) as {
+      phase: string
+      termination_expectation: { outcome: string; error_code: string }
+    }
+    expect(pending).toMatchObject({
+      phase: 'TERMINATION_REQUIRED',
+      termination_expectation: { outcome: 'FAILED', error_code: 'DEEPSEEK_STREAM_IDLE_TIMEOUT' },
+    })
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(false)
+
+    const restarted = fixture.makeService()
+    const status = await restarted.getStatus()
+    expect(status.workRecoveryState).toBe('recovered')
+    expect(status.activeSystem?.interruptedRun).toMatchObject({
+      runId: handle.runId,
+      outcome: 'FAILED',
+      reasonCode: 'DEEPSEEK_STREAM_IDLE_TIMEOUT',
+    })
+
+    releaseCancel.resolve(undefined)
+    await shuttingDown
+  })
+
+  it('does not call Controller after a tampered pending-work queue fails closed', async () => {
+    const fixture = await readyFixture()
+    await fixture.service.startWork('只用于建立待恢复记录')
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    const tampered = JSON.parse(await readFile(pendingPath, 'utf8')) as Record<string, unknown>
+    tampered.system_id = 'system-tampered'
+    await writeFile(pendingPath, `${JSON.stringify(tampered)}\n`, { encoding: 'utf8', mode: 0o600 })
+    fixture.controller.requests.length = 0
+
+    const restarted = fixture.makeService()
+    const status = await restarted.getStatus()
+
+    expect(status.workRecoveryState).toBe('retry-required')
+    expect(status.activeSystem).toBeNull()
+    expect(fixture.controller.requests).toHaveLength(0)
+  })
+
+  it('still stops and closes runtime when active termination persistence fails during shutdown', async () => {
+    const fixture = await readyFixture()
+    const handle = await fixture.service.startWork('持久化失败也必须清理进程')
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    const tampered = JSON.parse(await readFile(pendingPath, 'utf8')) as Record<string, unknown>
+    tampered.system_id = 'system-tampered'
+    await writeFile(pendingPath, `${JSON.stringify(tampered)}\n`, { encoding: 'utf8', mode: 0o600 })
+
+    await expect(fixture.service.shutdown()).rejects.toMatchObject({ code: 'WORK_TERMINATION_PENDING' })
+
+    expect(fixture.timeline).toContain('runtime:cancel')
+    expect(fixture.timeline).toContain('runtime:stop')
+    expect(fixture.timeline).toContain('loopback:close')
+    expect(fixture.runtime.status()).toEqual({ state: 'unconfigured' })
+    expect(fixture.events).toContainEqual(expect.objectContaining({
+      type: 'error', runId: handle.runId, code: 'WORK_TERMINATION_PENDING',
+    }))
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(false)
+  })
+
+  it('still stops runtime and returns pending when launch-catch persistence fails', async () => {
+    const profileEntered = deferred<void>()
+    const releaseProfile = deferred<void>()
+    const fixture = await readyFixture({
+      profileDigest: async () => {
+        profileEntered.resolve(undefined)
+        await releaseProfile.promise
+        throw new Error('synthetic profile failure')
+      },
+    })
+    const launching = fixture.service.startWork('启动失败也必须清理进程')
+    await profileEntered.promise
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    const tampered = JSON.parse(await readFile(pendingPath, 'utf8')) as Record<string, unknown>
+    tampered.system_id = 'system-tampered'
+    await writeFile(pendingPath, `${JSON.stringify(tampered)}\n`, { encoding: 'utf8', mode: 0o600 })
+    releaseProfile.resolve(undefined)
+
+    await expect(launching).rejects.toMatchObject({ code: 'WORK_TERMINATION_PENDING' })
+    expect(fixture.timeline).toContain('runtime:stop')
+    expect(fixture.controller.requests.some(item => item.operation === 'terminate_work')).toBe(false)
+  })
+
+  it('does not let an earlier retry timeout hide the latest terminal cause', async () => {
+    const fixture = await readyFixture({
+      provenance: {
+        requestCount: 2,
+        completedRequests: 0,
+        failedRequests: 2,
+        returnedModels: [],
+        systemFingerprints: [],
+        usage: {},
+        requests: [
+          {
+            requestNumber: 1,
+            startedAt: '2026-08-15T00:21:00.000Z',
+            completedAt: '2026-08-15T00:23:00.000Z',
+            status: 'FAILED',
+            httpStatus: 504,
+            errorCode: 'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+            usage: {},
+          },
+          {
+            requestNumber: 2,
+            startedAt: '2026-08-15T00:24:00.000Z',
+            completedAt: '2026-08-15T00:24:01.000Z',
+            status: 'FAILED',
+            httpStatus: 402,
+            errorCode: 'ACCOUNT_BALANCE',
+            usage: {},
+          },
+        ],
+      },
+    })
+    const handle = await fixture.service.startWork('写一段场景')
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error',
+      runId: 'runtime-one',
+      code: 'ACCOUNT_BALANCE',
+      message: 'DeepSeek 账户余额不足，请充值后重试。',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'failed' })
+
+    expect(fixture.events).toContainEqual({
+      type: 'error',
+      runId: handle.runId,
+      code: 'ACCOUNT_BALANCE',
+      message: 'DeepSeek 账户余额不足，请充值后重试。',
+    })
+  })
+
+  it('fails closed when the runtime stopped but Controller termination cannot be verified', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.failTerminateWork = true
+    const handle = await fixture.service.startWork('写一段场景')
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error', runId: 'runtime-one', code: 'RUNTIME_FAILED', message: 'synthetic failure',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'failed' })
+
+    expect(fixture.controller.requests.filter(item => item.operation === 'terminate_work')).toHaveLength(2)
+    expect(fixture.events).toContainEqual({
+      type: 'error',
+      runId: handle.runId,
+      code: 'WORK_TERMINATION_PENDING',
+      message: '生成已经停止，但失败记录还没有安全封存。请重启应用后恢复；本次不会计为作品或学习证据。',
+    })
+    expect(fixture.events.at(-1)).toEqual({ type: 'state', runId: handle.runId, state: 'failed' })
+
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    await expect(readFile(pendingPath, 'utf8')).resolves.toContain(handle.runId)
+    fixture.controller.failTerminateWork = false
+    const restarted = fixture.makeService()
+    const recovered = await restarted.getStatus()
+    expect(recovered.workRecoveryState).toBe('recovered')
+    expect(recovered.activeSystem?.interruptedRun).toMatchObject({
+      runId: handle.runId,
+      state: 'TERMINATED_FAILED',
+      findingEligible: false,
+    })
+    await expect(access(pendingPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('lets an exact completed Controller work win over a stale launch intent after restart', async () => {
+    const fixture = await readyFixture()
+    const handle = await fixture.service.startWork('完成结果应优先')
+    const pendingPath = join(fixture.userData, 'supervisor', 'pending-work.json')
+    const staleIntent = await readFile(pendingPath, 'utf8')
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: 'runtime-one', text: '已安全保存的作品' })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'completed' })
+    await writeFile(pendingPath, staleIntent, { encoding: 'utf8', mode: 0o600 })
+    const terminateCount = fixture.controller.requests.filter(item => item.operation === 'terminate_work').length
+
+    const restarted = fixture.makeService()
+    const status = await restarted.getStatus()
+
+    expect(status.workRecoveryState).toBe('recovered')
+    expect(status.activeSystem?.lastWork).toMatchObject({ runId: handle.runId, output: '已安全保存的作品' })
+    expect(fixture.controller.requests.filter(item => item.operation === 'terminate_work')).toHaveLength(terminateCount)
+    await expect(access(pendingPath)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('rejects a concurrent launch before a second Controller run can open', async () => {
     const fixture = await readyFixture()
     const first = fixture.service.startWork('第一次创作')
@@ -373,10 +790,11 @@ describe('StudioService governed alpha loop', () => {
 
     expect(fixture.timeline.indexOf('lease:revoked')).toBeLessThan(fixture.timeline.indexOf('runtime:cancel'))
     expect(fixture.controller.requests.at(-1)).toMatchObject({
-      operation: 'cancel_work',
+      operation: 'terminate_work',
       payload: {
         run_id: handle.runId,
         reason: 'user-cancelled',
+        outcome: 'CANCELLED',
         runtime_provenance: {
           request_count: 1,
           completed_requests: 1,
@@ -408,7 +826,7 @@ describe('StudioService governed alpha loop', () => {
 
     await expect(launching).rejects.toMatchObject({ code: 'LAUNCH_CANCELLED' })
     await shuttingDown
-    const cancelIndex = fixture.timeline.indexOf('controller:cancel_work')
+    const cancelIndex = fixture.timeline.indexOf('controller:terminate_work')
     const closeIndex = fixture.timeline.indexOf('loopback:close')
     expect(cancelIndex).toBeGreaterThanOrEqual(0)
     expect(closeIndex).toBeGreaterThan(cancelIndex)
@@ -435,9 +853,9 @@ describe('StudioService governed alpha loop', () => {
     await expect(launching).rejects.toMatchObject({ code: 'LAUNCH_CANCELLED' })
     await cancelling
     expect(fixture.timeline).toContain('runtime:cancel')
-    expect(fixture.timeline).toContain('controller:cancel_work')
+    expect(fixture.timeline).toContain('controller:terminate_work')
     expect(fixture.timeline.indexOf('lease:revoked')).toBeLessThan(
-      fixture.timeline.indexOf('controller:cancel_work'),
+      fixture.timeline.indexOf('controller:terminate_work'),
     )
   })
 
@@ -512,12 +930,36 @@ function deferred<T>(): {
   return { promise, resolve: resolvePromise }
 }
 
+function failedTimeoutProvenance(
+  errorCode: 'DEEPSEEK_STREAM_IDLE_TIMEOUT' | 'DEEPSEEK_TOTAL_TIMEOUT',
+): Partial<LoopbackLeaseProvenance> {
+  return {
+    requestCount: 1,
+    completedRequests: 0,
+    failedRequests: 1,
+    returnedModels: [],
+    systemFingerprints: [],
+    usage: {},
+    requests: [{
+      requestNumber: 1,
+      startedAt: '2026-08-15T00:20:00.000Z',
+      completedAt: '2026-08-15T00:30:00.000Z',
+      status: 'FAILED',
+      httpStatus: 504,
+      errorCode,
+      usage: {},
+    }],
+  }
+}
+
 interface FixtureOptions {
   readonly provenance?: Partial<LoopbackLeaseProvenance>
   readonly profileDigest?: (spec: DshRuntimeLaunchSpec) => Promise<string>
   readonly runtimeStart?: (input: string) => Promise<RuntimeRunHandle>
   readonly runtimeCancel?: (runId: string) => Promise<void>
+  readonly runtimeStop?: () => Promise<void>
   readonly runtimeSpecFactory?: RuntimeSpecFactory
+  readonly pendingWorkStoreFactory?: (userDataPath: string) => PendingWorkStorePort
 }
 
 async function readyFixture(options: FixtureOptions = {}): Promise<Fixture> {
@@ -549,9 +991,10 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const controller = new FakeController(timeline)
   const credentials = new FakeCredentials()
   const settings = new FakeSettings()
-  const runtime = new FakeRuntime(timeline, options.runtimeStart, options.runtimeCancel)
+  const runtime = new FakeRuntime(timeline, options.runtimeStart, options.runtimeCancel, options.runtimeStop)
   const loopback = new FakeLoopback(timeline, options.provenance)
   const credentialValidator = vi.fn<(key: string) => Promise<readonly ('deepseek-v4-pro' | 'deepseek-v4-flash')[]>>()
+  const pendingWorkStore = options.pendingWorkStoreFactory?.(userData)
   let nextId = 0
   const makeService = (): StudioService => new StudioService({
     appVersion: '1.0.0-alpha.1',
@@ -562,6 +1005,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     settings,
     runtime,
     loopback,
+    ...(pendingWorkStore === undefined ? {} : { pendingWorkStore }),
     emit: event => {
       events.push(event)
       if (event.type === 'state') timeline.push(`event:${event.state}`)
@@ -621,6 +1065,7 @@ class FakeRuntime implements RuntimePort {
     private readonly timeline: string[],
     private readonly startHook?: (input: string) => Promise<RuntimeRunHandle>,
     private readonly cancelHook?: (runId: string) => Promise<void>,
+    private readonly stopHook?: () => Promise<void>,
   ) {}
   configure(spec: DshRuntimeLaunchSpec): void { this.spec = spec; this.state = { state: 'ready' } }
   status(): RuntimeStatus { return this.state }
@@ -640,7 +1085,11 @@ class FakeRuntime implements RuntimePort {
     if (this.cancelHook !== undefined) await this.cancelHook(runId)
     this.state = { state: 'ready' }
   }
-  async stop(): Promise<void> { this.state = { state: 'ready' } }
+  async stop(): Promise<void> {
+    this.timeline.push('runtime:stop')
+    if (this.stopHook !== undefined) await this.stopHook()
+    this.state = { state: 'ready' }
+  }
   async clearConfiguration(): Promise<void> { this.state = { state: 'unconfigured' }; this.spec = undefined }
 }
 
@@ -719,9 +1168,14 @@ class FakeLoopback implements LoopbackGatewayPort {
 
 class FakeController implements ControllerPort {
   readonly requests: ControllerRequestLike[] = []
+  readonly openedBegins = new Set<string>()
   failCompleteWork = false
+  failBeginWorkBeforeCommit = false
   failRecoveryBegin = false
   failResumeFeedback = false
+  failTerminateWork = false
+  loseFirstBeginResponse = false
+  uniqueBeginOpenCount = 0
   private systemId: string | undefined
   private displayName = ''
   private initialIntent = ''
@@ -931,8 +1385,22 @@ class FakeController implements ControllerPort {
         result = { snapshot: this.snapshot() }
         break
       case 'begin_work':
+        if (this.failBeginWorkBeforeCommit) throw new Error('synthetic begin unavailable before commit')
         if (payload.recovery_of !== undefined && this.failRecoveryBegin) {
           throw new Error('synthetic recovery rejected')
+        }
+        {
+          const identity = JSON.stringify([
+            payload.run_id, payload.work_id, payload.dispatch_id, payload.context_id,
+          ])
+          if (!this.openedBegins.has(identity)) {
+            this.openedBegins.add(identity)
+            this.uniqueBeginOpenCount += 1
+          }
+        }
+        if (this.loseFirstBeginResponse) {
+          this.loseFirstBeginResponse = false
+          throw new Error('synthetic begin response lost after commit')
         }
         result = {
           run_id: payload.run_id,
@@ -1053,6 +1521,41 @@ class FakeController implements ControllerPort {
           manifest_sha256: 'a'.repeat(64),
           idempotent: false,
           snapshot: this.snapshot(),
+        }
+        break
+      }
+      case 'terminate_work': {
+        if (this.failTerminateWork) throw new Error('synthetic termination failure')
+        const begin = [...this.requests].reverse().find(item => item.operation === 'begin_work'
+          && item.payload.run_id === payload.run_id)
+        const outcome = String(payload.outcome)
+        const terminalReceipt = `creative-system/runs/${String(payload.run_id)}/attempts/attempt-001/.terminated.json`
+        this.interruptedRun = {
+          run_id: payload.run_id,
+          work_id: begin?.payload.work_id ?? 'work-unknown',
+          attempt_id: 'attempt-001',
+          dispatch_id: payload.dispatch_id,
+          state: `TERMINATED_${outcome}`,
+          reason_code: outcome === 'FAILED' ? payload.error_code : payload.reason,
+          outcome,
+          execution_status: 'BLOCK',
+          termination_class: 'ZERO_FILE_RUNTIME_FAILURE',
+          terminal_receipt: terminalReceipt,
+          terminal_receipt_sha256: 'b'.repeat(64),
+          content_attempt_consumed: false,
+          finding_eligible: false,
+        }
+        result = {
+          run_id: payload.run_id,
+          attempt_id: 'attempt-001',
+          dispatch_id: payload.dispatch_id,
+          outcome,
+          execution_status: 'BLOCK',
+          terminal_receipt: terminalReceipt,
+          terminal_receipt_sha256: 'b'.repeat(64),
+          content_attempt_consumed: false,
+          finding_eligible: false,
+          idempotent: false,
         }
         break
       }

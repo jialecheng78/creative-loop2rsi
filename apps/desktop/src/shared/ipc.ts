@@ -125,6 +125,13 @@ export interface InterruptedRunSnapshot {
   readonly dispatchId: string | null
   readonly state: string
   readonly reasonCode: string
+  readonly outcome?: 'FAILED' | 'CANCELLED'
+  readonly executionStatus?: 'BLOCK'
+  readonly terminationClass?: 'ZERO_FILE_RUNTIME_FAILURE' | 'UNCOMMITTED_OUTPUT_FAILURE'
+  readonly terminalReceipt?: string
+  readonly terminalReceiptSha256?: string
+  readonly contentAttemptConsumed?: boolean
+  readonly findingEligible?: false
 }
 
 export interface PendingFeedbackSnapshot {
@@ -144,6 +151,8 @@ export interface StudioStatus {
   readonly activeSystem: SystemSnapshot | null
   /** Main-owned recovery outcome for a feedback transaction found on this status read. */
   readonly feedbackRecoveryState: 'none' | 'recovered' | 'retry-required'
+  /** Main replay-queue outcome for a begin/termination response-loss window. */
+  readonly workRecoveryState: 'none' | 'recovered' | 'retry-required'
 }
 
 export interface ConfigureCredentialInput {

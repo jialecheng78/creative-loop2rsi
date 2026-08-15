@@ -45,15 +45,31 @@ v1 的受信 Profile 只保留进程内 Session，不挂载 DSH JSONL persistenc
 - `reasoning_content` 只在需要的工具回合内存中保留；
 - 所有出入站日志先脱敏，再进入 Evidence Sink。
 
+流式创作不得用一个短的固定倒计时同时代表“模型尚未开始”“返回途中停滞”和“任务总体过长”。Production Worker 固定使用三条相互独立的时限：
+
+- `firstEventTimeoutMs=120000`：从请求开始到首个合法 SSE event；响应头、裸字节和 keep-alive 注释都不算模型已经开始返回；
+- `streamIdleTimeoutMs=90000`：首个合法 event 之后，任意两个合法 SSE event 之间允许的最长空闲时间；每个合法 event 重置该计时器；
+- `totalTimeoutMs=600000`：从请求开始计算的绝对总时限，永不因流进展重置。
+
+三类失败分别记录 `FIRST_EVENT_TIMEOUT / STREAM_IDLE_TIMEOUT / TOTAL_TIMEOUT`，并由 Main 以 loopback request ledger 作为最终类别来源再传给界面。DSH rc.6 会把首事件前耗尽的 HTTP 5xx 归一为 `SERVER`，因此 Runtime event 不是该类别的唯一事实源。只有在首个合法 event 之前发生的限流或服务端失败才允许按固定预算重试；一旦流已经开始，idle/total failure 不得自动重跑整条长请求，避免重复计费和重复生成。外部取消始终优先，所有 timer 在成功、失败或取消后都必须清理。
+
 ## Controller
 
 Python Controller 是治理事实源。桌面应用通过 JSON stdin/stdout 和参数数组调用 PyInstaller `--onedir` sidecar，禁止 shell。原 Skill CLI 保持兼容，用同一 fixture 做源码、package 和 sidecar 差分。
 
-## 取消与恢复
+## 取消、失败终态与恢复
 
-用户取消或 Worker 崩溃时，Supervisor 终止当前 Worker，把 run 标记为 `INTERRUPTED`，并从最后一个已封存边界创建新 dispatch。新 dispatch 会重新生成，只保留与旧 run 的治理关联；未封存的半成品不得被当作成功或自动续写依据，应用不得宣称恢复未完成的模型回合。
+`DispatchStallRecord` 只证明一个 dispatch 已停止且允许局部重派，不是失败 run 的终态。应用级 Worker 失败或用户取消必须再写不可变 `TerminatedAttempt` 作为失败侧 commit point。打开时写入的 `attempt.json` 与 `dispatch.json` 保持不可变；终态由 marker 以及 run/system 投影证明，不能回写 start facts 冒充历史。
+
+`TerminatedAttempt` 区分两类事实：精确零输出的 runtime failure 绑定 stall 与 provenance，且不消耗内容 attempt；已经产生但尚未安全提交的输出绑定其 inventory 与哈希，标记不可发布、不可形成 finding。两类都必须令 run 收敛为 `BLOCK`、清空 `current_attempt`、禁止同 run 继续派发，并要求下一次创作使用新 run 与 `recovery_of` 关联。marker 写入后即使进程在投影前崩溃，Controller 也必须在读取快照或下一次写操作前幂等 roll-forward；全部 attempt mutator 还必须直接拒绝 marker，避免投影崩溃窗口继续写入或形成 `.sealed.json`。终态复核覆盖全部 dispatch，旧 stalled root 的晚写按 `LATE_WRITE_CONTAMINATION` 阻断；失败记录绝不能进入作品、反馈或重复 finding 计数。
+
+用户取消或 Worker 崩溃时，Supervisor 终止当前 Worker并封存失败终态，然后从最后一个已封存边界创建新 run。新 run 会重新生成，只保留与旧 run 的治理关联；未封存的半成品不得被当作成功或自动续写依据，应用不得宣称恢复未完成的模型回合。若失败终态尚未确认写入，界面必须显示“失败记录尚未封存、重启后恢复”，并阻止把该 run 当成成功；Main 不得吞掉 Controller 终止错误。
 
 Controller 快照若返回 `interrupted_run`，Main 创建下一条受治理 run 时必须把旧 `run_id` 写入 `begin_work.recovery_of`。Controller 无法验证旧 run 时必须阻止启动；Renderer 同时明确告诉用户“上次运行中断，但已封存作品仍在”，不能把它显示成普通空白起点。
+
+Main 另在 Electron `userData/supervisor/pending-work.json` 维护一条本机 replay intent，用来跨越“Controller 已写入、但 Main 没收到响应”和“Controller 暂时不可用”的窗口。它不是第二套治理事实源：Controller 的作品、`TerminatedAttempt` 和投影始终优先。Main 必须在第一次 `begin_work` 前以原子替换写入 `LAUNCHING`，并保留到作品成功提交或失败终态被精确验证；文件只保存 exact begin payload、受治理标识和脱敏终止 provenance，不得包含 API Key、capability、Gateway URL、推理内容、环境变量、项目绝对路径，也不得进入日志或导出包。POSIX 上目录和文件权限分别固定为 `0700` 与 `0600`；symlink、未知字段、超限文件或 content hash 不一致必须 fail closed，不能自动覆盖证据。
+
+若 `begin_work` 的响应丢失，Main 只能以完全相同 payload 幂等重试。只有得到合法 receipt，或快照精确证明同一 `run_id + work_id + dispatch_id` 已存在，才可把 intent 转为 `TERMINATION_REQUIRED`；Controller 不可达或 begin 尚未确认时必须保持 `LAUNCHING`，避免生成一条永远无法执行的 terminate。终止语义采用 first-writer-wins，取消、关闭和 runtime late event 不得相互覆写。重启时，所有新创作、模型切换、反馈和方法操作先串行 reconciliation：精确完成作品时 success wins；精确终止时清队列；否则先 replay begin、再 replay terminate。只有匹配 receipt 或精确快照 read-back 后才删除 intent；未收敛时返回 `workRecoveryState=retry-required` 并阻止新 work。
 
 反馈采用独立的事务恢复协议。若快照返回 `feedback_recovery_required`，Main 只能使用快照里的 `run_id` 调用 `resume_feedback`，由 Controller 从已经持久化的 transaction intent 恢复原 action、编辑正文和反馈；Renderer 不得重传这些原文。Main 在读取状态、启动作品和提交反馈前都会先尝试恢复：成功后展示已恢复，失败则保留恢复状态并阻止新作品和新反馈，避免不同内容覆盖原编辑。
 

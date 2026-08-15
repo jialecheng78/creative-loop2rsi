@@ -7,8 +7,20 @@
 - 只请求 `https://api.deepseek.com/models` 与 `https://api.deepseek.com/chat/completions`。
 - API Key 只从调用方提供的 `ApiKeyStore` 抽象读取；安全存储不可用时 fail closed。
 - 请求固定使用 `thinking: { type: "enabled" }` 与 `reasoning_effort: "high"`，`max_tokens` 不得超过 `16384`。
-- 通过请求次数、请求/响应字节数、SSE 单行大小和全请求超时控制预算，不按价格累计。
+- 通过请求次数、请求/响应字节数、SSE 单行大小和分层超时控制预算，不按价格累计。
 - completion 日志只含模型、fingerprint、request id、参数摘要与 token usage，不含消息正文或 `reasoning_content`。
+
+## 分层超时合同
+
+流式请求不得再用一个总计时器把“正在持续产生进展”误判为传输失败。固定三层边界为：
+
+- `firstEventTimeoutMs = 120000`：流式聊天从请求开始到第一个通过校验的 SSE event；HTTP 响应头、裸字节和 comment 不算进展。`/models` 是连接校验，同样受这一较短时限约束，不等待绝对总时限。
+- `streamIdleTimeoutMs = 90000`：首个合法 event 之后，两个合法 event 之间允许的最长静默时间；每个 event 重置该计时器。
+- `totalTimeoutMs = 600000`：从请求开始到完整结束的绝对上限；任何进展都不重置。
+
+三类失败分别返回 `FIRST_EVENT_TIMEOUT`、`STREAM_IDLE_TIMEOUT` 和 `TOTAL_TIMEOUT`。调用方的 `AbortSignal` 始终优先表示取消，不得被改写成 timeout。
+
+`timeoutMs` 仅作为旧调用方的临时兼容入口：单独传入时同时设置三层超时；与任一新字段混用时 fail closed。新代码不得继续使用它。
 
 ## 128k 输入边界
 

@@ -21,6 +21,23 @@
     reasoningEffort: high
     maxTokens: 16384
     defaultContextWindow: 128000
+    # Main owns the shorter 120s first-event, 90s stream-idle and 600s total
+    # limits. This is only a fail-closed fallback if the loopback contract is
+    # broken; it must not pre-empt Main's classified timeout.
+    streamIdleTimeoutMs: 660000
+    # Retry only failures that happen before a usable stream exists. TIMEOUT
+    # and TRANSPORT are deliberately excluded so a partial long generation is
+    # never replayed and charged again.
+    retryPolicy:
+      mode: normal
+      maxRetries: 2
+      retryableCodes:
+        - RATE_LIMIT
+        - SERVER
+      backoff:
+        initialDelayMs: 500
+        maxDelayMs: 10000
+        jitterRatio: 0.1
     models:
       - id: deepseek-v4-pro
         name: DeepSeek V4 Pro

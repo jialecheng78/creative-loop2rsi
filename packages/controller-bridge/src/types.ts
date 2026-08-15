@@ -26,6 +26,7 @@ export const CONTROLLER_OPERATIONS = [
   "submit_method_comparison",
   "submit_feedback",
   "system_snapshot",
+  "terminate_work",
 ] as const;
 
 export type ControllerOperation = (typeof CONTROLLER_OPERATIONS)[number];
@@ -55,6 +56,16 @@ export interface CancelWorkPayload {
   readonly run_id: string;
   readonly dispatch_id: string;
   readonly reason: string;
+  readonly runtime_provenance?: CompleteWorkRuntimeProvenance;
+}
+
+export interface TerminateWorkPayload {
+  readonly project: string;
+  readonly run_id: string;
+  readonly dispatch_id: string;
+  readonly outcome: "CANCELLED" | "FAILED";
+  readonly reason: string;
+  readonly error_code?: string;
   readonly runtime_provenance?: CompleteWorkRuntimeProvenance;
 }
 
@@ -274,7 +285,8 @@ export type ControllerRequest =
   | ControllerRequestBase<"stage_method_comparisons", StageMethodComparisonsPayload>
   | ControllerRequestBase<"submit_method_comparison", SubmitMethodComparisonPayload>
   | ControllerRequestBase<"submit_feedback", SubmitFeedbackPayload>
-  | ControllerRequestBase<"system_snapshot", SystemSnapshotPayload>;
+  | ControllerRequestBase<"system_snapshot", SystemSnapshotPayload>
+  | ControllerRequestBase<"terminate_work", TerminateWorkPayload>;
 
 export type ControllerWireRequest = ControllerRequest & {
   readonly protocol_version: typeof CONTROLLER_PROTOCOL_VERSION;

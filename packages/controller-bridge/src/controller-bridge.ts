@@ -358,6 +358,32 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
       requiredText(payload, "reason", 500);
       if (payload.runtime_provenance !== undefined) validateRuntimeProvenance(payload.runtime_provenance, false);
       return;
+    case "terminate_work": {
+      exactKeys(payload, "payload", [
+        "project",
+        "run_id",
+        "dispatch_id",
+        "outcome",
+        "reason",
+        "error_code",
+        "runtime_provenance",
+      ]);
+      projectPath(payload);
+      requiredId(payload, "run_id");
+      requiredId(payload, "dispatch_id");
+      const outcome = requiredText(payload, "outcome", 20);
+      if (outcome !== "FAILED" && outcome !== "CANCELLED") requestError("outcome 必须是 FAILED 或 CANCELLED");
+      requiredText(payload, "reason", 500);
+      optionalText(payload, "error_code", 160);
+      if (outcome === "FAILED" && payload.error_code === undefined) {
+        requestError("FAILED terminate_work 必须提供 error_code");
+      }
+      if (outcome === "CANCELLED" && payload.error_code !== undefined) {
+        requestError("CANCELLED terminate_work 不得提供 error_code");
+      }
+      if (payload.runtime_provenance !== undefined) validateRuntimeProvenance(payload.runtime_provenance, false);
+      return;
+    }
     case "complete_work":
       exactKeys(payload, "payload", ["project", "run_id", "dispatch_id", "output", "runtime_provenance"]);
       projectPath(payload);

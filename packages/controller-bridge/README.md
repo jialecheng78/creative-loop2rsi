@@ -8,6 +8,7 @@
 - 使用固定参数数组和 `shell: false`，不拼接命令字符串；
 - 只允许与 Python app-service 一致的固定 operation；其中 `resume_feedback` 只能提交受信项目路径与 `run_id`，不能从 Renderer 重传反馈或编辑原文；
 - `complete_work` 只接受固定 Studio 模型策略的结构化 runtime provenance；`reasoning_content` 与凭据字段不得进入 Controller 证据层；
+- `cancel_work` 只记录可重派的 zero-file dispatch stall；用户可见的失败或取消必须使用 `terminate_work`，由 Controller 返回不可覆盖 receipt 的 path/sha256 并将 run 收敛为 `BLOCK`；
 - request ID、operation、protocol version 和 response envelope 必须精确对应；
 - 子进程只继承固定的编码、区域、时区和临时目录环境，不继承 Key、token 或其他凭证环境变量；
 - stderr 不进入返回值，stdout 必须是单个、完整的 JSON 对象；

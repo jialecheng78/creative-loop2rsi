@@ -50,7 +50,18 @@ export interface GatewayBudgetPolicy {
   maxResponseBytes: number;
   maxSingleRequestBytes: number;
   maxSingleResponseBytes: number;
-  timeoutMs: number;
+  /** Time from request start until the first validated SSE event. */
+  firstEventTimeoutMs: number;
+  /** Maximum silence between validated SSE events after the first event. */
+  streamIdleTimeoutMs: number;
+  /** Absolute request lifetime; stream progress never resets this limit. */
+  totalTimeoutMs: number;
+  /**
+   * @deprecated Compatibility input only. When supplied alone, it sets all
+   * three timeout limits. Mixing it with a canonical timeout field is invalid.
+   * Canonical snapshots never contain this field.
+   */
+  timeoutMs?: number;
   maxSseLineBytes: number;
 }
 
@@ -69,7 +80,9 @@ export type GatewayErrorCode =
   | "HTTP_ERROR"
   | "INVALID_RESPONSE"
   | "NETWORK_ERROR"
-  | "TIMEOUT";
+  | "FIRST_EVENT_TIMEOUT"
+  | "STREAM_IDLE_TIMEOUT"
+  | "TOTAL_TIMEOUT";
 
 export type ChatRole = "system" | "user" | "assistant" | "tool";
 

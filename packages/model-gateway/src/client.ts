@@ -12,6 +12,7 @@ import {
   type DeepSeekEndpoint,
   type DeepSeekGatewayOptions,
   type GatewayLogRecord,
+  type GatewayErrorCode,
   type GatewayUsageSummary,
   type ModelListResponse,
   type RequestOptions,
@@ -156,7 +157,7 @@ export class DeepSeekGateway {
       requestedModel: normalized.model,
       parameters: summarizeRequest(normalized, true),
     };
-    const scope = createAbortScope(options.signal, this.budget.limits.timeoutMs);
+    const scope = createStreamAbortScope(options.signal, this.budget.limits);
     let key = "";
     let response: Response;
     try {
@@ -195,6 +196,7 @@ export class DeepSeekGateway {
       for await (const event of parseDeepSeekSse(response.body, this.budget, {
         signal: scope.signal,
         maxLineBytes: this.budget.limits.maxSseLineBytes,
+        onEvent: scope.markStreamEvent,
       })) {
         if (event.type === "chunk") {
           returnedModel = event.chunk.model ?? returnedModel;
@@ -219,7 +221,15 @@ export class DeepSeekGateway {
     init: Pick<RequestInit, "method" | "headers" | "body">,
     options: RequestOptions,
   ): Promise<HttpResponseScope> {
-    const scope = createAbortScope(options.signal, this.budget.limits.timeoutMs);
+    const isModelList = context.endpoint === "/models";
+    const timeoutMs = isModelList
+      ? this.budget.limits.firstEventTimeoutMs
+      : this.budget.limits.totalTimeoutMs;
+    const scope = createDeadlineAbortScope(
+      options.signal,
+      timeoutMs,
+      isModelList ? "FIRST_EVENT_TIMEOUT" : "TOTAL_TIMEOUT",
+    );
     let key = "";
     try {
       key = await this.#getKey();
@@ -273,7 +283,8 @@ export class DeepSeekGateway {
   }
 
   #transportError(_error: unknown, scope: AbortScope): GatewayError {
-    if (scope.timedOut()) return new GatewayError("TIMEOUT", "模型请求超时");
+    const timeout = scope.timeoutCode();
+    if (timeout !== undefined) return timeoutError(timeout);
     if (scope.signal.aborted) return new GatewayError("NETWORK_ERROR", "模型请求已取消");
     return new GatewayError("NETWORK_ERROR", "模型网络请求失败");
   }
@@ -575,7 +586,8 @@ function getRequestId(response: Response, secrets: readonly string[] = []): stri
 
 interface AbortScope {
   signal: AbortSignal;
-  timedOut(): boolean;
+  timeoutCode(): GatewayErrorCode | undefined;
+  markStreamEvent?(): void;
   cleanup(): void;
 }
 
@@ -585,19 +597,24 @@ interface HttpResponseScope {
   key: string;
 }
 
-function createAbortScope(external: AbortSignal | undefined, timeoutMs: number): AbortScope {
+function createDeadlineAbortScope(
+  external: AbortSignal | undefined,
+  timeoutMs: number,
+  deadlineCode: "FIRST_EVENT_TIMEOUT" | "TOTAL_TIMEOUT",
+): AbortScope {
   const controller = new AbortController();
-  let timeoutTriggered = false;
+  let timeoutCode: GatewayErrorCode | undefined;
   const onExternalAbort = (): void => controller.abort(external?.reason);
   if (external?.aborted) onExternalAbort();
   else external?.addEventListener("abort", onExternalAbort, { once: true });
   const timeout = setTimeout(() => {
-    timeoutTriggered = true;
-    controller.abort(new Error("timeout"));
+    if (controller.signal.aborted) return;
+    timeoutCode = deadlineCode;
+    controller.abort(new Error(deadlineCode.toLowerCase().replaceAll("_", "-")));
   }, timeoutMs);
   return {
     signal: controller.signal,
-    timedOut: () => timeoutTriggered,
+    timeoutCode: () => timeoutCode,
     cleanup: () => {
       clearTimeout(timeout);
       external?.removeEventListener("abort", onExternalAbort);
@@ -605,11 +622,73 @@ function createAbortScope(external: AbortSignal | undefined, timeoutMs: number):
   };
 }
 
+function createStreamAbortScope(
+  external: AbortSignal | undefined,
+  limits: Pick<
+    DeepSeekGateway["budget"]["limits"],
+    "firstEventTimeoutMs" | "streamIdleTimeoutMs" | "totalTimeoutMs"
+  >,
+): AbortScope & { markStreamEvent(): void } {
+  const controller = new AbortController();
+  let timeoutCode: GatewayErrorCode | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const abortFor = (code: GatewayErrorCode): void => {
+    if (controller.signal.aborted) return;
+    timeoutCode = code;
+    controller.abort(new Error(code.toLowerCase().replaceAll("_", "-")));
+  };
+  const onExternalAbort = (): void => controller.abort(external?.reason);
+  if (external?.aborted) onExternalAbort();
+  else external?.addEventListener("abort", onExternalAbort, { once: true });
+  const firstEventTimer = setTimeout(
+    () => abortFor("FIRST_EVENT_TIMEOUT"),
+    limits.firstEventTimeoutMs,
+  );
+  const totalTimer = setTimeout(
+    () => abortFor("TOTAL_TIMEOUT"),
+    limits.totalTimeoutMs,
+  );
+  let sawEvent = false;
+  return {
+    signal: controller.signal,
+    timeoutCode: () => timeoutCode,
+    markStreamEvent: () => {
+      if (controller.signal.aborted) return;
+      if (!sawEvent) {
+        sawEvent = true;
+        clearTimeout(firstEventTimer);
+      }
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => abortFor("STREAM_IDLE_TIMEOUT"),
+        limits.streamIdleTimeoutMs,
+      );
+    },
+    cleanup: () => {
+      clearTimeout(firstEventTimer);
+      clearTimeout(totalTimer);
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      external?.removeEventListener("abort", onExternalAbort);
+    },
+  };
+}
+
 function normalizeGatewayError(error: unknown, scope: AbortScope): GatewayError {
+  const timeout = scope.timeoutCode();
+  if (timeout !== undefined) return timeoutError(timeout);
   if (error instanceof GatewayError) return error;
-  if (scope.timedOut()) return new GatewayError("TIMEOUT", "模型请求超时");
   if (scope.signal.aborted) return new GatewayError("NETWORK_ERROR", "模型请求已取消");
   return new GatewayError("INVALID_RESPONSE", "无法解析模型响应");
+}
+
+function timeoutError(code: GatewayErrorCode): GatewayError {
+  if (code === "FIRST_EVENT_TIMEOUT") {
+    return new GatewayError(code, "模型在开始返回有效数据前超时");
+  }
+  if (code === "STREAM_IDLE_TIMEOUT") {
+    return new GatewayError(code, "模型流已开始，但长时间没有新事件");
+  }
+  return new GatewayError("TOTAL_TIMEOUT", "模型请求超过绝对总时限");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -71,6 +71,17 @@ class AppControllerTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    @staticmethod
+    def tree_hashes(root):
+        root = Path(root)
+        return {
+            path.relative_to(root).as_posix(): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in sorted(root.rglob("*"))
+            if path.is_file() and not path.is_symlink()
+        }
+
     def bootstrap(self, name="app-project"):
         project = self.root / name
         result = self.request(
@@ -392,6 +403,596 @@ class AppControllerTests(unittest.TestCase):
         self.assertTrue(resumed["idempotent_run"])
         self.assertFalse(resumed["idempotent_dispatch"])
         self.assertEqual(resumed["dispatch_id"], "dispatch-second")
+
+    def test_terminate_work_commits_zero_file_terminal_state_idempotently(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-failed",
+                "work_id": "work-failed",
+                "task": "不会完成的创作任务",
+                "dispatch_id": "dispatch-failed",
+                "context_id": "context-failed",
+            },
+        )
+        payload = {
+            "project": str(project),
+            "run_id": "run-failed",
+            "dispatch_id": begun["dispatch_id"],
+            "outcome": "FAILED",
+            "reason": "runtime-failed-before-commit",
+            "error_code": "UPSTREAM_UNAVAILABLE",
+            "runtime_provenance": self.failed_runtime_provenance(),
+        }
+        first = self.request("terminate_work", payload)
+        second = self.request("terminate_work", payload)
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        self.assertFalse(first["content_attempt_consumed"])
+        self.assertFalse(first["finding_eligible"])
+
+        run_root = project / "creative-system/runs/run-failed"
+        run = self.read_json(run_root / "run.json")
+        attempt = self.read_json(
+            run_root / "attempts/attempt-001/attempt.json"
+        )
+        dispatch = self.read_json(
+            run_root
+            / "attempts/attempt-001/dispatches/dispatch-failed/dispatch.json"
+        )
+        receipt = self.read_json(project / first["terminal_receipt"])
+        self.assertEqual(run["execution_status"], "BLOCK")
+        self.assertIsNone(run["current_attempt"])
+        self.assertEqual(run["last_decision"], "stop")
+        self.assertEqual(run["terminated_attempts"], ["attempt-001"])
+        self.assertEqual(run["attempts"], [])
+        self.assertEqual(attempt["execution_status"], "RUNNING")
+        self.assertEqual(dispatch["state"], "OPEN")
+        self.assertEqual(receipt["kind"], "TerminatedAttempt")
+        self.assertEqual(receipt["termination_class"], "ZERO_FILE_RUNTIME_FAILURE")
+        self.assertEqual(receipt["error_code"], "UPSTREAM_UNAVAILABLE")
+
+        system = self.read_json(project / "creative-system/system.json")
+        self.assertEqual(system["statuses"]["execution_status"], "BLOCK")
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        self.assertIsNone(snapshot["last_work"])
+        self.assertTrue(snapshot["recovery_required"])
+        self.assertEqual(
+            snapshot["interrupted_run"]["state"], "TERMINATED_FAILED"
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["reason_code"], "UPSTREAM_UNAVAILABLE"
+        )
+        self.assertEqual(snapshot["interrupted_run"]["outcome"], "FAILED")
+        self.assertEqual(
+            snapshot["interrupted_run"]["execution_status"], "BLOCK"
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["termination_class"],
+            "ZERO_FILE_RUNTIME_FAILURE",
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["terminal_receipt"],
+            first["terminal_receipt"],
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["terminal_receipt_sha256"],
+            first["terminal_receipt_sha256"],
+        )
+        self.assertFalse(snapshot["interrupted_run"]["content_attempt_consumed"])
+        self.assertFalse(snapshot["interrupted_run"]["finding_eligible"])
+
+        with self.assertRaises(AppRequestError):
+            self.request(
+                "begin_work",
+                {
+                    "project": str(project),
+                    "run_id": "run-failed",
+                    "work_id": "work-failed",
+                    "task": "不会完成的创作任务",
+                    "dispatch_id": "dispatch-reopen",
+                    "context_id": "context-reopen",
+                },
+            )
+        successor = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-successor",
+                "work_id": "work-successor",
+                "task": "重新生成",
+                "recovery_of": "run-failed",
+            },
+        )
+        self.assertEqual(successor["run_id"], "run-successor")
+        self.request("system_snapshot", {"project": str(project)})
+        system_after_successor = self.read_json(
+            project / "creative-system/system.json"
+        )
+        self.assertEqual(
+            system_after_successor["statuses"]["execution_status"], "RUNNING"
+        )
+        self.assertEqual(
+            load_controller().finding_occurrences(project, "APP-FEEDBACK-NOT-THERE"),
+            [],
+        )
+
+    def test_terminate_work_rejects_semantic_drift(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-drift",
+                "work_id": "work-drift",
+                "task": "失败语义不可覆盖",
+            },
+        )
+        payload = {
+            "project": str(project),
+            "run_id": "run-drift",
+            "dispatch_id": begun["dispatch_id"],
+            "outcome": "FAILED",
+            "reason": "runtime-failed-before-commit",
+            "error_code": "UPSTREAM_UNAVAILABLE",
+        }
+        self.request("terminate_work", payload)
+        attempt_dir = (
+            project
+            / "creative-system/runs/run-drift/attempts/attempt-001"
+        )
+        before = self.tree_hashes(attempt_dir)
+        changed = dict(payload)
+        changed["error_code"] = "DEEPSEEK_TOTAL_TIMEOUT"
+        changed["runtime_provenance"] = self.failed_runtime_provenance()
+        with self.assertRaises(AppRequestError) as caught:
+            self.request("terminate_work", changed)
+        self.assertIn("不同终止语义", str(caught.exception))
+        self.assertEqual(self.tree_hashes(attempt_dir), before)
+        self.assertFalse(
+            (attempt_dir / f"runtime-provenance-{begun['dispatch_id']}.json").exists()
+        )
+
+    def test_system_snapshot_rolls_forward_after_terminal_marker_crash(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-crashed-terminal",
+                "work_id": "work-crashed-terminal",
+                "task": "终态投影崩溃恢复",
+            },
+        )
+        original = app_service._apply_termination_run_projection_locked
+        calls = 0
+
+        def crash_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("injected crash after terminal marker")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+            app_service,
+            "_apply_termination_run_projection_locked",
+            side_effect=crash_once,
+        ):
+            with self.assertRaises(RuntimeError):
+                self.request(
+                    "terminate_work",
+                    {
+                        "project": str(project),
+                        "run_id": "run-crashed-terminal",
+                        "dispatch_id": begun["dispatch_id"],
+                        "outcome": "FAILED",
+                        "reason": "runtime-failed-before-commit",
+                        "error_code": "UPSTREAM_UNAVAILABLE",
+                        "runtime_provenance": self.failed_runtime_provenance(),
+                    },
+                )
+            run_before = self.read_json(
+                project / "creative-system/runs/run-crashed-terminal/run.json"
+            )
+            self.assertEqual(run_before["execution_status"], "RUNNING")
+            marker = (
+                project
+                / "creative-system/runs/run-crashed-terminal/attempts/attempt-001/.terminated.json"
+            )
+            self.assertTrue(marker.is_file())
+            snapshot = self.request("system_snapshot", {"project": str(project)})
+
+        run_after = self.read_json(
+            project / "creative-system/runs/run-crashed-terminal/run.json"
+        )
+        self.assertEqual(run_after["execution_status"], "BLOCK")
+        self.assertIsNone(run_after["current_attempt"])
+        self.assertEqual(
+            snapshot["interrupted_run"]["state"], "TERMINATED_FAILED"
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["termination_class"],
+            "ZERO_FILE_RUNTIME_FAILURE",
+        )
+        self.assertFalse(snapshot["interrupted_run"]["content_attempt_consumed"])
+        self.assertFalse(snapshot["interrupted_run"]["finding_eligible"])
+
+    def test_terminal_marker_blocks_completion_before_run_projection_recovers(self):
+        project, _ = self.bootstrap()
+        begun, artifact = self.begin_with_artifact(
+            project,
+            run_id="run-terminal-commit-point",
+            work_id="work-terminal-commit-point",
+        )
+        with mock.patch.object(
+            app_service,
+            "_apply_termination_run_projection_locked",
+            side_effect=RuntimeError("injected crash after terminal marker"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "terminal marker"):
+                self.request(
+                    "terminate_work",
+                    {
+                        "project": str(project),
+                        "run_id": "run-terminal-commit-point",
+                        "dispatch_id": begun["dispatch_id"],
+                        "outcome": "FAILED",
+                        "reason": "completion-evidence-or-commit-failed",
+                        "error_code": "COMMIT_FAILED",
+                        "runtime_provenance": self.failed_runtime_provenance(),
+                    },
+                )
+
+        attempt_dir = (
+            project
+            / "creative-system/runs/run-terminal-commit-point/attempts/attempt-001"
+        )
+        marker = attempt_dir / ".terminated.json"
+        self.assertTrue(marker.is_file())
+        marker_sha256 = hashlib.sha256(marker.read_bytes()).hexdigest()
+        run_before = self.read_json(attempt_dir.parent.parent / "run.json")
+        self.assertEqual(run_before["execution_status"], "RUNNING")
+
+        source = project / "outputs/terminal-measure-source.md"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("终止后不得测量\n", encoding="utf-8")
+        late_facts = (
+            "creative-system/runs/run-terminal-commit-point/attempts/"
+            "attempt-001/controller-facts/late.json"
+        )
+        blocked_measure = self.command(
+            "measure-artifact",
+            project,
+            "--source",
+            "outputs/terminal-measure-source.md",
+            "--output",
+            late_facts,
+            expected=2,
+        )
+        self.assertIn("attempt 已终止", blocked_measure["error"])
+        self.assertFalse((project / late_facts).exists())
+        self.assertEqual(
+            hashlib.sha256(marker.read_bytes()).hexdigest(), marker_sha256
+        )
+
+        core = load_controller()
+        with self.assertRaises(core.LoopCtlError):
+            core.command_open_human_review(
+                type(
+                    "Args",
+                    (),
+                    {
+                        "project": str(project),
+                        "run_id": "run-terminal-commit-point",
+                        "dispatch_id": begun["dispatch_id"],
+                        "machine_direction": "UNKNOWN",
+                    },
+                )()
+            )
+        with self.assertRaises(core.LoopCtlError):
+            self.request(
+                "complete_work",
+                {
+                    "project": str(project),
+                    "run_id": "run-terminal-commit-point",
+                    "dispatch_id": begun["dispatch_id"],
+                    "output": artifact.read_text(encoding="utf-8"),
+                    "runtime_provenance": self.runtime_provenance(),
+                },
+            )
+        run_after = self.read_json(attempt_dir.parent.parent / "run.json")
+        self.assertEqual(run_after["execution_status"], "BLOCK")
+        self.assertIsNone(run_after["current_attempt"])
+        self.assertFalse((attempt_dir / "human-review/subject.json").exists())
+        self.assertFalse((attempt_dir / ".sealed.json").exists())
+
+    def test_terminal_receipt_rejects_late_write_in_any_prior_stalled_dispatch(self):
+        project, _ = self.bootstrap()
+        first = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-late-prior-dispatch",
+                "work_id": "work-late-prior-dispatch",
+                "task": "验证旧派发晚写",
+                "dispatch_id": "dispatch-first",
+                "context_id": "context-first",
+            },
+        )
+        self.request(
+            "cancel_work",
+            {
+                "project": str(project),
+                "run_id": "run-late-prior-dispatch",
+                "dispatch_id": "dispatch-first",
+                "reason": "user-cancelled-before-output",
+            },
+        )
+        second = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-late-prior-dispatch",
+                "work_id": "work-late-prior-dispatch",
+                "task": "验证旧派发晚写",
+                "dispatch_id": "dispatch-second",
+                "context_id": "context-second",
+            },
+        )
+        terminal = self.request(
+            "terminate_work",
+            {
+                "project": str(project),
+                "run_id": "run-late-prior-dispatch",
+                "dispatch_id": second["dispatch_id"],
+                "outcome": "FAILED",
+                "reason": "runtime-failed-before-commit",
+                "error_code": "UPSTREAM_UNAVAILABLE",
+                "runtime_provenance": self.failed_runtime_provenance(),
+            },
+        )
+        receipt_path = project / terminal["terminal_receipt"]
+        receipt_sha256 = load_controller().sha256_file(receipt_path)
+        late = project / first["allowed_writes_root"] / "late.md"
+        late.write_text("旧 Worker 在终态后晚到的内容", encoding="utf-8")
+
+        with self.assertRaises(AppRequestError) as caught:
+            self.request("system_snapshot", {"project": str(project)})
+        self.assertIn("LATE_WRITE_CONTAMINATION", str(caught.exception))
+        self.assertEqual(load_controller().sha256_file(receipt_path), receipt_sha256)
+        run = self.read_json(
+            project / "creative-system/runs/run-late-prior-dispatch/run.json"
+        )
+        self.assertEqual(run["execution_status"], "BLOCK")
+
+    def test_system_snapshot_repairs_system_projection_after_run_commit(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-system-crash",
+                "work_id": "work-system-crash",
+                "task": "系统投影崩溃恢复",
+            },
+        )
+        original = app_service._project_system_from_latest_run_locked
+        calls = 0
+
+        def crash_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("injected crash before system projection")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+            app_service,
+            "_project_system_from_latest_run_locked",
+            side_effect=crash_once,
+        ):
+            with self.assertRaises(RuntimeError):
+                self.request(
+                    "terminate_work",
+                    {
+                        "project": str(project),
+                        "run_id": "run-system-crash",
+                        "dispatch_id": begun["dispatch_id"],
+                        "outcome": "FAILED",
+                        "reason": "runtime-failed-before-commit",
+                        "error_code": "UPSTREAM_UNAVAILABLE",
+                        "runtime_provenance": self.failed_runtime_provenance(),
+                    },
+                )
+            run = self.read_json(
+                project / "creative-system/runs/run-system-crash/run.json"
+            )
+            system_before = self.read_json(project / "creative-system/system.json")
+            self.assertEqual(run["execution_status"], "BLOCK")
+            self.assertEqual(
+                system_before["statuses"]["execution_status"], "RUNNING"
+            )
+            self.request("system_snapshot", {"project": str(project)})
+
+        system_after = self.read_json(project / "creative-system/system.json")
+        self.assertEqual(system_after["statuses"]["execution_status"], "BLOCK")
+
+    def test_terminate_work_binds_uncommitted_output_without_fake_stall(self):
+        project, _ = self.bootstrap()
+        begun, _ = self.begin_with_artifact(
+            project, run_id="run-uncommitted", work_id="work-uncommitted"
+        )
+        result = self.request(
+            "terminate_work",
+            {
+                "project": str(project),
+                "run_id": "run-uncommitted",
+                "dispatch_id": begun["dispatch_id"],
+                "outcome": "FAILED",
+                "reason": "completion-evidence-or-commit-failed",
+                "error_code": "RUNTIME_FAILED",
+                "runtime_provenance": self.failed_runtime_provenance(),
+            },
+        )
+        receipt = self.read_json(project / result["terminal_receipt"])
+        self.assertEqual(
+            receipt["termination_class"], "UNCOMMITTED_OUTPUT_FAILURE"
+        )
+        self.assertTrue(receipt["content_attempt_consumed"])
+        self.assertIsNone(receipt["dispatch_stall"])
+        self.assertGreater(len(receipt["artifact_inventory"]), 0)
+        stall = (
+            project
+            / begun["allowed_writes_root"]
+        ).parent / "stall.json"
+        self.assertFalse(stall.exists())
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        self.assertIsNone(snapshot["last_work"])
+        self.assertEqual(
+            snapshot["interrupted_run"]["state"], "TERMINATED_FAILED"
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["termination_class"],
+            "UNCOMMITTED_OUTPUT_FAILURE",
+        )
+        self.assertTrue(snapshot["interrupted_run"]["content_attempt_consumed"])
+        self.assertFalse(snapshot["interrupted_run"]["finding_eligible"])
+        self.assertEqual(snapshot["interrupted_run"]["outcome"], "FAILED")
+        self.assertEqual(
+            snapshot["interrupted_run"]["terminal_receipt"],
+            result["terminal_receipt"],
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["terminal_receipt_sha256"],
+            result["terminal_receipt_sha256"],
+        )
+
+    def test_snapshot_migrates_legacy_app_stall_to_terminal_receipt(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-legacy-stall",
+                "work_id": "work-legacy-stall",
+                "task": "旧版失败记录",
+            },
+        )
+        self.request(
+            "cancel_work",
+            {
+                "project": str(project),
+                "run_id": "run-legacy-stall",
+                "dispatch_id": begun["dispatch_id"],
+                "reason": "runtime-failed-before-commit",
+                "runtime_provenance": self.failed_runtime_provenance(),
+            },
+        )
+        run_path = project / "creative-system/runs/run-legacy-stall/run.json"
+        self.assertEqual(self.read_json(run_path)["execution_status"], "RUNNING")
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        run = self.read_json(run_path)
+        self.assertEqual(run["execution_status"], "BLOCK")
+        self.assertEqual(
+            snapshot["interrupted_run"]["state"], "TERMINATED_FAILED"
+        )
+        self.assertEqual(snapshot["interrupted_run"]["outcome"], "FAILED")
+        self.assertEqual(
+            snapshot["interrupted_run"]["terminal_receipt"],
+            run["terminal_receipt"],
+        )
+        self.assertEqual(
+            snapshot["interrupted_run"]["terminal_receipt_sha256"],
+            run["terminal_receipt_sha256"],
+        )
+        self.assertTrue(
+            (
+                run_path.parent
+                / "attempts/attempt-001/.terminated.json"
+            ).is_file()
+        )
+
+    def test_legacy_migration_does_not_reuse_an_earlier_timeout_after_success(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-legacy-recovered-timeout",
+                "work_id": "work-legacy-recovered-timeout",
+                "task": "旧版请求超时后曾成功恢复",
+            },
+        )
+        provenance = self.runtime_provenance()
+        completed = dict(provenance["requests"][0])
+        completed["request_number"] = 2
+        provenance.update(
+            {
+                "request_count": 2,
+                "completed_requests": 1,
+                "failed_requests": 1,
+                "requests": [
+                    {
+                        "request_number": 1,
+                        "started_at": "2026-08-14T00:00:00Z",
+                        "completed_at": "2026-08-14T00:00:01Z",
+                        "status": "FAILED",
+                        "http_status": 504,
+                        "error_code": "DEEPSEEK_FIRST_EVENT_TIMEOUT",
+                        "response_id": None,
+                        "returned_model": None,
+                        "system_fingerprint": None,
+                        "usage": {},
+                    },
+                    completed,
+                ],
+            }
+        )
+        self.request(
+            "cancel_work",
+            {
+                "project": str(project),
+                "run_id": "run-legacy-recovered-timeout",
+                "dispatch_id": begun["dispatch_id"],
+                "reason": "runtime-failed-before-commit",
+                "runtime_provenance": provenance,
+            },
+        )
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        self.assertEqual(snapshot["interrupted_run"]["outcome"], "FAILED")
+        self.assertEqual(
+            snapshot["interrupted_run"]["reason_code"], "RUNTIME_FAILED"
+        )
+
+    def test_snapshot_preserves_legacy_application_close_as_cancelled(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-legacy-application-close",
+                "work_id": "work-legacy-application-close",
+                "task": "旧版应用关闭中的任务",
+            },
+        )
+        self.request(
+            "cancel_work",
+            {
+                "project": str(project),
+                "run_id": "run-legacy-application-close",
+                "dispatch_id": begun["dispatch_id"],
+                "reason": "application-closed",
+                "runtime_provenance": self.failed_runtime_provenance(),
+            },
+        )
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        self.assertEqual(snapshot["interrupted_run"]["outcome"], "CANCELLED")
+        self.assertEqual(
+            snapshot["interrupted_run"]["reason_code"], "application-closed"
+        )
 
     def test_snapshot_keeps_sealed_a_when_newer_b_is_cancelled(self):
         project, _ = self.bootstrap()

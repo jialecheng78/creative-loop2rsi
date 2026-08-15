@@ -85,7 +85,13 @@ export type RuntimeErrorCode =
   | 'ACCOUNT_BALANCE'
   | 'RATE_LIMITED'
   | 'DEEPSEEK_UNAVAILABLE'
+  | 'DEEPSEEK_FIRST_EVENT_TIMEOUT'
+  | 'DEEPSEEK_STREAM_IDLE_TIMEOUT'
+  | 'DEEPSEEK_TOTAL_TIMEOUT'
+  /** Fallback for a timeout raised outside Studio's classified Gateway. */
   | 'DEEPSEEK_TIMEOUT'
+  | 'COMMIT_FAILED'
+  | 'WORK_TERMINATION_PENDING'
   | 'OUTPUT_TRUNCATED'
   | 'RUNTIME_FAILED'
   | 'DISPOSED'

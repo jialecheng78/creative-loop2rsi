@@ -17,6 +17,7 @@ const STATUS: StudioStatus = {
   selectedModel: 'deepseek-v4-flash',
   runtime: { state: 'ready' },
   feedbackRecoveryState: 'none',
+  workRecoveryState: 'none',
   activeSystem: {
     systemId: 'system-one',
     displayName: '克制悬疑',

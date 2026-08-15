@@ -31,3 +31,14 @@ that model reasoning never reaches disk. Completed work and governance state
 are recovered from the Python Controller; an interrupted model turn is
 redispatched from the last sealed boundary instead of being resumed after a
 process restart.
+
+The profile also overrides rc.6's default model retry policy. It permits at
+most two retries only for `RATE_LIMIT` and pre-stream `SERVER` failures. It
+does not retry `TIMEOUT` or `TRANSPORT`: once the loopback Gateway has emitted
+a valid SSE event, replaying the whole request can repeat a long, partially
+generated response and duplicate cost. The Gateway owns the public
+first-event, stream-idle, and absolute-total timeout contract. The adapter
+recognizes all three codes when rc.6 exposes them. Because rc.6 flattens an
+HTTP 5xx exhausted before the first stream event to `SERVER`, Main also reads
+the loopback request ledger and restores the precise timeout class before it
+is shown or committed; the runtime event alone is not authoritative.

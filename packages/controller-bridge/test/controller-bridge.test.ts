@@ -105,6 +105,7 @@ describe("buildControllerWireRequest", () => {
       "submit_method_comparison",
       "submit_feedback",
       "system_snapshot",
+      "terminate_work",
     ]);
   });
 
@@ -211,6 +212,48 @@ describe("buildControllerWireRequest", () => {
         reason: "user-cancelled",
       },
     })).toMatchObject({ operation: "cancel_work", payload: { reason: "user-cancelled" } });
+
+    expect(buildControllerWireRequest({
+      request_id: "request-terminate",
+      operation: "terminate_work",
+      payload: {
+        project: projectPath,
+        run_id: "run-one",
+        dispatch_id: "dispatch-one",
+        outcome: "FAILED",
+        reason: "runtime-failed-before-commit",
+        error_code: "DEEPSEEK_TOTAL_TIMEOUT",
+      },
+    })).toMatchObject({
+      operation: "terminate_work",
+      payload: { outcome: "FAILED", error_code: "DEEPSEEK_TOTAL_TIMEOUT" },
+    });
+  });
+
+  it("keeps termination outcome and error code consistent", () => {
+    expect(() => buildControllerWireRequest({
+      request_id: "request-failed-without-code",
+      operation: "terminate_work",
+      payload: {
+        project: projectPath,
+        run_id: "run-one",
+        dispatch_id: "dispatch-one",
+        outcome: "FAILED",
+        reason: "runtime-failed-before-commit",
+      },
+    })).toThrowError(/error_code/);
+    expect(() => buildControllerWireRequest({
+      request_id: "request-cancelled-with-code",
+      operation: "terminate_work",
+      payload: {
+        project: projectPath,
+        run_id: "run-one",
+        dispatch_id: "dispatch-one",
+        outcome: "CANCELLED",
+        reason: "user-cancelled",
+        error_code: "RUNTIME_FAILED",
+      },
+    })).toThrowError(/error_code/);
   });
 
   it("resumes feedback only by the persisted run identity", () => {

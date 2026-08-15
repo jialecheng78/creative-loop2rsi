@@ -40,6 +40,11 @@ import type {
   LoopbackLeaseProvenance,
   LoopbackModelGateway,
 } from './loopback-gateway.js'
+import {
+  PendingWorkStore,
+  type PendingTerminationExpectation,
+  type PendingWorkIntent,
+} from './pending-work-store.js'
 import type { RuntimeWorkerManager } from './runtime-worker-manager.js'
 import type { DesktopSettings, SettingsStore } from './settings-store.js'
 
@@ -66,6 +71,7 @@ type StudioControllerOperation =
   | 'submit_method_comparison'
   | 'submit_feedback'
   | 'system_snapshot'
+  | 'terminate_work'
 
 export interface ControllerRequestLike {
   readonly request_id: string
@@ -91,6 +97,9 @@ export interface RuntimePort extends Pick<RuntimeWorkerManager,
 export interface LoopbackGatewayPort extends Pick<LoopbackModelGateway,
   'close' | 'issueLease' | 'start'> {}
 
+export interface PendingWorkStorePort extends Pick<PendingWorkStore,
+  'clear' | 'createLaunching' | 'load' | 'requireTermination'> {}
+
 export type RuntimeSpecFactory = (input: {
   readonly nodeExecutable: string
   readonly cwd: string
@@ -112,6 +121,7 @@ export interface StudioServiceOptions {
   readonly settings: SettingsStorePort
   readonly runtime: RuntimePort
   readonly loopback: LoopbackGatewayPort
+  readonly pendingWorkStore?: PendingWorkStorePort
   readonly emit: (event: StudioEvent) => void
   readonly now?: () => string
   readonly idFactory?: () => string
@@ -131,6 +141,7 @@ interface StartingWork {
   readonly lease: LoopbackGatewayLease
   readonly profileSha256: string
   readonly queuedEvents: RuntimeEvent[]
+  readonly pendingWork: PendingWorkIntent
 }
 
 interface ActiveWork extends StartingWork {
@@ -169,8 +180,33 @@ interface InternalGenerationResult {
   readonly runtimeProvenance: JsonRecord
 }
 
+interface TerminationExpectation {
+  readonly project: string
+  readonly systemId: string
+  readonly runId: string
+  readonly dispatchId: string
+  readonly outcome: 'FAILED' | 'CANCELLED'
+  readonly reason: string
+  readonly errorCode?: string
+  readonly runtimeProvenance?: JsonRecord
+}
+
+interface PreparedTermination {
+  readonly pending: PendingWorkIntent
+  readonly expected: TerminationExpectation
+}
+
+interface LaunchOwnership {
+  readonly systemId: string
+  readonly runId: string
+  readonly workId: string
+  readonly dispatchId: string
+  readonly contextId: string
+}
+
 export class StudioService {
   private readonly systemsRoot: string
+  private readonly pendingWorkStore: PendingWorkStorePort
   private readonly now: () => string
   private readonly idFactory: () => string
   private readonly credentialValidator: (apiKey: string) => Promise<readonly ModelChoice[]>
@@ -180,6 +216,8 @@ export class StudioService {
   private active: ActiveWork | undefined
   private launchInProgress = false
   private launchCancellationRequested = false
+  private launchBeginConfirmed = false
+  private launchOwnership: LaunchOwnership | undefined
   private launchCompletion: LaunchCompletion | undefined
   private createInProgress = false
   private credentialMutationInProgress = false
@@ -190,6 +228,8 @@ export class StudioService {
   private internalLaunchEvents: RuntimeEvent[] | undefined
   private internalRun: InternalModelRun | undefined
   private eventQueue: Promise<void> = Promise.resolve()
+  private pendingRecoveryTask: Promise<boolean> | undefined
+  private currentPendingWork: PendingWorkIntent | undefined
 
   constructor(private readonly options: StudioServiceOptions) {
     if (!isAbsolute(options.userDataPath) || options.userDataPath.includes('\0')) {
@@ -199,6 +239,7 @@ export class StudioService {
       throw new TypeError('nodeExecutable 必须是可信绝对路径。')
     }
     this.systemsRoot = resolve(options.userDataPath, 'systems')
+    this.pendingWorkStore = options.pendingWorkStore ?? new PendingWorkStore(options.userDataPath)
     this.now = options.now ?? (() => new Date().toISOString())
     this.idFactory = options.idFactory ?? randomUUID
     this.credentialValidator = options.credentialValidator ?? validateOfficialCredential
@@ -207,11 +248,22 @@ export class StudioService {
   }
 
   async getStatus(): Promise<StudioStatus> {
-    const [credential, settings, snapshot] = await Promise.all([
+    let workRecoveryState: StudioStatus['workRecoveryState'] = 'none'
+    try {
+      if (await this.reconcilePendingWork()) workRecoveryState = 'recovered'
+    } catch {
+      workRecoveryState = 'retry-required'
+    }
+    const [credential, settings] = await Promise.all([
       this.credentialStatus(),
       this.options.settings.load(),
-      this.systemSnapshot(),
     ])
+    const snapshot = workRecoveryState === 'retry-required' || settings.activeSystemId === null
+      ? null
+      : await this.readProjectSnapshot(
+          this.projectPath(settings.activeSystemId),
+          settings.activeSystemId,
+        )
     let activeSystem = snapshot
     let feedbackRecoveryState: StudioStatus['feedbackRecoveryState'] = 'none'
     if (activeSystem?.feedbackRecoveryRequired === true) {
@@ -230,6 +282,7 @@ export class StudioService {
       runtime: this.options.runtime.status(),
       activeSystem,
       feedbackRecoveryState,
+      workRecoveryState,
     }
   }
 
@@ -284,6 +337,7 @@ export class StudioService {
   }
 
   async selectModel(model: ModelChoice): Promise<StudioStatus> {
+    await this.requirePendingWorkReconciled()
     if (this.active !== undefined || this.launchInProgress || this.methodOperationInProgress) {
       throw new StudioServiceError('WORK_ACTIVE', '请先结束当前创作，再切换模型。')
     }
@@ -292,6 +346,7 @@ export class StudioService {
   }
 
   async createSystem(input: CreateSystemInput): Promise<SystemSnapshot> {
+    await this.requirePendingWorkReconciled()
     if (this.createInProgress || this.launchInProgress || this.active !== undefined || this.methodOperationInProgress) {
       throw new StudioServiceError('BUSY', '当前有操作正在进行，请稍后再试。')
     }
@@ -317,6 +372,7 @@ export class StudioService {
   }
 
   async systemSnapshot(): Promise<SystemSnapshot | null> {
+    await this.requirePendingWorkReconciled()
     const settings = await this.options.settings.load()
     if (settings.activeSystemId === null) return null
     const result = await this.callController('system_snapshot', {
@@ -326,6 +382,7 @@ export class StudioService {
   }
 
   async startWork(task: string): Promise<WorkRunHandle> {
+    await this.requirePendingWorkReconciled()
     if (this.launchInProgress
       || this.active !== undefined
       || this.starting !== undefined
@@ -335,12 +392,17 @@ export class StudioService {
     }
     this.launchInProgress = true
     this.launchCancellationRequested = false
+    this.launchBeginConfirmed = false
     const launchCompletion = createLaunchCompletion()
     this.launchCompletion = launchCompletion
     let lease: LoopbackGatewayLease | undefined
     let controllerRunId: string | undefined
     let dispatchId: string | undefined
     let project: string | undefined
+    let systemId: string | undefined
+    let pendingWork: PendingWorkIntent | undefined
+    let runtimeRunId: string | undefined
+    let launchOwnership: LaunchOwnership | undefined
     try {
       const credential = await this.credentialStatus()
       if (!credential.configured) {
@@ -350,6 +412,7 @@ export class StudioService {
       if (settings.activeSystemId === null) {
         throw new StudioServiceError('SYSTEM_REQUIRED', '请先告诉我你想创作什么。')
       }
+      systemId = settings.activeSystemId
       this.throwIfLaunchCancelled()
       project = this.projectPath(settings.activeSystemId)
       const rawCreativeSystem = await this.readProjectSnapshot(project, settings.activeSystemId)
@@ -368,8 +431,15 @@ export class StudioService {
       dispatchId = this.internalId('dispatch')
       const workId = this.internalId('work')
       const contextId = this.internalId('context')
-      const begun = await this.callController('begin_work', {
-        project,
+      launchOwnership = {
+        systemId,
+        runId: controllerRunId,
+        workId,
+        dispatchId,
+        contextId,
+      }
+      this.launchOwnership = launchOwnership
+      const beginPayload = {
         run_id: controllerRunId,
         work_id: workId,
         task,
@@ -380,16 +450,19 @@ export class StudioService {
         ...(creativeSystem.interruptedRun === null
           ? {}
           : { recovery_of: creativeSystem.interruptedRun.runId }),
-      })
-      if (begun.run_id !== controllerRunId
-        || begun.dispatch_id !== dispatchId
-        || begun.work_id !== workId
-        || begun.task_sha256 !== createHash('sha256').update(task, 'utf8').digest('hex')
-        || begun.context_sha256 !== contextSha256
-        || begun.method_version !== methodVersion
-        || (begun.method_guidance_sha256 ?? null) !== guidanceSha256) {
-        throw invalidControllerResponse()
       }
+      pendingWork = await this.pendingWorkStore.createLaunching({
+        createdAt: this.now(),
+        systemId,
+        beginPayload,
+        beginExpectation: {
+          method_version: methodVersion,
+          method_guidance_sha256: guidanceSha256,
+        },
+      })
+      this.currentPendingWork = pendingWork
+      await this.beginControllerWork(project, pendingWork)
+      this.launchBeginConfirmed = true
       this.throwIfLaunchCancelled()
 
       lease = this.options.loopback.issueLease('production', settings.selectedModel)
@@ -428,13 +501,14 @@ export class StudioService {
         lease,
         profileSha256,
         queuedEvents: [],
+        pendingWork,
       }
       this.starting = starting
       const runtimeHandle = await this.options.runtime.startRun(
         creationInstruction(creativeSystem.initialIntent, task, guidance),
       )
+      runtimeRunId = runtimeHandle.runId
       if (this.launchCancellationRequested) {
-        await this.options.runtime.cancelRun(runtimeHandle.runId).catch(() => undefined)
         throw new StudioServiceError('LAUNCH_CANCELLED', '本次创作已停止。')
       }
       const active: ActiveWork = {
@@ -456,29 +530,78 @@ export class StudioService {
       return { runId: controllerRunId, sessionId: runtimeHandle.sessionId }
     } catch (error) {
       const launchState = this.starting
+      const publicError = publicServiceError(error, '无法开始本次创作。')
       lease?.revoke()
+      let prepared: PreparedTermination | undefined
+      let persistenceError: unknown
+      if (project !== undefined
+        && systemId !== undefined
+        && controllerRunId !== undefined
+        && dispatchId !== undefined
+        && pendingWork !== undefined
+        && this.launchBeginConfirmed) {
+        const cancelled = this.launchCancellationRequested
+        try {
+          prepared = await this.persistTerminationIntent({
+            project,
+            systemId,
+            runId: controllerRunId,
+            dispatchId,
+            outcome: cancelled ? 'CANCELLED' : 'FAILED',
+            reason: cancelled
+              ? 'user-cancelled-during-launch'
+              : 'runtime-launch-failed-before-output',
+            ...(cancelled ? {} : { errorCode: publicError.code }),
+            ...(launchState === undefined
+              ? {}
+              : { runtimeProvenance: runtimeProvenancePayload(
+                  this.options.appVersion,
+                  launchState,
+                  launchState.lease.provenance(),
+                ) }),
+          }, pendingWork, true)
+        } catch (caught) {
+          persistenceError = caught
+        }
+      }
       this.starting = undefined
-      await this.options.runtime.stop().catch(() => undefined)
-      if (project !== undefined && controllerRunId !== undefined && dispatchId !== undefined) {
-        await this.cancelControllerDispatch(
+      await this.stopProductionRuntime(runtimeRunId)
+      if (persistenceError !== undefined) throw pendingTerminationError()
+      if (project !== undefined
+        && systemId !== undefined
+        && controllerRunId !== undefined
+        && dispatchId !== undefined
+        && pendingWork !== undefined) {
+        const cancelled = this.launchCancellationRequested
+        const expectation = {
           project,
-          controllerRunId,
+          systemId,
+          runId: controllerRunId,
           dispatchId,
-          this.launchCancellationRequested
+          outcome: cancelled ? 'CANCELLED' : 'FAILED',
+          reason: cancelled
             ? 'user-cancelled-during-launch'
             : 'runtime-launch-failed-before-output',
-          launchState === undefined
-            ? undefined
-            : runtimeProvenancePayload(
+          ...(cancelled ? {} : { errorCode: publicError.code }),
+          ...(launchState === undefined
+            ? {}
+            : { runtimeProvenance: runtimeProvenancePayload(
                 this.options.appVersion,
                 launchState,
                 launchState.lease.provenance(),
-              ),
-        ).catch(() => undefined)
+              ) }),
+        } satisfies TerminationExpectation
+        if (prepared === undefined) {
+          await this.terminateControllerDispatch(expectation, pendingWork)
+        } else {
+          await this.sealPreparedTermination(prepared)
+        }
       }
-      throw publicServiceError(error, '无法开始本次创作。')
+      throw publicError
     } finally {
       this.launchInProgress = false
+      this.launchBeginConfirmed = false
+      if (this.launchOwnership === launchOwnership) this.launchOwnership = undefined
       launchCompletion.resolve()
       if (this.launchCompletion === launchCompletion) this.launchCompletion = undefined
     }
@@ -490,7 +613,15 @@ export class StudioService {
       if (runId === 'active' && this.launchInProgress) {
         this.launchCancellationRequested = true
         this.starting?.lease.revoke()
+        let persistenceFailed = false
+        try {
+          await this.persistLaunchCancellation('user-cancelled-during-launch')
+        } catch {
+          persistenceFailed = true
+        }
+        await this.stopProductionRuntime()
         await this.launchCompletion?.promise
+        if (persistenceFailed) throw pendingTerminationError()
         active = this.active
         if (active === undefined) return
       } else if (runId === 'active') {
@@ -505,13 +636,13 @@ export class StudioService {
     }
     // Revoke the network capability before waiting for runtime shutdown.
     active.cancelRequested = true
-    active.cancelReason = 'user-cancelled'
+    active.cancelReason ??= 'user-cancelled'
     active.lease.revoke()
-    await this.options.runtime.cancelRun(active.runtimeRunId).catch(() => undefined)
-    await this.finishUnsuccessful(active, 'user-cancelled', 'cancelled')
+    await this.finishUnsuccessful(active, active.cancelReason, 'cancelled', undefined, true)
   }
 
   async submitFeedback(input: SubmitFeedbackInput): Promise<SubmitFeedbackResult> {
+    await this.requirePendingWorkReconciled()
     if (this.active !== undefined || this.launchInProgress || this.methodOperationInProgress) {
       throw new StudioServiceError('WORK_ACTIVE', '请等待当前创作结束后再提交反馈。')
     }
@@ -682,18 +813,34 @@ export class StudioService {
   }
 
   async shutdown(): Promise<void> {
+    let terminationPending = false
     if (this.launchInProgress) {
       this.launchCancellationRequested = true
       this.starting?.lease.revoke()
+      let persistenceFailed = false
+      try {
+        await this.persistLaunchCancellation('application-closed-during-launch')
+      } catch {
+        persistenceFailed = true
+      }
+      await this.stopProductionRuntime()
       await this.launchCompletion?.promise
+      terminationPending ||= persistenceFailed
     }
     const active = this.active
     if (active !== undefined) {
       active.cancelRequested = true
-      active.cancelReason = 'application-closed'
+      active.cancelReason ??= 'application-closed'
       active.lease.revoke()
-      await this.options.runtime.cancelRun(active.runtimeRunId).catch(() => undefined)
-      await this.finishUnsuccessful(active, 'application-closed', 'cancelled')
+      try {
+        await this.finishUnsuccessful(active, active.cancelReason, 'cancelled', undefined, true)
+      } catch (error) {
+        if (error instanceof StudioServiceError && error.code === 'WORK_TERMINATION_PENDING') {
+          terminationPending = true
+        } else {
+          throw error
+        }
+      }
     }
     if (this.methodOperationInProgress) {
       this.methodCancellationRequested = true
@@ -708,6 +855,7 @@ export class StudioService {
     this.starting = undefined
     await this.options.runtime.clearConfiguration()
     await this.options.loopback.close()
+    if (terminationPending) throw pendingTerminationError()
   }
 
   private async methodDecision(
@@ -744,6 +892,7 @@ export class StudioService {
   }
 
   private async withMethodOperation<T>(action: () => Promise<T>): Promise<T> {
+    await this.requirePendingWorkReconciled()
     if (this.methodOperationInProgress || this.active !== undefined || this.launchInProgress) {
       throw new StudioServiceError('METHOD_ACTIVE', '当前有创作或新方式比较正在进行。')
     }
@@ -806,7 +955,7 @@ export class StudioService {
       const queued = this.internalLaunchEvents
       this.internalLaunchEvents = undefined
       for (const event of queued ?? []) await this.processInternalRuntimeEvent(event)
-      await withTimeout(completion.completion, 240_000, '新方式生成超时，本轮没有记为成功。')
+      await withTimeout(completion.completion, 900_000, '新方式生成超过十五分钟，本轮没有记为成功。')
       this.throwIfMethodCancelled()
       if (completion.output === undefined || completion.output.trim() === '') {
         throw new StudioServiceError('EMPTY_OUTPUT', '模型没有返回可比较的内容。')
@@ -861,6 +1010,7 @@ export class StudioService {
       return
     }
     if (event.runId !== active.runtimeRunId) return
+    if (active.terminalTask !== undefined) return
     if (event.type === 'output') {
       active.output = event.text
       this.emitForControllerRun(active, event)
@@ -937,16 +1087,19 @@ export class StudioService {
           }
         }
         if (!persisted) throw new StudioServiceError('COMMIT_FAILED', '作品未能安全保存，本次没有记为成功。')
+        await this.clearPendingWork(active.pendingWork).catch(() => undefined)
         active.lease.revoke()
         await this.options.runtime.stop().catch(() => undefined)
         if (this.active === active) this.active = undefined
         this.options.emit({ type: 'state', runId: active.controllerRunId, state: 'completed' })
       } catch (error) {
+        const commitError = publicServiceError(error, '作品未能安全保存，本次没有记为成功。')
         await this.performUnsuccessful(
           active,
           'completion-evidence-or-commit-failed',
           'failed',
-          publicServiceError(error, '作品未能安全保存，本次没有记为成功。').message,
+          commitError.message,
+          'COMMIT_FAILED',
         )
       }
     })()
@@ -958,9 +1111,10 @@ export class StudioService {
     reason: string,
     state: 'cancelled' | 'failed',
     message?: string,
+    cancelRuntime = false,
   ): Promise<void> {
     if (active.terminalTask !== undefined) return await active.terminalTask
-    active.terminalTask = this.performUnsuccessful(active, reason, state, message)
+    active.terminalTask = this.performUnsuccessful(active, reason, state, message, undefined, cancelRuntime)
     return await active.terminalTask
   }
 
@@ -969,46 +1123,288 @@ export class StudioService {
     reason: string,
     state: 'cancelled' | 'failed',
     message?: string,
+    errorCode?: string,
+    cancelRuntime = false,
   ): Promise<void> {
     active.lease.revoke()
-    await this.options.runtime.stop().catch(() => undefined)
-    await this.cancelControllerDispatch(
-      active.project,
-      active.controllerRunId,
-      active.dispatchId,
-      reason,
-      runtimeProvenancePayload(this.options.appVersion, active, active.lease.provenance()),
-    ).catch(() => undefined)
-    if (this.active === active) this.active = undefined
-    if (state === 'failed') {
+    const effectiveState = active.runtimeErrorCode === undefined ? state : 'failed'
+    const effectiveReason = effectiveState === 'failed' && state === 'cancelled'
+      ? 'runtime-failed-before-commit'
+      : reason
+    const failure = effectiveState === 'failed'
+      ? classifiedRuntimeFailure(active, errorCode, message)
+      : undefined
+    let prepared: PreparedTermination | undefined
+    let persistenceError: unknown
+    try {
+      prepared = await this.persistTerminationIntent({
+        project: active.project,
+        systemId: active.systemId,
+        runId: active.controllerRunId,
+        dispatchId: active.dispatchId,
+        outcome: effectiveState === 'failed' ? 'FAILED' : 'CANCELLED',
+        reason: effectiveReason,
+        ...(failure === undefined ? {} : { errorCode: failure.code }),
+        runtimeProvenance: runtimeProvenancePayload(
+          this.options.appVersion,
+          active,
+          active.lease.provenance(),
+        ),
+      }, active.pendingWork, true)
+    } catch (caught) {
+      persistenceError = caught
+    }
+    await this.stopProductionRuntime(cancelRuntime ? active.runtimeRunId : undefined)
+    if (persistenceError !== undefined || prepared === undefined) {
+      if (this.active === active) this.active = undefined
       this.options.emit({
         type: 'error',
         runId: active.controllerRunId,
-        code: active.runtimeErrorCode ?? 'RUNTIME_FAILED',
-        message: message ?? active.runtimeError ?? '本次创作未完成，请重试。',
+        code: 'WORK_TERMINATION_PENDING',
+        message: pendingTerminationError().message,
+      })
+      this.options.emit({ type: 'state', runId: active.controllerRunId, state: 'failed' })
+      throw pendingTerminationError()
+    }
+    try {
+      await this.sealPreparedTermination(prepared)
+    } catch (error) {
+      if (this.active === active) this.active = undefined
+      const pending = publicServiceError(
+        error,
+        '生成已经停止，但失败记录还没有安全封存。请重启应用后恢复；本次不会计为作品或学习证据。',
+      )
+      this.options.emit({
+        type: 'error',
+        runId: active.controllerRunId,
+        code: 'WORK_TERMINATION_PENDING',
+        message: pending.message,
+      })
+      this.options.emit({ type: 'state', runId: active.controllerRunId, state: 'failed' })
+      return
+    }
+    if (this.active === active) this.active = undefined
+    if (effectiveState === 'failed') {
+      this.options.emit({
+        type: 'error',
+        runId: active.controllerRunId,
+        code: failure?.code ?? 'RUNTIME_FAILED',
+        message: failure?.message ?? '本次创作未完成，请重试。',
       })
     }
-    this.options.emit({ type: 'state', runId: active.controllerRunId, state })
+    this.options.emit({ type: 'state', runId: active.controllerRunId, state: effectiveState })
   }
 
   private emitForControllerRun(active: ActiveWork, event: RuntimeEvent): void {
     this.options.emit({ ...event, runId: active.controllerRunId })
   }
 
-  private async cancelControllerDispatch(
-    project: string,
-    runId: string,
-    dispatchId: string,
-    reason: string,
-    runtimeProvenance?: JsonRecord,
-  ): Promise<void> {
-    await this.callController('cancel_work', {
-      project,
-      run_id: runId,
-      dispatch_id: dispatchId,
+  private async beginControllerWork(project: string, pending: PendingWorkIntent): Promise<void> {
+    let failure: unknown
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const begun = await this.callController('begin_work', {
+          project,
+          ...pending.begin_payload,
+        })
+        validateBeginReceipt(begun, pending)
+        return
+      } catch (error) {
+        failure = error
+      }
+    }
+    throw failure
+  }
+
+  private async persistLaunchCancellation(reason: string): Promise<void> {
+    const pending = this.currentPendingWork
+    if (!this.launchBeginConfirmed || pending === undefined) return
+    const starting = this.starting
+    await this.persistTerminationIntent({
+      project: this.projectPath(pending.system_id),
+      systemId: pending.system_id,
+      runId: pending.run_id,
+      dispatchId: pending.dispatch_id,
+      outcome: 'CANCELLED',
       reason,
-      ...(runtimeProvenance === undefined ? {} : { runtime_provenance: runtimeProvenance }),
-    })
+      ...(starting === undefined
+        ? {}
+        : { runtimeProvenance: runtimeProvenancePayload(
+            this.options.appVersion,
+            starting,
+            starting.lease.provenance(),
+          ) }),
+    }, pending, true)
+  }
+
+  private async stopProductionRuntime(runtimeRunId?: string): Promise<void> {
+    const operations: Promise<unknown>[] = []
+    if (runtimeRunId !== undefined) operations.push(this.options.runtime.cancelRun(runtimeRunId))
+    operations.push(this.options.runtime.stop())
+    await Promise.allSettled(operations)
+  }
+
+  private async terminateControllerDispatch(
+    input: TerminationExpectation,
+    pending: PendingWorkIntent,
+  ): Promise<void> {
+    await this.sealPreparedTermination(await this.persistTerminationIntent(input, pending))
+  }
+
+  private async persistTerminationIntent(
+    input: TerminationExpectation,
+    pending: PendingWorkIntent,
+    beginConfirmed = false,
+  ): Promise<PreparedTermination> {
+    if (!beginConfirmed) await this.ensureBeginBeforeTermination(input.project, pending)
+    const durable = await this.pendingWorkStore.requireTermination(
+      pending,
+      pendingTerminationExpectation(input),
+    )
+    if (this.currentPendingWork?.run_id === durable.run_id) this.currentPendingWork = durable
+    const expected = terminationExpectationFromPending(input.project, durable)
+    return { pending: durable, expected }
+  }
+
+  private async sealPreparedTermination(prepared: PreparedTermination): Promise<void> {
+    const { expected, pending } = prepared
+    const payload = {
+      project: expected.project,
+      run_id: expected.runId,
+      dispatch_id: expected.dispatchId,
+      outcome: expected.outcome,
+      reason: expected.reason,
+      ...(expected.errorCode === undefined ? {} : { error_code: expected.errorCode }),
+      ...(expected.runtimeProvenance === undefined ? {} : { runtime_provenance: expected.runtimeProvenance }),
+    } as const
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const receipt = await this.callController('terminate_work', payload)
+        validateTerminationReceipt(receipt, expected)
+        await this.clearPendingWork(pending)
+        return
+      } catch {
+        if (attempt === 0) continue
+      }
+    }
+    try {
+      const snapshot = await this.readProjectSnapshot(expected.project, expected.systemId)
+      if (snapshot !== null && confirmsTermination(snapshot, expected)) {
+        await this.clearPendingWork(pending)
+        return
+      }
+    } catch {
+      // The public error below is the only state exposed when both receipt and
+      // read-back verification fail. It intentionally contains no local path.
+    }
+    throw new StudioServiceError(
+      'WORK_TERMINATION_PENDING',
+      '生成已经停止，但失败记录还没有安全封存。请重启应用后恢复；本次不会计为作品或学习证据。',
+    )
+  }
+
+  private async ensureBeginBeforeTermination(project: string, pending: PendingWorkIntent): Promise<void> {
+    if (pending.phase === 'TERMINATION_REQUIRED') return
+    try {
+      await this.beginControllerWork(project, pending)
+      return
+    } catch {
+      try {
+        const snapshot = await this.readProjectSnapshot(project, pending.system_id)
+        if (snapshot !== null && confirmsOpenedDispatch(snapshot, pending)) return
+      } catch {
+        // Keep the LAUNCHING intent intact. A later startup will replay the
+        // exact begin payload before any terminal semantic is committed.
+      }
+      throw new StudioServiceError(
+        'WORK_TERMINATION_PENDING',
+        '生成已经停止，但本地创作记录尚未确认打开。请重启应用恢复；恢复完成前不会开始新创作。',
+      )
+    }
+  }
+
+  private async clearPendingWork(pending: PendingWorkIntent): Promise<void> {
+    await this.pendingWorkStore.clear(pending)
+    if (this.currentPendingWork?.run_id === pending.run_id) this.currentPendingWork = undefined
+  }
+
+  private async requirePendingWorkReconciled(): Promise<void> {
+    try {
+      await this.reconcilePendingWork()
+    } catch {
+      throw new StudioServiceError(
+        'WORK_TERMINATION_PENDING',
+        '上次创作的失败记录还没有安全封存。请重试或重启应用；恢复完成前不会开始新创作。',
+      )
+    }
+  }
+
+  private async reconcilePendingWork(): Promise<boolean> {
+    const existing = this.pendingRecoveryTask
+    if (existing !== undefined) return await existing
+    const operation = this.reconcilePendingWorkOnce()
+    this.pendingRecoveryTask = operation
+    try {
+      return await operation
+    } finally {
+      if (this.pendingRecoveryTask === operation) this.pendingRecoveryTask = undefined
+    }
+  }
+
+  private async reconcilePendingWorkOnce(): Promise<boolean> {
+    let pending = await this.pendingWorkStore.load()
+    if (pending === null) return false
+    if (this.isLivePendingWork(pending)) return false
+    const project = this.projectPath(pending.system_id)
+    let snapshot: SystemSnapshot | null = null
+    try {
+      snapshot = await this.readProjectSnapshot(project, pending.system_id)
+    } catch {
+      // The exact idempotent Controller operations below are the recovery path
+      // when a snapshot response is unavailable or malformed.
+    }
+    if (snapshot !== null && confirmsCompletedWork(snapshot, pending)) {
+      await this.clearPendingWork(pending)
+      return true
+    }
+    if (snapshot !== null
+      && pending.termination_expectation !== null
+      && confirmsTermination(snapshot, terminationExpectationFromPending(project, pending))) {
+      await this.clearPendingWork(pending)
+      return true
+    }
+    if (pending.phase === 'LAUNCHING') {
+      await this.terminateControllerDispatch({
+        project,
+        systemId: pending.system_id,
+        runId: pending.run_id,
+        dispatchId: pending.dispatch_id,
+        outcome: 'CANCELLED',
+        reason: 'application-restarted-before-terminal-commit',
+      }, pending)
+      return true
+    }
+    await this.terminateControllerDispatch(
+      terminationExpectationFromPending(project, pending),
+      pending,
+    )
+    return true
+  }
+
+  private isLivePendingWork(pending: PendingWorkIntent): boolean {
+    if (!this.launchInProgress && this.starting === undefined && this.active === undefined) return false
+    const launchOwnership = this.launchOwnership
+    if (launchOwnership !== undefined
+      && launchOwnership.systemId === pending.system_id
+      && launchOwnership.runId === pending.run_id
+      && launchOwnership.workId === pending.work_id
+      && launchOwnership.dispatchId === pending.dispatch_id
+      && launchOwnership.contextId === pending.context_id) {
+      return true
+    }
+    return this.currentPendingWork?.content_hash === pending.content_hash
+      || this.starting?.controllerRunId === pending.run_id
+      || this.active?.controllerRunId === pending.run_id
   }
 
   private async readProjectSnapshot(project: string, systemId: string): Promise<SystemSnapshot | null> {
@@ -1233,6 +1629,67 @@ function runtimeProvenancePayload(
   }
 }
 
+function validateBeginReceipt(receipt: JsonRecord, pending: PendingWorkIntent): void {
+  const begin = pending.begin_payload
+  const expectation = pending.begin_expectation
+  if (receipt.run_id !== pending.run_id
+    || receipt.dispatch_id !== pending.dispatch_id
+    || receipt.work_id !== pending.work_id
+    || receipt.task_sha256 !== createHash('sha256').update(begin.task, 'utf8').digest('hex')
+    || receipt.context_sha256 !== begin.context_sha256
+    || receipt.method_version !== expectation.method_version
+    || (receipt.method_guidance_sha256 ?? null) !== expectation.method_guidance_sha256) {
+    throw invalidControllerResponse()
+  }
+}
+
+function pendingTerminationExpectation(input: TerminationExpectation): PendingTerminationExpectation {
+  if (input.outcome === 'FAILED' && input.errorCode === undefined) throw invalidControllerResponse()
+  return {
+    outcome: input.outcome,
+    reason: input.reason,
+    error_code: input.errorCode ?? null,
+    runtime_provenance: input.runtimeProvenance ?? null,
+  }
+}
+
+function terminationExpectationFromPending(
+  project: string,
+  pending: PendingWorkIntent,
+): TerminationExpectation {
+  const expectation = pending.termination_expectation
+  if (expectation === null) throw invalidControllerResponse()
+  return {
+    project,
+    systemId: pending.system_id,
+    runId: pending.run_id,
+    dispatchId: pending.dispatch_id,
+    outcome: expectation.outcome,
+    reason: expectation.reason,
+    ...(expectation.error_code === null ? {} : { errorCode: expectation.error_code }),
+    ...(expectation.runtime_provenance === null
+      ? {}
+      : { runtimeProvenance: expectation.runtime_provenance }),
+  }
+}
+
+function confirmsCompletedWork(snapshot: SystemSnapshot, pending: PendingWorkIntent): boolean {
+  const work = snapshot.lastWork
+  return work !== null
+    && work.runId === pending.run_id
+    && work.workId === pending.work_id
+    && work.runtimeProvenanceSha256 !== null
+    && work.reviewSubjectSha256 !== null
+}
+
+function confirmsOpenedDispatch(snapshot: SystemSnapshot, pending: PendingWorkIntent): boolean {
+  const interrupted = snapshot.interruptedRun
+  return interrupted !== null
+    && interrupted.runId === pending.run_id
+    && interrupted.workId === pending.work_id
+    && interrupted.dispatchId === pending.dispatch_id
+}
+
 function validateCompletionReceipt(
   receipt: JsonRecord,
   active: Pick<ActiveWork, 'controllerRunId' | 'workId'>,
@@ -1248,6 +1705,90 @@ function validateCompletionReceipt(
   requiredString(receipt.review_subject)
   const reviewAvailableAt = requiredString(receipt.review_available_at)
   if (!Number.isFinite(Date.parse(reviewAvailableAt))) throw invalidControllerResponse()
+}
+
+function validateTerminationReceipt(
+  receipt: JsonRecord,
+  expected: TerminationExpectation,
+): void {
+  if (receipt.run_id !== expected.runId
+    || receipt.dispatch_id !== expected.dispatchId
+    || receipt.outcome !== expected.outcome
+    || receipt.execution_status !== 'BLOCK'
+    || receipt.finding_eligible !== false
+    || typeof receipt.idempotent !== 'boolean') {
+    throw invalidControllerResponse()
+  }
+  requiredString(receipt.attempt_id)
+  requiredString(receipt.terminal_receipt)
+  requiredSha256(receipt.terminal_receipt_sha256)
+  requiredBoolean(receipt.content_attempt_consumed)
+}
+
+function confirmsTermination(
+  snapshot: SystemSnapshot,
+  expected: TerminationExpectation,
+): boolean {
+  const interrupted = snapshot.interruptedRun
+  return snapshot.recoveryRequired
+    && interrupted !== null
+    && interrupted.runId === expected.runId
+    && interrupted.dispatchId === expected.dispatchId
+    && interrupted.state === `TERMINATED_${expected.outcome}`
+    && interrupted.outcome === expected.outcome
+    && interrupted.executionStatus === 'BLOCK'
+    && interrupted.findingEligible === false
+    && interrupted.terminalReceipt !== undefined
+    && interrupted.terminalReceiptSha256 !== undefined
+    && interrupted.contentAttemptConsumed !== undefined
+    && (expected.outcome === 'FAILED'
+      ? interrupted.reasonCode === expected.errorCode
+      : interrupted.reasonCode === expected.reason)
+}
+
+function classifiedRuntimeFailure(
+  active: ActiveWork,
+  explicitCode?: string,
+  explicitMessage?: string,
+): { readonly code: RuntimeErrorCode; readonly message: string } {
+  const provenance = active.lease.provenance()
+  const lastRequest = provenance.requests[provenance.requests.length - 1]
+  const latestFailedCode = lastRequest?.status === 'FAILED' ? lastRequest.errorCode : undefined
+  const preciseTimeout: RuntimeErrorCode | undefined = latestFailedCode === 'DEEPSEEK_FIRST_EVENT_TIMEOUT'
+    || latestFailedCode === 'DEEPSEEK_STREAM_IDLE_TIMEOUT'
+    || latestFailedCode === 'DEEPSEEK_TOTAL_TIMEOUT'
+    ? latestFailedCode
+    : undefined
+  const code: RuntimeErrorCode = explicitCode === 'COMMIT_FAILED'
+    ? 'COMMIT_FAILED'
+    : preciseTimeout ?? active.runtimeErrorCode ?? 'RUNTIME_FAILED'
+  if (explicitMessage !== undefined && explicitCode !== undefined) {
+    return { code, message: explicitMessage }
+  }
+  const attempts = provenance.requestCount
+  const attemptText = attempts > 0 ? `（本次共发起 ${attempts} 次请求）` : ''
+  if (code === 'DEEPSEEK_FIRST_EVENT_TIMEOUT') {
+    return {
+      code,
+      message: `DeepSeek 在两分钟内没有开始返回内容${attemptText}，本次没有保存。请稍后重试。`,
+    }
+  }
+  if (code === 'DEEPSEEK_STREAM_IDLE_TIMEOUT') {
+    return {
+      code,
+      message: `DeepSeek 已开始生成，但九十秒没有新进展${attemptText}；未完成内容不会保存。`,
+    }
+  }
+  if (code === 'DEEPSEEK_TOTAL_TIMEOUT') {
+    return {
+      code,
+      message: `DeepSeek 生成已达到十分钟上限${attemptText}；未完成内容不会保存。`,
+    }
+  }
+  return {
+    code,
+    message: explicitMessage ?? active.runtimeError ?? '本次创作未完成，请重试。',
+  }
 }
 
 function parseSystemSnapshot(value: JsonRecord, expectedSystemId: string): SystemSnapshot {
@@ -1371,7 +1912,7 @@ function parseMethodCandidate(value: JsonRecord): SystemSnapshot['methodCandidat
 function parseInterruptedRun(value: unknown): SystemSnapshot['interruptedRun'] {
   if (value === null || value === undefined) return null
   if (!isPlainRecord(value)) throw invalidControllerResponse()
-  return {
+  const base = {
     runId: requiredString(value.run_id),
     workId: requiredString(value.work_id),
     attemptId: requiredString(value.attempt_id),
@@ -1379,6 +1920,28 @@ function parseInterruptedRun(value: unknown): SystemSnapshot['interruptedRun'] {
     state: requiredString(value.state),
     reasonCode: requiredString(value.reason_code),
   }
+  if (base.state === 'TERMINATED_FAILED' || base.state === 'TERMINATED_CANCELLED') {
+    const outcome = requiredString(value.outcome)
+    const terminationClass = requiredString(value.termination_class)
+    if ((outcome !== 'FAILED' && outcome !== 'CANCELLED')
+      || (terminationClass !== 'ZERO_FILE_RUNTIME_FAILURE'
+        && terminationClass !== 'UNCOMMITTED_OUTPUT_FAILURE')
+      || value.execution_status !== 'BLOCK'
+      || value.finding_eligible !== false) {
+      throw invalidControllerResponse()
+    }
+    return {
+      ...base,
+      outcome,
+      executionStatus: 'BLOCK',
+      terminationClass,
+      terminalReceipt: requiredString(value.terminal_receipt),
+      terminalReceiptSha256: requiredSha256(value.terminal_receipt_sha256),
+      contentAttemptConsumed: requiredBoolean(value.content_attempt_consumed),
+      findingEligible: false,
+    }
+  }
+  return base
 }
 
 function parsePendingFeedback(value: unknown): SystemSnapshot['pendingFeedback'] {
@@ -1557,6 +2120,13 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 
 function invalidControllerResponse(): StudioServiceError {
   return new StudioServiceError('CONTROLLER_PROTOCOL', '本地创作记录返回了无效结果。')
+}
+
+function pendingTerminationError(): StudioServiceError {
+  return new StudioServiceError(
+    'WORK_TERMINATION_PENDING',
+    '生成已经停止，但失败记录还没有安全封存。请重启应用后恢复；本次不会计为作品或学习证据。',
+  )
 }
 
 function createLaunchCompletion(): LaunchCompletion {

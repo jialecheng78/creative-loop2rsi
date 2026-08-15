@@ -120,6 +120,58 @@ describe('LoopbackModelGateway', () => {
     await gateway.close()
   })
 
+  it.each([
+    ['FIRST_EVENT_TIMEOUT', 'DEEPSEEK_FIRST_EVENT_TIMEOUT'],
+    ['STREAM_IDLE_TIMEOUT', 'DEEPSEEK_STREAM_IDLE_TIMEOUT'],
+    ['TOTAL_TIMEOUT', 'DEEPSEEK_TOTAL_TIMEOUT'],
+  ] as const)('preserves the classified %s timeout in HTTP evidence', async (upstreamCode, publicCode) => {
+    const stream = vi.fn(async function * (): AsyncGenerator<ChatStreamEvent> {
+      throw new GatewayError(upstreamCode, 'private timeout detail')
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+
+    const result = await post(lease.url, lease.token, requestBody())
+    expect(result.status).toBe(504)
+    expect(JSON.parse(result.body)).toMatchObject({ error: { code: publicCode } })
+    expect(result.body).not.toContain('private timeout detail')
+    expect(lease.provenance().requests[0]).toMatchObject({
+      status: 'FAILED',
+      httpStatus: 504,
+      errorCode: publicCode,
+    })
+    await gateway.close()
+  })
+
+  it('issues production leases with layered timeout defaults', async () => {
+    const budgets: Partial<import('@creative-loop2rsi/model-gateway').GatewayBudgetPolicy>[] = []
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: budget => {
+        budgets.push(budget)
+        return {
+          streamChatCompletion: async function * (): AsyncGenerator<ChatStreamEvent> {
+            yield { type: 'done' }
+          },
+        }
+      },
+    })
+    await gateway.start()
+    gateway.issueLease('production', 'deepseek-v4-flash')
+
+    expect(budgets).toEqual([expect.objectContaining({
+      firstEventTimeoutMs: 120_000,
+      streamIdleTimeoutMs: 90_000,
+      totalTimeoutMs: 600_000,
+    })])
+    expect(budgets[0]).not.toHaveProperty('timeoutMs')
+    await gateway.close()
+  })
+
   it('keeps sanitized per-request evidence across an intermediate failure and retry', async () => {
     let invocation = 0
     const stream = vi.fn(async function * (body: ChatCompletionRequest): AsyncGenerator<ChatStreamEvent> {
