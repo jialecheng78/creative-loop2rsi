@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -64,14 +64,18 @@ export async function buildPreview(options) {
       timeoutMs: 300_000,
       env: { ...process.env, CI: 'true' },
     })
-    await run(process.execPath, [
-      pnpmCli,
-      '--filter',
-      '@creative-loop2rsi/desktop',
-      'rebuild',
-      'electron',
-    ], {
-      cwd: workspace,
+    const electronPackageLink = join(workspace, 'apps', 'desktop', 'node_modules', 'electron')
+    const electronPackage = await realpath(electronPackageLink)
+    const realWorkspace = await realpath(workspace)
+    if (!inside(realWorkspace, electronPackage)) throw new Error('Electron package escapes fresh workspace')
+    const electronPackageJson = JSON.parse(await readFile(join(electronPackage, 'package.json'), 'utf8'))
+    if (electronPackageJson.name !== 'electron' || electronPackageJson.version !== '43.4.0') {
+      throw new Error('fresh workspace resolved an unexpected Electron package')
+    }
+    const electronInstaller = join(electronPackage, 'install.js')
+    await assertRegularFile(electronInstaller, 'Electron installer')
+    await run(process.execPath, [electronInstaller], {
+      cwd: electronPackage,
       timeoutMs: 300_000,
       env: { ...process.env, CI: 'true' },
     })
@@ -87,7 +91,7 @@ export async function buildPreview(options) {
     ], { cwd: workspace, timeoutMs: 300_000, env: { ...process.env, CI: 'true' } })
     await reduceDeployedApp(deployed)
 
-    const electronDist = resolve(workspace, 'apps', 'desktop', 'node_modules', 'electron', 'dist')
+    const electronDist = join(electronPackage, 'dist')
     await assertRegularDirectory(electronDist, 'Electron distribution')
     const bundle = platform === 'darwin'
       ? await stageMacBundle(electronDist, stagingRoot, deployed, sidecarDirectory, source, root)
