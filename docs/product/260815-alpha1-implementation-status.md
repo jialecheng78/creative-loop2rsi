@@ -9,6 +9,8 @@
 - Electron Renderer、Preload、Main 与 DSH utility worker 的分层骨架；Renderer 开启 sandbox 与 context isolation，不拥有 Node 或通用 IPC。
 - `safeStorage` 凭据封装、仅允许 DeepSeek 官方地址的 Model Gateway、Pro/Flash 固定模型选择和请求预算。
 - DSH rc.6 受信 Profile、公开 SDK JSON-RPC Adapter、loopback capability 与 Worker 取消/退出处理。
+- Electron ESM 入口采用非阻塞 bootstrap；应用只允许单实例，重复实例聚焦已有窗口，关闭最多等待 15 秒。
+- live harness 在打开 Key 前先运行无 Key、无网络、零模型 lease 的独立 Electron 预检。
 - Python Controller 应用协议：初始意图、作品 dispatch、完成、取消、反馈、封存和系统快照。
 - Key → 模型 → 创作方向 → 生成 → 编辑/保留/拒绝/重写反馈的界面与 Main 业务链路。
 - 反馈事务中断后由 Main 依据 Controller 已保存的 intent 自动恢复；恢复失败时界面保留明确状态，并阻止新反馈和新作品覆盖原编辑。
@@ -37,8 +39,8 @@
 |---|---|---|
 | M0 规则与 Skill 基线 | 已完成 | 仍需在最终 commit 后重跑完整历史与 archive 审计 |
 | M1 Monorepo 与治理拆包 | 已实现 | Python 采用 facade-first；旧 Skill 脚本仍是唯一治理实现，尚未反转成薄 wrapper |
-| M2 安全运行骨架 | 已实现、部分未验证 | mock 与真实 DSH 启停通过；真实 Electron GUI、macOS/Windows 打包进程与 DSH OS 级出网隔离尚未验收 |
-| M3 首个可用闭环 | 代码已实现 | 没有使用真实 DeepSeek Key 完成 Pro/Flash 流式验收；当前 DSH Adapter只在完成时交付正文，不宣称逐 token UI 流式 |
+| M2 安全运行骨架 | 已实现、部分未验证 | mock、真实 DSH 启停和 macOS arm64 无 Key/无网络 Electron 预检通过；真实 GUI、macOS/Windows 打包进程与 DSH OS 级出网隔离尚未验收 |
+| M3 首个可用闭环 | 代码已实现、实网仍未验证 | 官方 `/models` 已观察到 Pro/Flash；完整 Flash harness 在 pre-credential Electron boot 阶段 BLOCK，死锁已修复但未追加第三次运行；Pro/Flash Chat 均未通过，见 [真实验收报告](260815-Flash真实验收报告.md) |
 | M4 个人创作系统 | 部分实现 | 初始意图、作品与明确反馈已落治理证据；跨作品 finding 聚类和用户可见原则管理未接通 |
 | M5 可验证自我改进 | 未接入应用 | Python 已有候选、三类评价、晋升和回滚内核；桌面端尚无真实 Candidate/Evaluator Worker 闭环 |
 | M6 系统实验室 | 协议原型 | 只能建立 `CANDIDATE_ONLY` 治理记录；应用没有生成维护者 patch 包，也不运行模型生成代码 |
@@ -46,7 +48,7 @@
 
 ## 下一条最小发布路径
 
-1. 使用维护者临时 Key 分别完成 Pro 与 Flash 的真实官方调用，确认 returned model、fingerprint、usage、取消和错误映射；Key 与正文不得进入测试记录。
+1. 先在新的 clean commit 上完成一次 Flash 全链路验收，确认 returned model、fingerprint、usage、封存恢复和在途取消；通过后再单独验证 Pro。Key 与正文不得进入测试记录。
 2. 在 macOS arm64 和 Windows x64 hosted runner 生成可运行的 unpacked app，并用打包 sidecar 做 smoke test。
 3. 解决 installer 依赖供应链门禁后再生成 DMG、Windows 安装器与 portable ZIP；为每个产物绑定 SHA256、SBOM、许可证和来源 manifest。
 4. 完成 5 名非程序员验收后，才发布无签名 alpha；签名、公证与无警告安装仍是 stable blocker。
