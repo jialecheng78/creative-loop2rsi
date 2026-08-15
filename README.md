@@ -68,7 +68,8 @@
 | L5 修改 Judge、学习策略或改进控制器 | `UNVALIDATED` | 只生成 `CANDIDATE`；禁止自动晋升 |
 | 从 L0 到 L4、再证明晋升后运行 N 轮 | `IMPLEMENTED` | 分开 bootstrap 与 post-L4 计数；仍需真实人工门和独立评价者 |
 | Desktop monorepo、DeepSeek Gateway 与 DSH Adapter | `IMPLEMENTED` | 已通过 mock、协议、rc.6 启停探针与无 Key/无网络 Electron 预检；GUI 和打包仍未验收 |
-| Key → 模型 → 主题 → 首个作品 → 编辑/反馈的应用闭环 | `IMPLEMENTED` | 官方 `/models` 已取得有限实网证据；完整 Flash 验收曾在 pre-credential Electron boot 阶段 BLOCK，修复后尚未重跑；Pro/Flash Chat 均为 `UNVALIDATED`，见 [验收报告](docs/product/260815-Flash真实验收报告.md) |
+| Electron Main → DSH → Gateway → Controller 的 Flash 创作、封存、重启恢复与本地取消边界 | `IMPLEMENTED` | macOS arm64 当前 headless build 已取得一次真实 Flash PASS；`quality_status=NOT_EVALUATED`，且本次未绑定忽略目录 build digest，不能外推为文学质量或可复现发布产物，见 [验收报告](docs/product/260815-Flash真实验收报告.md) |
+| Renderer / Preload / IPC 的普通用户 GUI 闭环 | `UNVALIDATED` | 本次没有通过 UI 输入 Key，也没有验证安装包；Pro Chat 同样未调用 |
 | DSH 运行中 Session 的跨进程恢复 | `UNVALIDATED` | v1 主动禁用：rc.6 持久化会落盘 reasoning；只从 Controller 封存边界重新派发 |
 | 应用内跨作品 finding、候选三评估、采用与回滚 | `PROPOSED` | Renderer 只有诚实空态；现有 Python 治理能力尚未接成普通用户闭环 |
 | 无签名 macOS / Windows 安装包 | `PROPOSED` | 当前只完成编译和 sidecar 预检；没有可下载的 DMG、EXE 或 portable ZIP |
