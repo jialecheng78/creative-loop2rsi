@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { afterEach, describe, expect, it } from 'vitest'
@@ -57,27 +57,25 @@ describe('preview build inventory', () => {
     const packageRoot = join(parent, 'workspace', 'apps', 'desktop')
     const link = join(deployed, 'node_modules', '.pnpm', 'node_modules', '@creative-loop2rsi', 'desktop')
     await mkdir(packageRoot, { recursive: true })
-    await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: '@creative-loop2rsi/desktop' }))
     await mkdir(dirname(link), { recursive: true })
-    await symlink(packageRoot, link)
+    await symlink(relative(dirname(link), packageRoot), link)
 
     await expect(removePnpmWorkspaceSelfReference(deployed)).resolves.toBe(true)
     await expect(readFile(link)).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(removePnpmWorkspaceSelfReference(deployed)).resolves.toBe(false)
   })
 
-  it('refuses to hide an unexpected package behind the self-reference path', async () => {
+  it('refuses to hide an unexpected target behind the self-reference path', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'preview-bad-self-link-'))
     temporary.push(parent)
     const deployed = join(parent, 'deployed')
     const packageRoot = join(parent, 'unexpected')
     const link = join(deployed, 'node_modules', '.pnpm', 'node_modules', '@creative-loop2rsi', 'desktop')
     await mkdir(packageRoot, { recursive: true })
-    await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: 'unexpected-package' }))
     await mkdir(dirname(link), { recursive: true })
     await symlink(packageRoot, link)
 
-    await expect(removePnpmWorkspaceSelfReference(deployed)).rejects.toThrow('unexpected package')
+    await expect(removePnpmWorkspaceSelfReference(deployed)).rejects.toThrow('target is unexpected')
   })
 
   it('binds sidecar bytes and all tracked controller inputs to the source identity', async () => {

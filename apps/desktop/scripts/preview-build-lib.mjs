@@ -279,14 +279,13 @@ export async function removePnpmWorkspaceSelfReference(directory) {
   if (!info.isSymbolicLink()) {
     throw new Error('pnpm desktop self-reference must be a symlink')
   }
-  let packageJson
-  try {
-    packageJson = JSON.parse(await readFile(join(link, 'package.json'), 'utf8'))
-  } catch {
-    throw new Error('pnpm desktop self-reference target is invalid')
-  }
-  if (packageJson.name !== '@creative-loop2rsi/desktop') {
-    throw new Error('pnpm desktop self-reference points to an unexpected package')
+  const target = await readlink(link)
+  const targetParts = target.split(/[\\/]+/).filter(Boolean)
+  if (isAbsolute(target)
+    || targetParts.length < 2
+    || targetParts.at(-2) !== 'apps'
+    || targetParts.at(-1) !== 'desktop') {
+    throw new Error('pnpm desktop self-reference target is unexpected')
   }
   await rm(link)
   return true
