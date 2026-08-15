@@ -3,10 +3,14 @@ import { contextBridge, ipcRenderer } from 'electron'
 import {
   IPC_CHANNELS,
   type CancelWorkInput,
+  type CandidateDecisionInput,
+  type CompareCandidateInput,
   type ConfigureCredentialInput,
   type CreateSystemInput,
   type CreativeRsiApi,
   type SelectModelInput,
+  type PrepareCandidateInput,
+  type RollbackMethodInput,
   type StartWorkInput,
   type StudioEvent,
   type SubmitFeedbackInput,
@@ -41,6 +45,15 @@ const api: CreativeRsiApi = Object.freeze({
     cancel: (input: CancelWorkInput) => ipcRenderer.invoke(IPC_CHANNELS.worksCancel, input),
     submitFeedback: (input: SubmitFeedbackInput) => ipcRenderer.invoke(IPC_CHANNELS.worksSubmitFeedback, input),
     onEvent: subscribe,
+  }),
+  candidates: Object.freeze({
+    prepare: (input: PrepareCandidateInput) => ipcRenderer.invoke(IPC_CHANNELS.candidatesPrepare, input),
+    compare: (input: CompareCandidateInput) => ipcRenderer.invoke(IPC_CHANNELS.candidatesCompare, input),
+    adopt: (input: CandidateDecisionInput) => ipcRenderer.invoke(IPC_CHANNELS.candidatesAdopt, input),
+    reject: (input: CandidateDecisionInput) => ipcRenderer.invoke(IPC_CHANNELS.candidatesReject, input),
+  }),
+  releases: Object.freeze({
+    rollback: (input: RollbackMethodInput) => ipcRenderer.invoke(IPC_CHANNELS.releasesRollback, input),
   }),
   runtime: Object.freeze({
     status: async () => (await ipcRenderer.invoke(IPC_CHANNELS.appStatus)).runtime,

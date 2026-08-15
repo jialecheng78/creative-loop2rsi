@@ -16,11 +16,13 @@ import {
   type RuntimeErrorCode,
   type RuntimeEvent,
   type RuntimeRunHandle,
+  type RuntimeRole,
   type RuntimeStatus,
 } from '@creative-loop2rsi/runtime-dsh'
 
 import type {
   CredentialPublicStatus,
+  CompareCandidateInput,
   CreateSystemInput,
   ModelChoice,
   StudioEvent,
@@ -50,9 +52,17 @@ type StudioControllerOperation =
   | 'bootstrap_intent'
   | 'cancel_work'
   | 'complete_work'
+  | 'create_method_candidate'
+  | 'adopt_method_candidate'
+  | 'method_candidate_context'
+  | 'production_context'
   | 'record_feedback'
+  | 'reject_method_candidate'
   | 'resume_feedback'
   | 'seal_feedback'
+  | 'rollback_method'
+  | 'stage_method_comparisons'
+  | 'submit_method_comparison'
   | 'submit_feedback'
   | 'system_snapshot'
 
@@ -86,7 +96,7 @@ export type RuntimeSpecFactory = (input: {
   readonly workspaceDir: string
   readonly dshHome: string
   readonly sessionRoot: string
-  readonly role: 'production'
+  readonly role: RuntimeRole
   readonly model: DshModelId
   readonly gateway: { readonly url: string; readonly token: string }
   readonly maxTokens: number
@@ -143,6 +153,21 @@ interface FeedbackRecoveryTask {
   readonly promise: Promise<SystemSnapshot>
 }
 
+interface InternalModelRun {
+  readonly runtimeRunId: string
+  output: string | undefined
+  errorCode: RuntimeErrorCode | undefined
+  errorMessage: string | undefined
+  readonly completion: Promise<void>
+  resolve(): void
+  reject(error: Error): void
+}
+
+interface InternalGenerationResult {
+  readonly output: string
+  readonly runtimeProvenance: JsonRecord
+}
+
 export class StudioService {
   private readonly systemsRoot: string
   private readonly now: () => string
@@ -158,6 +183,11 @@ export class StudioService {
   private createInProgress = false
   private credentialMutationInProgress = false
   private feedbackRecoveryTask: FeedbackRecoveryTask | undefined
+  private methodOperationInProgress = false
+  private methodCancellationRequested = false
+  private methodOperationCompletion: Promise<void> | undefined
+  private internalLaunchEvents: RuntimeEvent[] | undefined
+  private internalRun: InternalModelRun | undefined
   private eventQueue: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: StudioServiceOptions) {
@@ -207,7 +237,7 @@ export class StudioService {
   }
 
   async configureCredential(apiKey: string): Promise<CredentialPublicStatus> {
-    if (this.active !== undefined || this.launchInProgress || this.credentialMutationInProgress) {
+    if (this.active !== undefined || this.launchInProgress || this.methodOperationInProgress || this.credentialMutationInProgress) {
       throw new StudioServiceError('WORK_ACTIVE', '请先结束当前创作，再更换 API Key。')
     }
     this.credentialMutationInProgress = true
@@ -242,6 +272,7 @@ export class StudioService {
     }
     this.credentialMutationInProgress = true
     try {
+      if (this.methodOperationInProgress) throw new StudioServiceError('METHOD_ACTIVE', '请等待新方式比较完成。')
       if (this.active !== undefined || this.launchInProgress) await this.cancelWork('active')
       await this.options.runtime.clearConfiguration()
       await this.options.credentials.delete()
@@ -252,7 +283,7 @@ export class StudioService {
   }
 
   async selectModel(model: ModelChoice): Promise<StudioStatus> {
-    if (this.active !== undefined || this.launchInProgress) {
+    if (this.active !== undefined || this.launchInProgress || this.methodOperationInProgress) {
       throw new StudioServiceError('WORK_ACTIVE', '请先结束当前创作，再切换模型。')
     }
     await this.options.settings.update({ selectedModel: model })
@@ -260,7 +291,7 @@ export class StudioService {
   }
 
   async createSystem(input: CreateSystemInput): Promise<SystemSnapshot> {
-    if (this.createInProgress || this.launchInProgress || this.active !== undefined) {
+    if (this.createInProgress || this.launchInProgress || this.active !== undefined || this.methodOperationInProgress) {
       throw new StudioServiceError('BUSY', '当前有操作正在进行，请稍后再试。')
     }
     this.createInProgress = true
@@ -297,6 +328,7 @@ export class StudioService {
     if (this.launchInProgress
       || this.active !== undefined
       || this.starting !== undefined
+      || this.methodOperationInProgress
       || this.credentialMutationInProgress) {
       throw new StudioServiceError('WORK_ACTIVE', '已有创作正在进行。')
     }
@@ -322,6 +354,15 @@ export class StudioService {
       const rawCreativeSystem = await this.readProjectSnapshot(project, settings.activeSystemId)
       if (rawCreativeSystem === null) throw invalidControllerResponse()
       const creativeSystem = await this.requireFeedbackRecovery(rawCreativeSystem)
+      const productionContext = await this.callController('production_context', { project })
+      const contextSha256 = requiredSha256(productionContext.context_sha256)
+      const methodVersion = requiredString(productionContext.method_version)
+      const guidance = nullableString(productionContext.guidance)
+      const guidanceSha256 = nullableSha256(productionContext.guidance_sha256)
+      if ((guidance === null) !== (guidanceSha256 === null)
+        || productionContext.initial_intent !== creativeSystem.initialIntent) {
+        throw invalidControllerResponse()
+      }
       controllerRunId = this.internalId('run')
       dispatchId = this.internalId('dispatch')
       const workId = this.internalId('work')
@@ -334,7 +375,7 @@ export class StudioService {
         loop: 'main-loop',
         dispatch_id: dispatchId,
         context_id: contextId,
-        context_sha256: creativeSystem.initialIntentSha256,
+        context_sha256: contextSha256,
         ...(creativeSystem.interruptedRun === null
           ? {}
           : { recovery_of: creativeSystem.interruptedRun.runId }),
@@ -343,12 +384,15 @@ export class StudioService {
         || begun.dispatch_id !== dispatchId
         || begun.work_id !== workId
         || begun.task_sha256 !== createHash('sha256').update(task, 'utf8').digest('hex')
-        || begun.context_sha256 !== creativeSystem.initialIntentSha256) {
+        || begun.context_sha256 !== contextSha256
+        || begun.method_version !== methodVersion
+        || (begun.method_guidance_sha256 ?? null) !== guidanceSha256) {
         throw invalidControllerResponse()
       }
       this.throwIfLaunchCancelled()
 
       lease = this.options.loopback.issueLease('production', settings.selectedModel)
+      if (lease.role !== 'production' || lease.model !== settings.selectedModel) throw invalidControllerResponse()
       const workspaceDir = join(project, 'creative-system', 'runtime', 'workspace')
       const dshHome = join(this.systemsRoot, '..', 'runtime', 'dsh-home', 'production')
       await Promise.all([
@@ -379,14 +423,14 @@ export class StudioService {
         workId,
         project,
         model: settings.selectedModel,
-        contextSha256: creativeSystem.initialIntentSha256,
+        contextSha256,
         lease,
         profileSha256,
         queuedEvents: [],
       }
       this.starting = starting
       const runtimeHandle = await this.options.runtime.startRun(
-        creationInstruction(creativeSystem.initialIntent, task),
+        creationInstruction(creativeSystem.initialIntent, task, guidance),
       )
       if (this.launchCancellationRequested) {
         await this.options.runtime.cancelRun(runtimeHandle.runId).catch(() => undefined)
@@ -467,7 +511,7 @@ export class StudioService {
   }
 
   async submitFeedback(input: SubmitFeedbackInput): Promise<SubmitFeedbackResult> {
-    if (this.active !== undefined || this.launchInProgress) {
+    if (this.active !== undefined || this.launchInProgress || this.methodOperationInProgress) {
       throw new StudioServiceError('WORK_ACTIVE', '请等待当前创作结束后再提交反馈。')
     }
     const settings = await this.options.settings.load()
@@ -515,6 +559,121 @@ export class StudioService {
     }
   }
 
+  async prepareMethodCandidate(observationId: string): Promise<SystemSnapshot> {
+    return await this.withMethodOperation(async () => {
+      const { project, systemId, model, snapshot } = await this.methodOperationContext()
+      const observation = snapshot.observations.find(item => item.id === observationId)
+      if (observation?.readyForCandidate !== true) {
+        throw new StudioServiceError('EVIDENCE_INSUFFICIENT', '这条观察还没有来自三个独立作品的证据。')
+      }
+      const candidateId = this.internalId('method')
+      const context = await this.callController('method_candidate_context', {
+        project,
+        candidate_id: candidateId,
+        observation_id: observationId,
+      })
+      if (context.heldout_included !== false || context.candidate_id !== candidateId) {
+        throw invalidControllerResponse()
+      }
+      const builderContextSha256 = requiredSha256(context.builder_context_sha256)
+      const sourceWorks = requiredRecordArray(context.source_works, 3)
+      const builder = await this.executeInternalGeneration({
+        project,
+        model,
+        role: 'candidate',
+        contextSha256: builderContextSha256,
+        instruction: methodBuilderInstruction(
+          requiredString(context.initial_intent, true),
+          requiredString(context.feedback, true),
+          nullableString(context.current_guidance),
+          sourceWorks,
+        ),
+      })
+      const guidance = normalizedGuidance(builder.output)
+      const created = await this.callController('create_method_candidate', {
+        project,
+        candidate_id: candidateId,
+        observation_id: observationId,
+        guidance,
+        builder_role_id: 'method-candidate-builder',
+        builder_context_id: `builder-context-${candidateId}`,
+        builder_task_id: `builder-task-${candidateId}`,
+        builder_attested_by: 'desktop-main-supervisor',
+        builder_provenance: builder.runtimeProvenance,
+      })
+      const plan = requiredRecord(created.evaluation_plan)
+      const targeted = requiredRecord(plan.targeted)
+      const regression = requiredRecord(plan.regression)
+      const heldout = requiredRecord(plan.heldout)
+      const initialIntent = requiredString(context.initial_intent, true)
+      const currentGuidance = nullableString(context.current_guidance)
+      const generated = {
+        targeted_candidate: await this.executeInternalGeneration({
+          project, model, role: 'candidate',
+          contextSha256: requiredSha256(targeted.candidate_context_sha256),
+          instruction: creationInstruction(initialIntent, requiredString(targeted.task, true), guidance),
+        }),
+        regression_candidate: await this.executeInternalGeneration({
+          project, model, role: 'candidate',
+          contextSha256: requiredSha256(regression.candidate_context_sha256),
+          instruction: creationInstruction(initialIntent, requiredString(regression.task, true), guidance),
+        }),
+        heldout_baseline: await this.executeInternalGeneration({
+          project, model, role: 'production',
+          contextSha256: requiredSha256(heldout.baseline_context_sha256),
+          instruction: creationInstruction(initialIntent, requiredString(heldout.task, true), currentGuidance),
+        }),
+        heldout_candidate: await this.executeInternalGeneration({
+          project, model, role: 'candidate',
+          contextSha256: requiredSha256(heldout.candidate_context_sha256),
+          instruction: creationInstruction(initialIntent, requiredString(heldout.task, true), guidance),
+        }),
+      }
+      this.throwIfMethodCancelled()
+      const staged = await this.callController('stage_method_comparisons', {
+        project,
+        candidate_id: candidateId,
+        generations: Object.fromEntries(Object.entries(generated).map(([key, value]) => [key, {
+          output: value.output,
+          runtime_provenance: value.runtimeProvenance,
+        }])),
+      })
+      if (!isPlainRecord(staged.snapshot)) throw invalidControllerResponse()
+      return parseSystemSnapshot(staged.snapshot, systemId)
+    })
+  }
+
+  async submitMethodComparison(input: CompareCandidateInput): Promise<SystemSnapshot> {
+    return await this.withMethodOperation(async () => {
+      const { project, systemId } = await this.methodOperationContext()
+      const result = await this.callController('submit_method_comparison', {
+        project,
+        candidate_id: input.candidateId,
+        phase: input.phase,
+        choice: input.choice,
+      })
+      if (!isPlainRecord(result.snapshot)) throw invalidControllerResponse()
+      return parseSystemSnapshot(result.snapshot, systemId)
+    })
+  }
+
+  async adoptMethodCandidate(candidateId: string): Promise<SystemSnapshot> {
+    return await this.methodDecision('adopt_method_candidate', candidateId)
+  }
+
+  async rejectMethodCandidate(candidateId: string): Promise<SystemSnapshot> {
+    return await this.methodDecision('reject_method_candidate', candidateId)
+  }
+
+  async rollbackMethod(version: string): Promise<SystemSnapshot> {
+    return await this.withMethodOperation(async () => {
+      const { project, systemId } = await this.methodOperationContext()
+      const result = await this.callController('rollback_method', { project, to_version: version })
+      if (!isPlainRecord(result.snapshot)) throw invalidControllerResponse()
+      return parseSystemSnapshot(result.snapshot, systemId)
+    })
+  }
+
   acceptRuntimeEvent(event: RuntimeEvent): Promise<void> {
     const operation = this.eventQueue.then(() => this.processRuntimeEvent(event))
     this.eventQueue = operation.catch(() => undefined)
@@ -535,13 +694,166 @@ export class StudioService {
       await this.options.runtime.cancelRun(active.runtimeRunId).catch(() => undefined)
       await this.finishUnsuccessful(active, 'application-closed', 'cancelled')
     }
+    if (this.methodOperationInProgress) {
+      this.methodCancellationRequested = true
+      const internal = this.internalRun
+      if (internal !== undefined) {
+        internal.reject(new StudioServiceError('APPLICATION_CLOSED', '应用已关闭，新方式比较没有完成。'))
+        await this.options.runtime.cancelRun(internal.runtimeRunId).catch(() => undefined)
+      }
+      await this.methodOperationCompletion
+    }
     this.starting?.lease.revoke()
     this.starting = undefined
     await this.options.runtime.clearConfiguration()
     await this.options.loopback.close()
   }
 
+  private async methodDecision(
+    operation: 'adopt_method_candidate' | 'reject_method_candidate',
+    candidateId: string,
+  ): Promise<SystemSnapshot> {
+    return await this.withMethodOperation(async () => {
+      const { project, systemId } = await this.methodOperationContext()
+      const result = await this.callController(operation, { project, candidate_id: candidateId })
+      if (!isPlainRecord(result.snapshot)) throw invalidControllerResponse()
+      return parseSystemSnapshot(result.snapshot, systemId)
+    })
+  }
+
+  private async methodOperationContext(): Promise<{
+    readonly project: string
+    readonly systemId: string
+    readonly model: ModelChoice
+    readonly snapshot: SystemSnapshot
+  }> {
+    const credential = await this.credentialStatus()
+    if (!credential.configured) throw new StudioServiceError('CREDENTIAL_REQUIRED', '请先连接 DeepSeek API Key。')
+    const settings = await this.options.settings.load()
+    if (settings.activeSystemId === null) throw new StudioServiceError('SYSTEM_REQUIRED', '没有可改进的创作系统。')
+    const project = this.projectPath(settings.activeSystemId)
+    const snapshot = await this.readProjectSnapshot(project, settings.activeSystemId)
+    if (snapshot === null) throw invalidControllerResponse()
+    return {
+      project,
+      systemId: settings.activeSystemId,
+      model: settings.selectedModel,
+      snapshot: await this.requireFeedbackRecovery(snapshot),
+    }
+  }
+
+  private async withMethodOperation<T>(action: () => Promise<T>): Promise<T> {
+    if (this.methodOperationInProgress || this.active !== undefined || this.launchInProgress) {
+      throw new StudioServiceError('METHOD_ACTIVE', '当前有创作或新方式比较正在进行。')
+    }
+    this.methodOperationInProgress = true
+    this.methodCancellationRequested = false
+    let resolveCompletion!: () => void
+    const completion = new Promise<void>(resolve => { resolveCompletion = resolve })
+    this.methodOperationCompletion = completion
+    try {
+      return await action()
+    } finally {
+      this.methodOperationInProgress = false
+      this.methodCancellationRequested = false
+      resolveCompletion()
+      if (this.methodOperationCompletion === completion) {
+        this.methodOperationCompletion = undefined
+      }
+    }
+  }
+
+  private async executeInternalGeneration(input: {
+    readonly project: string
+    readonly model: ModelChoice
+    readonly role: RuntimeRole
+    readonly contextSha256: string
+    readonly instruction: string
+  }): Promise<InternalGenerationResult> {
+    this.throwIfMethodCancelled()
+    const lease = this.options.loopback.issueLease(input.role, input.model)
+    if (lease.role !== input.role || lease.model !== input.model) throw invalidControllerResponse()
+    const workspaceDir = join(input.project, 'creative-system', 'runtime', `workspace-${input.role}`)
+    const dshHome = join(this.systemsRoot, '..', 'runtime', 'dsh-home', input.role)
+    let profileSha256: string | undefined
+    try {
+      await Promise.all([
+        mkdir(workspaceDir, { recursive: true }),
+        mkdir(dshHome, { recursive: true, mode: 0o700 }),
+      ])
+      const spec = this.runtimeSpecFactory({
+        nodeExecutable: this.options.nodeExecutable,
+        cwd: workspaceDir,
+        workspaceDir,
+        dshHome,
+        sessionRoot: workspaceDir,
+        role: input.role,
+        model: input.model,
+        gateway: { url: lease.url, token: lease.token },
+        maxTokens: MAX_MODEL_OUTPUT_TOKENS,
+      })
+      profileSha256 = await this.profileDigest(spec)
+      this.options.runtime.configure(spec)
+      this.internalLaunchEvents = []
+      const handle = await this.options.runtime.startRun(input.instruction)
+      const completion = createInternalCompletion(handle.runId)
+      this.internalRun = completion
+      if (this.methodCancellationRequested) {
+        completion.reject(new StudioServiceError('APPLICATION_CLOSED', '应用已关闭，新方式比较没有完成。'))
+        await this.options.runtime.cancelRun(handle.runId).catch(() => undefined)
+      }
+      const queued = this.internalLaunchEvents
+      this.internalLaunchEvents = undefined
+      for (const event of queued ?? []) await this.processInternalRuntimeEvent(event)
+      await withTimeout(completion.completion, 240_000, '新方式生成超时，本轮没有记为成功。')
+      this.throwIfMethodCancelled()
+      if (completion.output === undefined || completion.output.trim() === '') {
+        throw new StudioServiceError('EMPTY_OUTPUT', '模型没有返回可比较的内容。')
+      }
+      const provenance = validatedProvenance(lease.provenance())
+      return {
+        output: completion.output,
+        runtimeProvenance: runtimeProvenancePayload(
+          this.options.appVersion,
+          { contextSha256: input.contextSha256, model: input.model, profileSha256 },
+          provenance,
+        ),
+      }
+    } finally {
+      lease.revoke()
+      this.internalLaunchEvents = undefined
+      this.internalRun = undefined
+      await this.options.runtime.stop().catch(() => undefined)
+    }
+  }
+
+  private async processInternalRuntimeEvent(event: RuntimeEvent): Promise<boolean> {
+    const internal = this.internalRun
+    if (internal === undefined) {
+      if (this.internalLaunchEvents !== undefined) {
+        this.internalLaunchEvents.push(event)
+        return true
+      }
+      return false
+    }
+    if (event.runId !== internal.runtimeRunId) return false
+    if (event.type === 'output') internal.output = event.text
+    if (event.type === 'error') {
+      internal.errorCode = event.code
+      internal.errorMessage = event.message
+    }
+    if (event.type === 'state' && event.state === 'completed') internal.resolve()
+    if (event.type === 'state' && (event.state === 'failed' || event.state === 'cancelled')) {
+      internal.reject(new StudioServiceError(
+        internal.errorCode ?? 'RUNTIME_FAILED',
+        internal.errorMessage ?? '新方式生成没有完成。',
+      ))
+    }
+    return true
+  }
+
   private async processRuntimeEvent(event: RuntimeEvent): Promise<void> {
+    if (await this.processInternalRuntimeEvent(event)) return
     const active = this.active
     if (active === undefined) {
       if (this.starting !== undefined) this.starting.queuedEvents.push(event)
@@ -796,6 +1108,12 @@ export class StudioService {
       throw new StudioServiceError('LAUNCH_CANCELLED', '本次创作已停止。')
     }
   }
+
+  private throwIfMethodCancelled(): void {
+    if (this.methodCancellationRequested) {
+      throw new StudioServiceError('APPLICATION_CLOSED', '应用已关闭，新方式比较没有完成。')
+    }
+  }
 }
 
 export class StudioServiceError extends Error {
@@ -954,6 +1272,8 @@ function parseSystemSnapshot(value: JsonRecord, expectedSystemId: string): Syste
       humanAccepted: nullableBoolean(lastWorkValue.human_accepted),
       humanDirection: direction,
       decision: nullableString(lastWorkValue.decision),
+      methodVersion: requiredString(lastWorkValue.method_version),
+      methodGuidanceSha256: nullableSha256(lastWorkValue.method_guidance_sha256),
     }
   }
   const initialIntent = requiredString(value.initial_intent, true)
@@ -967,6 +1287,29 @@ function parseSystemSnapshot(value: JsonRecord, expectedSystemId: string): Syste
   const feedbackRecoveryRequired = requiredBoolean(value.feedback_recovery_required)
   const pendingFeedback = parsePendingFeedback(value.pending_feedback)
   if (feedbackRecoveryRequired !== (pendingFeedback !== null)) throw invalidControllerResponse()
+  const learning = requiredRecord(value.learning)
+  const observations = requiredRecordArray(learning.observations).map(item => ({
+    id: requiredString(item.id),
+    findingCode: requiredString(item.finding_code),
+    feedback: requiredString(item.feedback, true),
+    independentWorks: requiredNonNegativeNumber(item.independent_works),
+    independentRuns: requiredNonNegativeNumber(item.independent_runs),
+    independentTasks: requiredNonNegativeNumber(item.independent_tasks),
+    readyForCandidate: requiredBoolean(item.ready_for_candidate),
+  }))
+  const adoptedPrinciples = requiredRecordArray(learning.adopted_principles).map(item => ({
+    version: requiredString(item.version),
+    guidance: requiredString(item.guidance, true),
+    adoptedAt: requiredString(item.adopted_at),
+    active: requiredBoolean(item.active),
+  }))
+  const methodValue = requiredRecord(value.method)
+  const method = {
+    activeVersion: requiredString(methodValue.active_version),
+    activeGuidance: nullableString(methodValue.active_guidance),
+    history: requiredRecordArray(methodValue.history).map(parseMethodHistory),
+  }
+  const methodCandidates = requiredRecordArray(value.method_candidates).map(parseMethodCandidate)
   return {
     systemId,
     displayName: requiredString(value.display_name),
@@ -980,6 +1323,47 @@ function parseSystemSnapshot(value: JsonRecord, expectedSystemId: string): Syste
     interruptedRun,
     feedbackRecoveryRequired,
     pendingFeedback,
+    observations,
+    adoptedPrinciples,
+    method,
+    methodCandidates,
+  }
+}
+
+function parseMethodHistory(value: JsonRecord): SystemSnapshot['method']['history'][number] {
+  const action = value.action
+  if (action !== 'PROMOTE' && action !== 'ROLLBACK') throw invalidControllerResponse()
+  return {
+    action,
+    version: requiredString(value.version),
+    previousVersion: requiredString(value.previous_version),
+    createdAt: requiredString(value.created_at),
+  }
+}
+
+function parseMethodCandidate(value: JsonRecord): SystemSnapshot['methodCandidates'][number] {
+  const comparisons = requiredRecordArray(value.comparisons).map(item => {
+    const phase = item.phase
+    const choice = item.choice
+    if (phase !== 'targeted' && phase !== 'regression' && phase !== 'heldout') throw invalidControllerResponse()
+    if (choice !== null && choice !== undefined && choice !== 'A' && choice !== 'B' && choice !== 'TIE') {
+      throw invalidControllerResponse()
+    }
+    return {
+      phase: phase as 'targeted' | 'regression' | 'heldout',
+      left: requiredString(item.left, true),
+      right: requiredString(item.right, true),
+      choice: (choice ?? null) as 'A' | 'B' | 'TIE' | null,
+    }
+  })
+  return {
+    id: requiredString(value.id),
+    title: requiredString(value.title),
+    summary: requiredString(value.summary, true),
+    tradeoff: requiredString(value.tradeoff, true),
+    status: requiredString(value.status),
+    ready: requiredBoolean(value.ready),
+    comparisons,
   }
 }
 
@@ -1026,17 +1410,98 @@ function defaultDisplayName(intent: string): string {
   return beginning.length < compact.length ? `${beginning}…` : beginning
 }
 
-function creationInstruction(initialIntent: string, task: string): string {
+function creationInstruction(initialIntent: string, task: string, guidance: string | null = null): string {
   return [
     '完成下面的创意写作任务。',
     '只输出可供用户直接阅读和编辑的成品，不解释过程，不把推测的偏好写成永久规则。',
     '',
     '用户首次确认的创作方向（保留原意，不扩写为新规则）：',
     initialIntent,
+    ...(guidance === null
+      ? []
+      : [
+          '',
+          '用户已经通过盲比并明确采用的当前创作方法（必须用于本次作品）：',
+          guidance,
+        ]),
     '',
     '本次任务：',
     task,
   ].join('\n')
+}
+
+function methodBuilderInstruction(
+  initialIntent: string,
+  feedback: string,
+  currentGuidance: string | null,
+  sourceWorks: readonly JsonRecord[],
+): string {
+  const evidence = sourceWorks.map((work, index) => [
+    `作品 ${index + 1} 任务：${requiredString(work.task, true)}`,
+    `作品 ${index + 1} 文本：${requiredString(work.output, true)}`,
+  ].join('\n')).join('\n\n')
+  return [
+    '你是创作方法候选 Builder。根据三个独立作品上完全相同的用户明确反馈，提出一条可执行、可复用的创作指导。',
+    '只输出这条指导本身，最多三句话；不得输出标题、代码、JSON、评价结论或 held-out 内容。',
+    '',
+    `创作方向：${initialIntent}`,
+    `用户重复反馈：${feedback}`,
+    `当前已采用指导：${currentGuidance ?? '无，使用通用起步方法'}`,
+    '',
+    evidence,
+  ].join('\n')
+}
+
+function normalizedGuidance(value: string): string {
+  const result = value.trim()
+  if (result === '' || Buffer.byteLength(result, 'utf8') > 2_000 || result.includes('```') || /<script/iu.test(result)) {
+    throw new StudioServiceError('CANDIDATE_INVALID', '模型没有返回可安全比较的声明式创作指导。')
+  }
+  return result
+}
+
+function createInternalCompletion(runId: string): InternalModelRun {
+  let resolvePromise!: () => void
+  let rejectPromise!: (error: Error) => void
+  const completion = new Promise<void>((resolve, reject) => {
+    resolvePromise = resolve
+    rejectPromise = reject
+  })
+  return {
+    runtimeRunId: runId,
+    output: undefined,
+    errorCode: undefined,
+    errorMessage: undefined,
+    completion,
+    resolve: resolvePromise,
+    reject: rejectPromise,
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new StudioServiceError('RUNTIME_TIMEOUT', message)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+function requiredRecord(value: unknown): JsonRecord {
+  if (!isPlainRecord(value)) throw invalidControllerResponse()
+  return value
+}
+
+function requiredRecordArray(value: unknown, exactLength?: number): readonly JsonRecord[] {
+  if (!Array.isArray(value) || (exactLength !== undefined && value.length !== exactLength)) {
+    throw invalidControllerResponse()
+  }
+  return value.map(requiredRecord)
 }
 
 function notBefore(now: string, boundary: string | null): string {
@@ -1071,6 +1536,11 @@ function nullableString(value: unknown): string | null {
 function requiredBoolean(value: unknown): boolean {
   if (typeof value !== 'boolean') throw invalidControllerResponse()
   return value
+}
+
+function requiredNonNegativeNumber(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw invalidControllerResponse()
+  return value as number
 }
 
 function nullableBoolean(value: unknown): boolean | null {

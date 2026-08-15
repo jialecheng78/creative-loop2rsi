@@ -9,8 +9,10 @@ import type {
 import {
   adoptNewMethod,
   cancelWork,
+  compareNewMethod,
   configureCredential,
   getStudioStatus,
+  prepareNewMethod,
   rejectNewMethod,
   rollbackMethod,
   selectModel,
@@ -309,6 +311,7 @@ export function App(): React.JSX.Element {
             onStop={() => void stopCreation()}
             onSubmitFeedback={action => void submitFeedback(action)}
             onRetryRecovery={() => void retryFeedbackRecovery()}
+            onStatusChange={setStatus}
             output={output}
             reviewClosed={reviewClosed}
             recoveryBusy={recoveryBusy}
@@ -517,6 +520,7 @@ function StudioView(props: {
   readonly onStop: () => void
   readonly onSubmitFeedback: (action: FeedbackAction) => void
   readonly onRetryRecovery: () => void
+  readonly onStatusChange: (status: StudioViewStatus) => void
   readonly output: string
   readonly reviewClosed: boolean
   readonly recoveryBusy: boolean
@@ -526,9 +530,9 @@ function StudioView(props: {
   readonly topic: string
   readonly workState: WorkState
 }): React.JSX.Element {
-  if (props.section === 'learning') return <LearningPage status={props.status} />
-  if (props.section === 'new-methods') return <NewMethodsPage status={props.status} />
-  if (props.section === 'versions') return <VersionsPage status={props.status} />
+  if (props.section === 'learning') return <LearningPage onStatusChange={props.onStatusChange} status={props.status} />
+  if (props.section === 'new-methods') return <NewMethodsPage onStatusChange={props.onStatusChange} status={props.status} />
+  if (props.section === 'versions') return <VersionsPage onStatusChange={props.onStatusChange} status={props.status} />
   return <CreationPage {...props} />
 }
 
@@ -651,7 +655,7 @@ function CreationPage(props: Parameters<typeof StudioView>[0]): React.JSX.Elemen
                   type="button"
                 >不采用这个版本</button>
               </div>
-              <p className="decision-help">保留、拒绝、文字修改和明确反馈会先保存为证据；当前预览尚不会自动改变下一次创作。</p>
+              <p className="decision-help">保留、拒绝、文字修改和明确反馈会先保存为证据。只有同类反馈来自三项独立创作，并经过三组盲比且由你采用，才会改变下一次创作。</p>
             </aside>
           </div>}
 
@@ -666,73 +670,122 @@ function CreationPage(props: Parameters<typeof StudioView>[0]): React.JSX.Elemen
   )
 }
 
-function LearningPage({ status }: { readonly status: StudioViewStatus | undefined }): React.JSX.Element {
+function LearningPage(props: {
+  readonly onStatusChange: (status: StudioViewStatus) => void
+  readonly status: StudioViewStatus | undefined
+}): React.JSX.Element {
+  const status = props.status
   const observations = status?.learning?.observations ?? []
   const principles = status?.learning?.adoptedPrinciples ?? []
+  const [busyId, setBusyId] = useState<string>()
+  const [notice, setNotice] = useState('')
+
+  async function prepare(observationId: string): Promise<void> {
+    if (busyId !== undefined) return
+    setBusyId(observationId)
+    setNotice('正在生成一种新方法和三组盲比内容。这会调用 Flash/Pro，但不会自动改变当前方法…')
+    try {
+      const nextStatus = await prepareNewMethod(observationId)
+      props.onStatusChange(nextStatus)
+      setNotice('三组盲比已准备好。请前往“新方式”，只按作品本身作选择。')
+    } catch (caught) {
+      setNotice(actionableError(caught))
+    } finally {
+      setBusyId(undefined)
+    }
+  }
+
   return (
     <section className="page-view">
       <header className="page-header prose-header">
         <div>
           <p className="eyebrow">它学到了什么</p>
           <h1>你仍然拥有最后决定权</h1>
-          <p>当前预览只保存你的明确反馈证据，尚不会自动提炼或采用创作原则。</p>
+          <p>系统只整理你在不同作品中反复给出的明确反馈。它可以提出新方法，但不能替你采用。</p>
         </div>
       </header>
       <div className="two-column-cards">
-        <EvidenceList
-          description="未来版本会把重复证据整理成暂时观察；当前预览不会自动生成。"
-          empty="还没有暂时观察。当前预览只保存反馈证据，不会自动在这里生成内容。"
-          items={observations}
-          tone="observation"
-          title="暂时观察"
-        />
-        <EvidenceList
-          description="未来可由你亲自选择、持续影响新作品的原则。"
-          empty="还没有已采用原则。当前预览没有采用入口，也不会把自己的猜测变成规则。"
-          items={principles}
-          tone="principle"
-          title="已采用原则"
-        />
+        <section className="evidence-card observation">
+          <div className="card-heading">
+            <div><h2>暂时观察</h2><p>同一句反馈必须来自三项独立创作，才有资格提出候选方法。</p></div>
+            <span>{observations.length}</span>
+          </div>
+          {observations.length === 0
+            ? <EmptyState text="还没有重复观察。先完成作品并提交明确反馈；单个作品不会改变全局方法。" />
+            : <ul className="evidence-items">{observations.map(item => (
+                <li key={item.id}>
+                  <strong>{item.feedback}</strong>
+                  <span>{item.independentWorks}/3 项独立创作</span>
+                  <button
+                    className="secondary-button"
+                    disabled={!item.readyForCandidate || busyId !== undefined}
+                    onClick={() => void prepare(item.id)}
+                    type="button"
+                  >{busyId === item.id ? '正在准备盲比…' : item.readyForCandidate ? '提出并比较新方法' : '证据不足'}</button>
+                </li>
+              ))}</ul>}
+        </section>
+        <section className="evidence-card principle">
+          <div className="card-heading">
+            <div><h2>已采用原则</h2><p>只有你完成盲比并点击采用的原则，才会进入后续创作。</p></div>
+            <span>{principles.length}</span>
+          </div>
+          {principles.length === 0
+            ? <EmptyState text="还没有已采用原则。系统的观察和候选不会自动成为规则。" />
+            : <ul className="evidence-items">{principles.map(item => (
+                <li key={`${item.version}-${item.adoptedAt}`}>
+                  <strong>{item.guidance}</strong>
+                  <span>{item.active ? '当前正在使用' : '已保留在历史中'}</span>
+                </li>
+              ))}</ul>}
+        </section>
       </div>
+      <p aria-live="polite" className="section-notice" role="status">{notice}</p>
     </section>
   )
 }
 
-function EvidenceList(props: {
-  readonly description: string
-  readonly empty: string
-  readonly items: readonly string[]
-  readonly title: string
-  readonly tone: 'observation' | 'principle'
+function NewMethodsPage(props: {
+  readonly onStatusChange: (status: StudioViewStatus) => void
+  readonly status: StudioViewStatus | undefined
 }): React.JSX.Element {
-  return (
-    <section className={`evidence-card ${props.tone}`}>
-      <div className="card-heading">
-        <div>
-          <h2>{props.title}</h2>
-          <p>{props.description}</p>
-        </div>
-        <span>{props.items.length}</span>
-      </div>
-      {props.items.length === 0
-        ? <EmptyState text={props.empty} />
-        : <ul>{props.items.map(item => <li key={item}>{item}</li>)}</ul>}
-    </section>
-  )
-}
-
-function NewMethodsPage({ status }: { readonly status: StudioViewStatus | undefined }): React.JSX.Element {
+  const status = props.status
   const methods = status?.newMethods ?? []
   const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
 
   async function decide(id: string, action: 'adopt' | 'reject'): Promise<void> {
+    if (busy) return
+    setBusy(true)
     setNotice('正在保存你的决定…')
     try {
-      if (action === 'adopt') await adoptNewMethod(id)
-      else await rejectNewMethod(id)
+      const nextStatus = action === 'adopt' ? await adoptNewMethod(id) : await rejectNewMethod(id)
+      props.onStatusChange(nextStatus)
       setNotice(action === 'adopt' ? '已采用新方式，并保留了回到旧方式的入口。' : '已拒绝，新方式没有影响当前创作。')
     } catch (caught) {
       setNotice(actionableError(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function compare(
+    candidateId: string,
+    phase: 'targeted' | 'regression' | 'heldout',
+    choice: 'A' | 'B' | 'TIE',
+  ): Promise<void> {
+    if (busy) return
+    setBusy(true)
+    setNotice('正在保存这组盲比选择…')
+    try {
+      const nextStatus = await compareNewMethod(candidateId, phase, choice)
+      props.onStatusChange(nextStatus)
+      const next = nextStatus.newMethods?.find(item => item.id === candidateId)
+      setNotice(next?.ready === true ? '三组盲比已完成。现在可以查看候选说明并作最终决定。' : '这一组已保存，请继续下一组。')
+    } catch (caught) {
+      setNotice(actionableError(caught))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -750,42 +803,72 @@ function NewMethodsPage({ status }: { readonly status: StudioViewStatus | undefi
             <span aria-hidden="true" className="empty-symbol">↗</span>
             <h2>目前没有等待决定的新方式</h2>
             <p>这不是故障。证据不足时，保持现有方法比仓促改变更可靠。</p>
-            <div className="disabled-preview" aria-label="新方式出现后的可用操作">
-              <button disabled type="button">采用新方式</button>
-              <button disabled type="button">继续观察</button>
-              <button disabled type="button">拒绝</button>
-            </div>
+            <p>当“它学到了什么”里出现 3/3 的观察后，你可以在那里发起候选。</p>
           </section>
         : <div className="method-list">
-            {methods.map(method => (
-              <article className="method-card" key={method.id}>
-                <span>{method.status === 'ready' ? '可以决定' : '继续观察中'}</span>
-                <h2>{method.title}</h2>
-                <p>{method.summary}</p>
-                {method.tradeoff === undefined ? null : <p className="tradeoff">可能的代价：{method.tradeoff}</p>}
-                <div>
-                  <button className="primary-button" disabled={method.status !== 'ready'} onClick={() => void decide(method.id, 'adopt')} type="button">采用新方式</button>
-                  <button className="secondary-button" onClick={() => void decide(method.id, 'reject')} type="button">拒绝</button>
-                </div>
-              </article>
-            ))}
+            {methods.map(method => {
+              const unanswered = method.comparisons.find(item => item.choice === null)
+              const answered = method.comparisons.filter(item => item.choice !== null).length
+              const adoptionIncomplete = method.status === 'PROMOTED'
+                && status?.method?.activeVersion !== method.id
+              const decided = method.status === 'REJECTED'
+                || (method.status === 'PROMOTED' && !adoptionIncomplete)
+              return (
+                <article className="method-card" key={method.id}>
+                  <span>{adoptionIncomplete ? '等待完成采用' : decided ? (method.status === 'PROMOTED' ? '已采用' : '已拒绝') : method.ready ? '可以决定' : `盲比 ${answered + 1}/3`}</span>
+                  {unanswered === undefined
+                    ? <>
+                        <h2>{method.title}</h2>
+                        <p>{method.summary}</p>
+                        <p className="tradeoff">可能的代价：{method.tradeoff}</p>
+                        <div>
+                          <button className="primary-button" disabled={(!method.ready && !adoptionIncomplete) || busy || decided} onClick={() => void decide(method.id, 'adopt')} type="button">{adoptionIncomplete ? '完成采用' : '采用新方式'}</button>
+                          <button className="secondary-button" disabled={busy || decided} onClick={() => void decide(method.id, 'reject')} type="button">拒绝</button>
+                        </div>
+                      </>
+                    : <>
+                        <h2>{comparisonLabel(unanswered.phase)}</h2>
+                        <p>只比较作品，不会告诉你哪一边使用了候选方法。你的选择保存后不能改写。</p>
+                        <div className="blind-comparison">
+                          <section><span>版本 A</span><p>{unanswered.left}</p></section>
+                          <section><span>版本 B</span><p>{unanswered.right}</p></section>
+                        </div>
+                        <div className="comparison-actions">
+                          <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'A')} type="button">A 更好</button>
+                          <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'TIE')} type="button">差不多</button>
+                          <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'B')} type="button">B 更好</button>
+                        </div>
+                      </>}
+                </article>
+              )
+            })}
           </div>}
       <p aria-live="polite" className="section-notice" role="status">{notice}</p>
     </section>
   )
 }
 
-function VersionsPage({ status }: { readonly status: StudioViewStatus | undefined }): React.JSX.Element {
+function VersionsPage(props: {
+  readonly onStatusChange: (status: StudioViewStatus) => void
+  readonly status: StudioViewStatus | undefined
+}): React.JSX.Element {
+  const status = props.status
   const history = status?.method?.history ?? []
   const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
 
   async function rollback(id: string): Promise<void> {
+    if (busy) return
+    setBusy(true)
     setNotice('正在恢复旧方式…')
     try {
-      await rollbackMethod(id)
+      const nextStatus = await rollbackMethod(id)
+      props.onStatusChange(nextStatus)
       setNotice('已恢复旧方式，历史记录仍然保留。')
     } catch (caught) {
       setNotice(actionableError(caught))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -818,9 +901,17 @@ function VersionsPage({ status }: { readonly status: StudioViewStatus | undefine
           ? <EmptyState text="还没有历史变化，因此现在没有可回退的版本。" />
           : <ol className="version-list">
               {history.map(item => (
-                <li key={item.id}>
-                  <div><strong>{item.label}</strong>{item.adoptedAt === undefined ? null : <time>{item.adoptedAt}</time>}</div>
-                  <button className="secondary-button" onClick={() => void rollback(item.id)} type="button">恢复这个版本</button>
+                <li key={`${item.action}-${item.version}-${item.createdAt}`}>
+                  <div>
+                    <strong>{item.action === 'PROMOTE' ? `采用 ${item.version}` : `回滚到 ${item.version}`}</strong>
+                    <time>{item.createdAt}</time>
+                  </div>
+                  <button
+                    className="secondary-button"
+                    disabled={busy || item.previousVersion === status?.method?.activeVersion}
+                    onClick={() => void rollback(item.previousVersion)}
+                    type="button"
+                  >恢复改变前的方法</button>
                 </li>
               ))}
             </ol>}
@@ -828,6 +919,12 @@ function VersionsPage({ status }: { readonly status: StudioViewStatus | undefine
       <p aria-live="polite" className="section-notice" role="status">{notice}</p>
     </section>
   )
+}
+
+function comparisonLabel(phase: 'targeted' | 'regression' | 'heldout'): string {
+  if (phase === 'targeted') return '比较 1：它是否解决了重复问题'
+  if (phase === 'regression') return '比较 2：它有没有伤害原本正常的作品'
+  return '比较 3：在未参与改进的新任务上是否仍然成立'
 }
 
 function EmptyState({ text }: { readonly text: string }): React.JSX.Element {

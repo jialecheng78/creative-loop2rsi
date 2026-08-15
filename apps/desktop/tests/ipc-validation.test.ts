@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest'
 
 import {
   validateCancelWorkInput,
+  validateCandidateDecisionInput,
+  validateCompareCandidateInput,
   validateCreateSystemInput,
   validateCredentialInput,
   validateFeedbackInput,
   validateModelInput,
+  validatePrepareCandidateInput,
+  validateRollbackMethodInput,
   validateStartWorkInput,
 } from '../src/main/ipc-validation.js'
 
@@ -46,5 +50,28 @@ describe('business IPC validation', () => {
     expect(validateCancelWorkInput({ runId: 'run-1234-abcd' })).toEqual({ runId: 'run-1234-abcd' })
     expect(validateCancelWorkInput({ runId: 'active' })).toEqual({ runId: 'active' })
     expect(() => validateCancelWorkInput({ runId: '../../run' })).toThrow()
+  })
+
+  it('keeps method candidate, blind comparison, and rollback IPC narrow', () => {
+    expect(validatePrepareCandidateInput({ observationId: 'app-feedback-one' })).toEqual({
+      observationId: 'app-feedback-one',
+    })
+    expect(validateCompareCandidateInput({
+      candidateId: 'method-one', phase: 'heldout', choice: 'TIE',
+    })).toEqual({ candidateId: 'method-one', phase: 'heldout', choice: 'TIE' })
+    expect(validateCandidateDecisionInput({ candidateId: 'method-one' })).toEqual({
+      candidateId: 'method-one',
+    })
+    expect(validateRollbackMethodInput({ version: 'baseline-v1' })).toEqual({
+      version: 'baseline-v1',
+    })
+    expect(() => validateCompareCandidateInput({
+      candidateId: 'method-one', phase: 'heldout', choice: 'A', mapping: 'candidate=A',
+    })).toThrow()
+    expect(() => validateCompareCandidateInput({
+      candidateId: 'method-one', phase: 'unknown', choice: 'A',
+    })).toThrow()
+    expect(() => validateCandidateDecisionInput({ candidateId: '../../method' })).toThrow()
+    expect(() => validateRollbackMethodInput({ version: '/tmp/version' })).toThrow()
   })
 })

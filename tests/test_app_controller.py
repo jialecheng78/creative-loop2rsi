@@ -100,20 +100,26 @@ class AppControllerTests(unittest.TestCase):
         return begun, artifact
 
     @staticmethod
-    def runtime_provenance(*, completed_at="2026-08-14T00:00:00Z"):
+    def runtime_provenance(
+        *,
+        completed_at="2026-08-14T00:00:00Z",
+        context_sha256=None,
+        model="deepseek-v4-pro",
+        fingerprint="fp-synthetic-v1",
+        response_id="response-synthetic-one",
+    ):
         usage = {
             "prompt_tokens": 120,
             "completion_tokens": 300,
             "total_tokens": 420,
         }
         return {
-            "context_sha256": hashlib.sha256(
-                "写克制的近未来悬疑故事".encode("utf-8")
-            ).hexdigest(),
-            "requested_model": "deepseek-v4-pro",
-            "returned_model": "deepseek-v4-pro",
-            "system_fingerprint": "fp-synthetic-v1",
-            "response_id": "response-synthetic-one",
+            "context_sha256": context_sha256
+            or hashlib.sha256("写克制的近未来悬疑故事".encode("utf-8")).hexdigest(),
+            "requested_model": model,
+            "returned_model": model,
+            "system_fingerprint": fingerprint,
+            "response_id": response_id,
             "completed_at": completed_at,
             "parameters": {
                 "thinking": "enabled",
@@ -132,9 +138,9 @@ class AppControllerTests(unittest.TestCase):
                     "status": "COMPLETED",
                     "http_status": 200,
                     "error_code": None,
-                    "response_id": "response-synthetic-one",
-                    "returned_model": "deepseek-v4-pro",
-                    "system_fingerprint": "fp-synthetic-v1",
+                    "response_id": response_id,
+                    "returned_model": model,
+                    "system_fingerprint": fingerprint,
                     "usage": usage,
                 }
             ],
@@ -877,6 +883,238 @@ class AppControllerTests(unittest.TestCase):
                     "feedback_at": "2026-08-14T00:00:00Z",
                 },
             )
+
+    def test_minimum_app_method_loop_requires_three_works_and_binds_next_work(self):
+        project, _ = self.bootstrap()
+        feedback_text = "减少解释性句子，让人物通过可见行动推进情节。"
+        source_runs = []
+        for number in range(1, 4):
+            run_id = f"method-run-{number}"
+            work_id = f"method-work-{number}"
+            task = f"创作第 {number} 个相互独立的近未来悬疑短篇"
+            begun = self.request(
+                "begin_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "work_id": work_id,
+                    "task": task,
+                },
+            )
+            completed = self.request(
+                "complete_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "output": f"第 {number} 个基线作品：人物解释了来龙去脉。",
+                    "runtime_provenance": self.runtime_provenance(
+                        response_id=f"response-source-{number}"
+                    ),
+                },
+            )
+            self.request(
+                "submit_feedback",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "action": "rewrite",
+                    "feedback_at": completed["review_available_at"],
+                    "feedback_text": feedback_text,
+                    "machine_direction": "UNKNOWN",
+                },
+            )
+            source_runs.append((run_id, work_id, task, begun))
+
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        ready = [
+            item
+            for item in snapshot["learning"]["observations"]
+            if item["ready_for_candidate"]
+        ]
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0]["independent_works"], 3)
+        self.assertEqual(ready[0]["independent_runs"], 3)
+        self.assertEqual(ready[0]["independent_tasks"], 3)
+
+        candidate_id = "method-action-first-v1"
+        context = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": ready[0]["id"],
+            },
+        )
+        self.assertFalse(context["heldout_included"])
+        self.assertNotIn("heldout_task", context)
+        self.assertNotIn("heldout_output", context)
+        self.assertEqual(len(context["source_works"]), 3)
+        guidance = "优先用人物可见的选择、动作与后果推进情节；仅在动作无法表达必要因果时保留一句解释。"
+        created = self.request(
+            "create_method_candidate",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": ready[0]["id"],
+                "guidance": guidance,
+                "builder_role_id": "method-candidate-builder",
+                "builder_context_id": "method-builder-context-one",
+                "builder_task_id": "method-builder-task-one",
+                "builder_attested_by": "local-main-supervisor",
+                "builder_provenance": self.runtime_provenance(
+                    context_sha256=context["builder_context_sha256"],
+                    response_id="response-method-builder",
+                ),
+            },
+        )
+        plan = created["evaluation_plan"]
+
+        def generation(output, expected_context, suffix):
+            return {
+                "output": output,
+                "runtime_provenance": self.runtime_provenance(
+                    context_sha256=expected_context,
+                    response_id=f"response-method-{suffix}",
+                ),
+            }
+
+        staged = self.request(
+            "stage_method_comparisons",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "generations": {
+                    "targeted_candidate": generation(
+                        "目标候选：她没有解释，只把停用的门卡递给警卫。",
+                        plan["targeted"]["candidate_context_sha256"],
+                        "targeted",
+                    ),
+                    "regression_candidate": generation(
+                        "回归候选：他关掉广播，亲手撕掉了通行名单。",
+                        plan["regression"]["candidate_context_sha256"],
+                        "regression",
+                    ),
+                    "heldout_baseline": generation(
+                        "留出基线：人物说明自己为什么必须离开。",
+                        plan["heldout"]["baseline_context_sha256"],
+                        "heldout-baseline",
+                    ),
+                    "heldout_candidate": generation(
+                        "留出候选：她把最后一张返程票塞进陌生人的口袋。",
+                        plan["heldout"]["candidate_context_sha256"],
+                        "heldout-candidate",
+                    ),
+                },
+            },
+        )
+        self.assertEqual(staged["lifecycle"], "EVALUATING")
+        with self.assertRaises(AppRequestError):
+            self.request(
+                "adopt_method_candidate",
+                {"project": str(project), "candidate_id": candidate_id},
+            )
+
+        for phase in ("targeted", "regression", "heldout"):
+            mapping = self.read_json(
+                project
+                / "creative-system"
+                / "app-methods"
+                / "candidates"
+                / candidate_id
+                / "comparisons"
+                / phase
+                / "mapping.json"
+            )
+            decision = self.request(
+                "submit_method_comparison",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "phase": phase,
+                    "choice": mapping["candidate_label"],
+                },
+            )
+        self.assertEqual(decision["lifecycle"], "READY_FOR_HUMAN")
+
+        targeted_decision = (
+            project
+            / "creative-system"
+            / "app-methods"
+            / "candidates"
+            / candidate_id
+            / "comparisons"
+            / "targeted"
+            / "decision.json"
+        )
+        original_decision = targeted_decision.read_bytes()
+        damaged_decision = self.read_json(targeted_decision)
+        damaged_decision["choice"] = "TIE"
+        self.write_json(targeted_decision, damaged_decision)
+        with self.assertRaises(AppRequestError):
+            self.request("system_snapshot", {"project": str(project)})
+        targeted_decision.write_bytes(original_decision)
+
+        with mock.patch.object(
+            app_service,
+            "_write_method_registry",
+            side_effect=RuntimeError("synthetic registry crash"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "synthetic registry crash"):
+                self.request(
+                    "adopt_method_candidate",
+                    {"project": str(project), "candidate_id": candidate_id},
+                )
+        still_stable = self.request("production_context", {"project": str(project)})
+        self.assertEqual(still_stable["method_version"], "baseline-v1")
+        adopted = self.request(
+            "adopt_method_candidate",
+            {"project": str(project), "candidate_id": candidate_id},
+        )
+        self.assertFalse(adopted["formal_l4"])
+        production = self.request("production_context", {"project": str(project)})
+        self.assertEqual(production["method_version"], candidate_id)
+        self.assertEqual(production["guidance"], guidance)
+
+        fourth = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "method-run-four",
+                "work_id": "method-work-four",
+                "task": "创作第四个独立近未来悬疑短篇",
+                "context_sha256": production["context_sha256"],
+            },
+        )
+        fourth_run = self.read_json(
+            project / "creative-system/runs/method-run-four/run.json"
+        )
+        fourth_task = self.read_json(project / fourth["task_receipt"])
+        self.assertEqual(fourth_run["app_method_version_at_start"], candidate_id)
+        self.assertEqual(fourth_task["method_version"], candidate_id)
+        self.assertEqual(
+            fourth_task["method_guidance_sha256"], production["guidance_sha256"]
+        )
+
+        rolled_back = self.request(
+            "rollback_method",
+            {"project": str(project), "to_version": "baseline-v1"},
+        )
+        self.assertEqual(rolled_back["active_method_version"], "baseline-v1")
+        final_snapshot = rolled_back["snapshot"]
+        self.assertTrue(
+            any(
+                item.get("action") == "PROMOTE" and item.get("version") == candidate_id
+                for item in final_snapshot["method"]["history"]
+            )
+        )
+        self.assertTrue(
+            any(
+                item.get("action") == "ROLLBACK"
+                for item in final_snapshot["method"]["history"]
+            )
+        )
+        audit = self.command("audit", project)
+        self.assertNotEqual(audit["provable_maturity"], "L4")
 
     def test_progressive_candidate_requires_three_distinct_works_not_three_runs(self):
         project, _ = self.bootstrap()

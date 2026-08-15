@@ -92,7 +92,7 @@ describe('desktop security defaults', () => {
         expect(report).toMatchObject({
           status: 'PASS',
           preload_error: false,
-          api_keys: ['credentials', 'getStatus', 'model', 'runtime', 'systems', 'works'],
+          api_keys: ['candidates', 'credentials', 'getStatus', 'model', 'releases', 'runtime', 'systems', 'works'],
           network_requests: 0,
           raw_globals_exposed: false,
           renderer_visible_text: true,

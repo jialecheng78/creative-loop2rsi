@@ -7,6 +7,7 @@ import type {
   DshRuntimeLaunchSpec,
   RuntimeEvent,
   RuntimeRunHandle,
+  RuntimeRole,
   RuntimeStatus,
 } from '@creative-loop2rsi/runtime-dsh'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -204,6 +205,66 @@ describe('StudioService governed alpha loop', () => {
     expect(fixture.runtime.lastInput).toContain('第二个作品')
     expect(fixture.runtime.lastInput).toContain('不把推测的偏好写成永久规则')
     await fixture.service.cancelWork(second.runId)
+  })
+
+  it('builds exact-three blind comparisons, adopts a method, and injects it into the next work', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    for (let index = 0; index < 5; index += 1) {
+      await vi.waitFor(() => expect(fixture.runtime.inputs.length).toBe(index + 1))
+      const handle = fixture.runtime.handles[index]
+      expect(handle).toBeDefined()
+      const output = index === 0
+        ? '优先用人物可见的选择、动作与后果推进情节；只在动作无法表达必要因果时保留一句解释。'
+        : `盲比生成作品 ${index}`
+      await fixture.service.acceptRuntimeEvent({ type: 'output', runId: handle!.runId, text: output })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle!.runId, state: 'completed' })
+    }
+    let snapshot = await preparing
+    expect(fixture.runtime.inputs[0]).not.toContain('heldout')
+    expect(snapshot.methodCandidates).toHaveLength(1)
+    expect(snapshot.methodCandidates[0]?.comparisons).toHaveLength(3)
+    expect(snapshot.methodCandidates[0]?.status).toBe('EVALUATING')
+
+    const candidateId = snapshot.methodCandidates[0]!.id
+    for (const phase of ['targeted', 'regression', 'heldout'] as const) {
+      snapshot = await fixture.service.submitMethodComparison({ candidateId, phase, choice: 'A' })
+    }
+    expect(snapshot.methodCandidates[0]?.ready).toBe(true)
+    snapshot = await fixture.service.adoptMethodCandidate(candidateId)
+    expect(snapshot.method.activeVersion).toBe(candidateId)
+    expect(snapshot.method.activeGuidance).toContain('人物可见的选择')
+
+    const nextWork = await fixture.service.startWork('采用新方式后的第四个作品')
+    expect(fixture.runtime.lastInput).toContain('用户已经通过盲比并明确采用的当前创作方法')
+    expect(fixture.runtime.lastInput).toContain('人物可见的选择')
+    const begin = fixture.controller.requests.filter(item => item.operation === 'begin_work').at(-1)
+    expect(begin?.payload.context_sha256).toBe('9'.repeat(64))
+    await fixture.service.cancelWork(nextWork.runId)
+
+    snapshot = await fixture.service.rollbackMethod('baseline-v1')
+    expect(snapshot.method.activeVersion).toBe('baseline-v1')
+    expect(snapshot.method.history.map(item => item.action)).toEqual(['PROMOTE', 'ROLLBACK'])
+  })
+
+  it('cancels an in-flight method generation before shutdown completes', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const internalRun = fixture.runtime.handles[0]!
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'APPLICATION_CLOSED' })
+    await fixture.service.shutdown()
+
+    await rejected
+    expect(fixture.timeline).toContain('runtime:cancel')
+    expect(fixture.loopback.lastLease?.revoked).toBe(true)
+    expect(fixture.controller.requests.some(item => item.operation === 'stage_method_comparisons')).toBe(false)
+    expect(fixture.runtime.status()).toEqual({ state: 'unconfigured' })
+    expect(internalRun.runId).toBe('runtime-one')
   })
 
   it('does not claim success when gateway provenance is incomplete', async () => {
@@ -533,6 +594,8 @@ class FakeSettings implements SettingsStorePort {
 
 class FakeRuntime implements RuntimePort {
   lastInput: string | undefined
+  readonly inputs: string[] = []
+  readonly handles: RuntimeRunHandle[] = []
   spec: DshRuntimeLaunchSpec | undefined
   private state: RuntimeStatus = { state: 'unconfigured' }
 
@@ -545,9 +608,14 @@ class FakeRuntime implements RuntimePort {
   status(): RuntimeStatus { return this.state }
   async startRun(input: string): Promise<RuntimeRunHandle> {
     this.lastInput = input
+    this.inputs.push(input)
     if (this.startHook !== undefined) return await this.startHook(input)
-    this.state = { state: 'running', activeRunId: 'runtime-one' }
-    return { runId: 'runtime-one', sessionId: 'session-one' }
+    const number = this.inputs.length
+    const suffix = number === 1 ? 'one' : number === 2 ? 'two' : number === 3 ? 'three' : number === 4 ? 'four' : 'five'
+    const handle = { runId: `runtime-${suffix}`, sessionId: `session-${suffix}` }
+    this.handles.push(handle)
+    this.state = { state: 'running', activeRunId: handle.runId }
+    return handle
   }
   async cancelRun(runId: string): Promise<void> {
     this.timeline.push('runtime:cancel')
@@ -561,14 +629,16 @@ class FakeRuntime implements RuntimePort {
 class FakeLease implements LoopbackGatewayLease {
   readonly url = 'http://127.0.0.1:12345'
   readonly token = 'x'.repeat(32)
-  readonly role = 'production' as const
-  readonly model = 'deepseek-v4-pro' as const
+  readonly role: RuntimeRole
+  readonly model: 'deepseek-v4-pro' | 'deepseek-v4-flash'
   revoked = false
 
   constructor(
     private readonly timeline: string[],
     private readonly value: LoopbackLeaseProvenance,
-  ) {}
+    role: RuntimeRole,
+    model: 'deepseek-v4-pro' | 'deepseek-v4-flash',
+  ) { this.role = role; this.model = model }
   provenance(): LoopbackLeaseProvenance { return this.value }
   revoke(): void {
     if (this.revoked) return
@@ -580,9 +650,11 @@ class FakeLease implements LoopbackGatewayLease {
 class FakeLoopback implements LoopbackGatewayPort {
   lastLease: FakeLease | undefined
   private readonly provenance: LoopbackLeaseProvenance
+  private readonly hasReturnedModelOverride: boolean
 
   constructor(timeline: string[], overrides: Partial<LoopbackLeaseProvenance> = {}) {
     this.timeline = timeline
+    this.hasReturnedModelOverride = overrides.returnedModels !== undefined
     this.provenance = {
       requestCount: 1,
       completedRequests: 1,
@@ -608,8 +680,20 @@ class FakeLoopback implements LoopbackGatewayPort {
   }
   private readonly timeline: string[]
   async start(): Promise<void> {}
-  issueLease(): LoopbackGatewayLease {
-    this.lastLease = new FakeLease(this.timeline, this.provenance)
+  issueLease(
+    role: RuntimeRole = 'production',
+    model: 'deepseek-v4-pro' | 'deepseek-v4-flash' = 'deepseek-v4-pro',
+  ): LoopbackGatewayLease {
+    const provenance = {
+      ...this.provenance,
+      requestedModel: model,
+      returnedModels: this.hasReturnedModelOverride ? this.provenance.returnedModels : [model],
+      requests: this.provenance.requests.map(item => ({
+        ...item,
+        returnedModel: this.hasReturnedModelOverride ? (item.returnedModel ?? model) : model,
+      })),
+    }
+    this.lastLease = new FakeLease(this.timeline, provenance, role, model)
     return this.lastLease
   }
   async close(): Promise<void> { this.timeline.push('loopback:close') }
@@ -628,6 +712,11 @@ class FakeController implements ControllerPort {
   private pendingFeedback: Record<string, unknown> | null = null
   private pendingEditedOutput: string | undefined
   private interruptedRun: Record<string, unknown> | null = null
+  private observations: Record<string, unknown>[] = []
+  private methodCandidates: Record<string, unknown>[] = []
+  private methodHistory: Record<string, unknown>[] = []
+  private activeMethodVersion = 'baseline-v1'
+  private activeGuidance: string | null = null
 
   constructor(private readonly timeline: string[]) {}
 
@@ -668,6 +757,18 @@ class FakeController implements ControllerPort {
     }
   }
 
+  primeMethodObservation(): void {
+    this.observations = [{
+      id: 'app-feedback-synthetic',
+      finding_code: 'APP-FEEDBACK-SYNTHETIC',
+      feedback: '减少解释，让人物用动作推进情节。',
+      independent_works: 3,
+      independent_runs: 3,
+      independent_tasks: 3,
+      ready_for_candidate: true,
+    }]
+  }
+
   async invoke(request: ControllerRequestLike): Promise<{ exitCode: number; payload: unknown }> {
     this.requests.push(request)
     this.timeline.push(`controller:${request.operation}`)
@@ -689,12 +790,127 @@ class FakeController implements ControllerPort {
           charter_confirmed: false,
           initial_intent: this.initialIntent,
           initial_intent_sha256: createHash('sha256').update(this.initialIntent, 'utf8').digest('hex'),
-          last_work: this.lastWork,
+          last_work: this.lastWork === null ? null : {
+            method_version: 'baseline-v1',
+            method_guidance_sha256: null,
+            ...this.lastWork,
+          },
           recovery_required: this.interruptedRun !== null,
           interrupted_run: this.interruptedRun,
           feedback_recovery_required: this.pendingFeedback !== null,
           pending_feedback: this.pendingFeedback,
+          learning: { observations: this.observations, adopted_principles: this.adoptedPrinciples() },
+          method: { active_version: this.activeMethodVersion, active_guidance: this.activeGuidance, history: this.methodHistory },
+          method_candidates: this.methodCandidates,
         }
+        break
+      case 'production_context':
+        result = {
+          method_version: this.activeMethodVersion,
+          guidance: this.activeGuidance,
+          guidance_sha256: this.activeGuidance === null
+            ? null
+            : createHash('sha256').update(this.activeGuidance, 'utf8').digest('hex'),
+          context_sha256: this.activeGuidance === null
+            ? createHash('sha256').update(this.initialIntent, 'utf8').digest('hex')
+            : '9'.repeat(64),
+          initial_intent: this.initialIntent,
+          formal_l4: false,
+        }
+        break
+      case 'method_candidate_context':
+        result = {
+          candidate_id: payload.candidate_id,
+          observation_id: payload.observation_id,
+          finding_code: 'APP-FEEDBACK-SYNTHETIC',
+          feedback: '减少解释，让人物用动作推进情节。',
+          initial_intent: this.initialIntent,
+          current_method_version: this.activeMethodVersion,
+          current_guidance: this.activeGuidance,
+          builder_context_sha256: 'b'.repeat(64),
+          heldout_included: false,
+          source_works: [1, 2, 3].map(number => ({
+            run_id: `run-source-${number}`,
+            work_id: `work-source-${number}`,
+            task: `独立创作任务 ${number}`,
+            task_sha256: String(number).repeat(64),
+            output: `基线作品 ${number}，人物解释了原因。`,
+            artifact_sha256: String(number).repeat(64),
+            provenance: {},
+            provenance_path: `run-${number}/runtime-provenance.json`,
+            provenance_sha256: String(number).repeat(64),
+          })),
+        }
+        break
+      case 'create_method_candidate':
+        this.methodCandidates = [{
+          id: payload.candidate_id,
+          title: '针对重复反馈的新方式',
+          summary: payload.guidance,
+          tradeoff: '只改变后续作品的创作指导，不改写既有作品。',
+          status: 'CANDIDATE',
+          ready: false,
+          comparisons: [],
+        }]
+        result = {
+          candidate_id: payload.candidate_id,
+          lifecycle: 'CANDIDATE',
+          evaluation_plan: {
+            targeted: { task: '目标任务', baseline_output: '目标基线', candidate_context_sha256: 'c'.repeat(64) },
+            regression: { task: '回归任务', baseline_output: '回归基线', candidate_context_sha256: 'd'.repeat(64) },
+            heldout: {
+              task: '全新留出任务',
+              baseline_context_sha256: 'e'.repeat(64),
+              candidate_context_sha256: 'f'.repeat(64),
+            },
+          },
+        }
+        break
+      case 'stage_method_comparisons':
+        this.methodCandidates = this.methodCandidates.map(candidate => ({
+          ...candidate,
+          status: 'EVALUATING',
+          comparisons: [
+            { phase: 'targeted', left: '目标 A', right: '目标 B', choice: null },
+            { phase: 'regression', left: '回归 A', right: '回归 B', choice: null },
+            { phase: 'heldout', left: '留出 A', right: '留出 B', choice: null },
+          ],
+        }))
+        result = { lifecycle: 'EVALUATING', snapshot: this.snapshot() }
+        break
+      case 'submit_method_comparison':
+        this.methodCandidates = this.methodCandidates.map(candidate => {
+          const comparisons = (candidate.comparisons as Record<string, unknown>[]).map(item => (
+            item.phase === payload.phase ? { ...item, choice: payload.choice } : item
+          ))
+          const complete = comparisons.every(item => item.choice !== null)
+          return { ...candidate, comparisons, status: complete ? 'READY_FOR_HUMAN' : 'EVALUATING', ready: complete }
+        })
+        result = { snapshot: this.snapshot() }
+        break
+      case 'adopt_method_candidate': {
+        const candidate = this.methodCandidates.find(item => item.id === payload.candidate_id)
+        if (candidate === undefined) throw new Error('synthetic missing candidate')
+        this.activeMethodVersion = String(payload.candidate_id)
+        this.activeGuidance = String(candidate.summary)
+        this.methodHistory.push({
+          action: 'PROMOTE', version: this.activeMethodVersion, previous_version: 'baseline-v1', created_at: '2026-08-15T01:30:00.000Z',
+        })
+        this.methodCandidates = this.methodCandidates.map(item => ({ ...item, status: 'PROMOTED', ready: false }))
+        result = { snapshot: this.snapshot() }
+        break
+      }
+      case 'reject_method_candidate':
+        this.methodCandidates = this.methodCandidates.map(item => ({ ...item, status: 'REJECTED', ready: false }))
+        result = { snapshot: this.snapshot() }
+        break
+      case 'rollback_method':
+        this.methodHistory.push({
+          action: 'ROLLBACK', version: payload.to_version, previous_version: this.activeMethodVersion, created_at: '2026-08-15T01:40:00.000Z',
+        })
+        this.activeMethodVersion = String(payload.to_version)
+        this.activeGuidance = this.activeMethodVersion === 'baseline-v1' ? null : this.activeGuidance
+        result = { snapshot: this.snapshot() }
         break
       case 'begin_work':
         if (payload.recovery_of !== undefined && this.failRecoveryBegin) {
@@ -706,6 +922,10 @@ class FakeController implements ControllerPort {
           work_id: payload.work_id,
           task_sha256: createHash('sha256').update(String(payload.task), 'utf8').digest('hex'),
           context_sha256: payload.context_sha256,
+          method_version: this.activeMethodVersion,
+          method_guidance_sha256: this.activeGuidance === null
+            ? null
+            : createHash('sha256').update(this.activeGuidance, 'utf8').digest('hex'),
         }
         break
       case 'complete_work':
@@ -840,11 +1060,29 @@ class FakeController implements ControllerPort {
       charter_confirmed: false,
       initial_intent: this.initialIntent,
       initial_intent_sha256: createHash('sha256').update(this.initialIntent, 'utf8').digest('hex'),
-      last_work: this.lastWork,
+      last_work: this.lastWork === null ? null : {
+        method_version: 'baseline-v1',
+        method_guidance_sha256: null,
+        ...this.lastWork,
+      },
       recovery_required: this.interruptedRun !== null,
       interrupted_run: this.interruptedRun,
       feedback_recovery_required: this.pendingFeedback !== null,
       pending_feedback: this.pendingFeedback,
+      learning: { observations: this.observations, adopted_principles: this.adoptedPrinciples() },
+      method: { active_version: this.activeMethodVersion, active_guidance: this.activeGuidance, history: this.methodHistory },
+      method_candidates: this.methodCandidates,
     }
+  }
+
+  private adoptedPrinciples(): Record<string, unknown>[] {
+    return this.methodHistory
+      .filter(item => item.action === 'PROMOTE')
+      .map(item => ({
+        version: item.version,
+        guidance: this.methodCandidates.find(candidate => candidate.id === item.version)?.summary ?? '已采用指导',
+        adopted_at: item.created_at,
+        active: item.version === this.activeMethodVersion,
+      }))
   }
 }

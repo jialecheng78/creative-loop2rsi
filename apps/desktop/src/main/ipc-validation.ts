@@ -3,6 +3,10 @@ import {
   type ConfigureCredentialInput,
   type CreateSystemInput,
   type FeedbackAction,
+  type CandidateDecisionInput,
+  type CompareCandidateInput,
+  type PrepareCandidateInput,
+  type RollbackMethodInput,
   type SelectModelInput,
   type StartWorkInput,
   type SubmitFeedbackInput,
@@ -11,6 +15,7 @@ import {
 const MODEL_CHOICES = new Set(['deepseek-v4-pro', 'deepseek-v4-flash'])
 const FEEDBACK_ACTIONS = new Set<FeedbackAction>(['edit', 'keep', 'reject', 'rewrite'])
 const RUN_ID_PATTERN = /^run-[0-9a-f-]+$/u
+const KEBAB_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
 
 export function validateCredentialInput(value: unknown): ConfigureCredentialInput {
   const record = exactRecord(value, ['apiKey'], 'API Key')
@@ -80,6 +85,40 @@ export function validateFeedbackInput(value: unknown): SubmitFeedbackInput {
     ...(feedbackText === undefined ? {} : { feedbackText }),
     ...(editedText === undefined ? {} : { editedText }),
   }
+}
+
+export function validatePrepareCandidateInput(value: unknown): PrepareCandidateInput {
+  const record = exactRecord(value, ['observationId'], '方法候选')
+  return { observationId: kebabId(record.observationId, '观察标识') }
+}
+
+export function validateCompareCandidateInput(value: unknown): CompareCandidateInput {
+  const record = exactRecord(value, ['candidateId', 'phase', 'choice'], '盲比选择')
+  const phase = record.phase
+  const choice = record.choice
+  if (phase !== 'targeted' && phase !== 'regression' && phase !== 'heldout') {
+    throw new TypeError('盲比阶段无效。')
+  }
+  if (choice !== 'A' && choice !== 'B' && choice !== 'TIE') {
+    throw new TypeError('盲比选择无效。')
+  }
+  return { candidateId: kebabId(record.candidateId, '候选标识'), phase, choice }
+}
+
+export function validateCandidateDecisionInput(value: unknown): CandidateDecisionInput {
+  const record = exactRecord(value, ['candidateId'], '候选决定')
+  return { candidateId: kebabId(record.candidateId, '候选标识') }
+}
+
+export function validateRollbackMethodInput(value: unknown): RollbackMethodInput {
+  const record = exactRecord(value, ['version'], '方法回滚')
+  return { version: kebabId(record.version, '方法版本') }
+}
+
+function kebabId(value: unknown, label: string): string {
+  const result = text(value, label, 120)
+  if (!KEBAB_ID_PATTERN.test(result)) throw new TypeError(`${label}无效。`)
+  return result
 }
 
 function exactRecord(value: unknown, allowed: readonly string[], label: string): Record<string, unknown> {

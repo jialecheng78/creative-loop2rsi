@@ -1,7 +1,14 @@
-import { access } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const entry = resolve('dist/main/index.js')
-await access(entry)
-process.stdout.write(`Unpackaged preview build ready: ${entry}\n`)
-process.stdout.write('Installer generation remains blocked by the repository exotic-subdependency policy.\n')
+import { buildPreview } from './preview-build-lib.mjs'
+
+const root = fileURLToPath(new URL('../../../', import.meta.url))
+const result = await buildPreview({ root })
+process.stdout.write(`${JSON.stringify({
+  status: 'PASS',
+  output: result.outputRoot,
+  manifest: result.manifestPath,
+  tree_sha256: result.treeSha256,
+  source_commit: result.source.git_commit,
+  unsigned: true,
+}, null, 2)}\n`)

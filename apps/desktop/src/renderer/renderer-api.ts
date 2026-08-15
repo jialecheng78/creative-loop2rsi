@@ -5,13 +5,21 @@ import type {
 } from '@creative-loop2rsi/runtime-dsh'
 
 import type { CreativeRsiApi, StudioStatus } from '../shared/ipc.js'
+import type {
+  AdoptedPrincipleSnapshot,
+  MethodCandidateSnapshot,
+  MethodComparisonChoice,
+  MethodComparisonPhase,
+  MethodHistorySnapshot,
+  MethodObservationSnapshot,
+} from '../shared/ipc.js'
 
 export type MainSection = 'create' | 'learning' | 'new-methods' | 'versions'
 export type FeedbackAction = 'keep' | 'rewrite' | 'reject' | 'edit'
 
 export interface LearningView {
-  readonly observations?: readonly string[]
-  readonly adoptedPrinciples?: readonly string[]
+  readonly observations: readonly MethodObservationSnapshot[]
+  readonly adoptedPrinciples: readonly AdoptedPrincipleSnapshot[]
 }
 
 export interface CurrentWorkView {
@@ -21,28 +29,18 @@ export interface CurrentWorkView {
 }
 
 export interface MethodView {
-  readonly currentName?: string
-  readonly stageLabel?: string
-  readonly history?: readonly {
-    readonly id: string
-    readonly label: string
-    readonly adoptedAt?: string
-  }[]
-}
-
-export interface NewMethodView {
-  readonly id: string
-  readonly title: string
-  readonly summary: string
-  readonly tradeoff?: string
-  readonly status?: 'ready' | 'observing'
+  readonly activeVersion: string
+  readonly activeGuidance: string | null
+  readonly currentName: string
+  readonly stageLabel: string
+  readonly history: readonly MethodHistorySnapshot[]
 }
 
 export interface StudioViewStatus extends StudioStatus {
   readonly currentWork?: CurrentWorkView
   readonly learning?: LearningView
   readonly method?: MethodView
-  readonly newMethods?: readonly NewMethodView[]
+  readonly newMethods?: readonly MethodCandidateSnapshot[]
 }
 
 export interface FeedbackInput {
@@ -57,16 +55,6 @@ export interface FeedbackSubmissionViewResult {
   readonly status: StudioViewStatus
 }
 
-type ExtendedCreativeRsiApi = CreativeRsiApi & {
-  readonly candidates?: {
-    adopt(id: string): Promise<void>
-    reject(id: string): Promise<void>
-  }
-  readonly releases?: {
-    rollback(id: string): Promise<void>
-  }
-}
-
 export class PreviewCapabilityError extends Error {
   constructor(readonly capability: 'credential' | 'model' | 'feedback' | 'candidate' | 'rollback') {
     super(capability)
@@ -74,8 +62,8 @@ export class PreviewCapabilityError extends Error {
   }
 }
 
-function api(): ExtendedCreativeRsiApi {
-  return window.creativeRsi as unknown as ExtendedCreativeRsiApi
+function api(): CreativeRsiApi {
+  return window.creativeRsi
 }
 
 export async function getStudioStatus(): Promise<StudioViewStatus> {
@@ -119,25 +107,36 @@ export function subscribeToWorkEvents(listener: (event: RuntimeEvent) => void): 
   return api().works.onEvent(listener)
 }
 
-export async function adoptNewMethod(id: string): Promise<void> {
-  const adopt = api().candidates?.adopt
-  if (adopt === undefined) throw new PreviewCapabilityError('candidate')
-  await adopt(id)
+export async function prepareNewMethod(observationId: string): Promise<StudioViewStatus> {
+  await api().candidates.prepare({ observationId })
+  return await getStudioStatus()
 }
 
-export async function rejectNewMethod(id: string): Promise<void> {
-  const reject = api().candidates?.reject
-  if (reject === undefined) throw new PreviewCapabilityError('candidate')
-  await reject(id)
+export async function compareNewMethod(
+  candidateId: string,
+  phase: MethodComparisonPhase,
+  choice: MethodComparisonChoice,
+): Promise<StudioViewStatus> {
+  await api().candidates.compare({ candidateId, phase, choice })
+  return await getStudioStatus()
 }
 
-export async function rollbackMethod(id: string): Promise<void> {
-  const rollback = api().releases?.rollback
-  if (rollback === undefined) throw new PreviewCapabilityError('rollback')
-  await rollback(id)
+export async function adoptNewMethod(candidateId: string): Promise<StudioViewStatus> {
+  await api().candidates.adopt({ candidateId })
+  return await getStudioStatus()
 }
 
-function toViewStatus(status: StudioStatus): StudioViewStatus {
+export async function rejectNewMethod(candidateId: string): Promise<StudioViewStatus> {
+  await api().candidates.reject({ candidateId })
+  return await getStudioStatus()
+}
+
+export async function rollbackMethod(version: string): Promise<StudioViewStatus> {
+  await api().releases.rollback({ version })
+  return await getStudioStatus()
+}
+
+export function toViewStatus(status: StudioStatus): StudioViewStatus {
   const system = status.activeSystem
   const work = system?.lastWork
   return {
@@ -155,17 +154,22 @@ function toViewStatus(status: StudioStatus): StudioViewStatus {
       ? {}
       : {
           method: {
-            currentName: system.displayName,
-            stageLabel: system.charterConfirmed
-              ? '已形成由你确认的创作方法'
-              : '正在从真实创作与明确反馈中了解方向',
-            history: [],
+            activeVersion: system.method.activeVersion,
+            activeGuidance: system.method.activeGuidance,
+            currentName: system.method.activeVersion === 'baseline-v1'
+              ? '通用起步方法'
+              : '你采用的新创作方法',
+            stageLabel: system.method.activeGuidance
+              ?? (system.charterConfirmed
+                ? '已形成由你确认的创作方法'
+                : '正在从真实创作与明确反馈中了解方向'),
+            history: system.method.history,
           },
           learning: {
-            observations: [],
-            adoptedPrinciples: [],
+            observations: system.observations,
+            adoptedPrinciples: system.adoptedPrinciples,
           },
-          newMethods: [],
+          newMethods: system.methodCandidates,
         }),
   }
 }

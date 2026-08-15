@@ -7,11 +7,15 @@ import {
 } from './ipc-security.js'
 import {
   validateCancelWorkInput,
+  validateCandidateDecisionInput,
+  validateCompareCandidateInput,
   validateCreateSystemInput,
   validateCredentialInput,
   validateFeedbackInput,
   validateModelInput,
   validateStartWorkInput,
+  validatePrepareCandidateInput,
+  validateRollbackMethodInput,
 } from './ipc-validation.js'
 import { StudioServiceError, type StudioService } from './studio-service.js'
 
@@ -60,6 +64,26 @@ export function registerIpc(
   handle(IPC_CHANNELS.worksSubmitFeedback, boundary, args => {
     const [input] = oneArgument(args)
     return service.submitFeedback(validateFeedbackInput(input))
+  })
+  handle(IPC_CHANNELS.candidatesPrepare, boundary, args => {
+    const [input] = oneArgument(args)
+    return service.prepareMethodCandidate(validatePrepareCandidateInput(input).observationId)
+  })
+  handle(IPC_CHANNELS.candidatesCompare, boundary, args => {
+    const [input] = oneArgument(args)
+    return service.submitMethodComparison(validateCompareCandidateInput(input))
+  })
+  handle(IPC_CHANNELS.candidatesAdopt, boundary, args => {
+    const [input] = oneArgument(args)
+    return service.adoptMethodCandidate(validateCandidateDecisionInput(input).candidateId)
+  })
+  handle(IPC_CHANNELS.candidatesReject, boundary, args => {
+    const [input] = oneArgument(args)
+    return service.rejectMethodCandidate(validateCandidateDecisionInput(input).candidateId)
+  })
+  handle(IPC_CHANNELS.releasesRollback, boundary, args => {
+    const [input] = oneArgument(args)
+    return service.rollbackMethod(validateRollbackMethodInput(input).version)
   })
 
   return () => {

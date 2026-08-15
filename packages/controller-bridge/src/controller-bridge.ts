@@ -309,6 +309,13 @@ function assertNoCredentialFields(value: unknown, seen = new WeakSet<object>()):
   }
 }
 
+function validateMethodGeneration(rawValue: unknown, field: string): void {
+  const generation = asRecord(rawValue, field);
+  exactKeys(generation, field, ["output", "runtime_provenance"]);
+  requiredText(generation, "output", 500_000, { multiline: true });
+  validateRuntimeProvenance(generation.runtime_provenance, true);
+}
+
 function validatePayload(operation: ControllerOperation, rawPayload: unknown): void {
   const payload = asRecord(rawPayload, "payload");
   switch (operation) {
@@ -358,6 +365,76 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
       optionalId(payload, "dispatch_id");
       requiredText(payload, "output", 500_000, { multiline: true });
       validateRuntimeProvenance(payload.runtime_provenance, true);
+      return;
+    case "production_context":
+    case "system_snapshot":
+      exactKeys(payload, "payload", ["project"]);
+      projectPath(payload);
+      return;
+    case "method_candidate_context":
+      exactKeys(payload, "payload", ["project", "candidate_id", "observation_id"]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredText(payload, "observation_id", 100);
+      return;
+    case "create_method_candidate":
+      exactKeys(payload, "payload", [
+        "project",
+        "candidate_id",
+        "observation_id",
+        "guidance",
+        "builder_role_id",
+        "builder_context_id",
+        "builder_task_id",
+        "builder_attested_by",
+        "builder_provenance",
+      ]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredText(payload, "observation_id", 100);
+      requiredText(payload, "guidance", 2_000, { multiline: true });
+      requiredId(payload, "builder_role_id");
+      requiredText(payload, "builder_context_id", 300);
+      requiredText(payload, "builder_task_id", 300);
+      requiredText(payload, "builder_attested_by", 300);
+      validateRuntimeProvenance(payload.builder_provenance, true);
+      return;
+    case "stage_method_comparisons": {
+      exactKeys(payload, "payload", ["project", "candidate_id", "generations"]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      const generations = asRecord(payload.generations, "generations");
+      exactKeys(generations, "generations", [
+        "targeted_candidate",
+        "regression_candidate",
+        "heldout_baseline",
+        "heldout_candidate",
+      ]);
+      for (const key of [
+        "targeted_candidate",
+        "regression_candidate",
+        "heldout_baseline",
+        "heldout_candidate",
+      ] as const) validateMethodGeneration(generations[key], `generations.${key}`);
+      return;
+    }
+    case "submit_method_comparison":
+      exactKeys(payload, "payload", ["project", "candidate_id", "phase", "choice"]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredEnum(payload, "phase", ["targeted", "regression", "heldout"]);
+      requiredEnum(payload, "choice", ["A", "B", "TIE"]);
+      return;
+    case "adopt_method_candidate":
+    case "reject_method_candidate":
+      exactKeys(payload, "payload", ["project", "candidate_id"]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      return;
+    case "rollback_method":
+      exactKeys(payload, "payload", ["project", "to_version"]);
+      projectPath(payload);
+      requiredId(payload, "to_version");
       return;
     case "record_feedback": {
       exactKeys(payload, "payload", [
@@ -497,10 +574,6 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
       exactKeys(payload, "payload", ["project", "candidate_id"]);
       projectPath(payload);
       requiredId(payload, "candidate_id");
-      return;
-    case "system_snapshot":
-      exactKeys(payload, "payload", ["project"]);
-      projectPath(payload);
       return;
   }
 }

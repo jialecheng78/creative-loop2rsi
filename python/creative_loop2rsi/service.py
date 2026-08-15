@@ -8,10 +8,12 @@ operation allowlist.  Model execution remains outside the Python controller.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
 import tempfile
+import unicodedata
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
@@ -26,10 +28,18 @@ ALLOWED_OPERATIONS = {
     "candidate_summary",
     "cancel_work",
     "complete_work",
+    "create_method_candidate",
     "create_system_lab_candidate",
+    "adopt_method_candidate",
+    "method_candidate_context",
+    "production_context",
     "record_feedback",
+    "reject_method_candidate",
     "resume_feedback",
+    "rollback_method",
     "seal_feedback",
+    "stage_method_comparisons",
+    "submit_method_comparison",
     "submit_feedback",
     "system_snapshot",
 }
@@ -55,6 +65,9 @@ SYSTEM_LAB_TARGETS = {
     "model-gateway",
     "runtime-profile",
 }
+METHOD_PHASES = ("targeted", "regression", "heldout")
+METHOD_CHOICES = {"A", "B", "TIE"}
+METHOD_REGISTRY_RELATIVE = "creative-system/app-methods/registry.json"
 
 
 class AppRequestError(RuntimeError):
@@ -132,6 +145,112 @@ def _record(core: Any, kind: str, record_id: str, values: Mapping[str, Any]) -> 
     return record
 
 
+def _method_registry(core: Any, project: Path) -> Dict[str, Any]:
+    path = project / METHOD_REGISTRY_RELATIVE
+    if not os.path.lexists(str(path)):
+        system = core.load_system(project)
+        onboarding = system.get("onboarding")
+        if not isinstance(onboarding, dict) or onboarding.get("mode") != "progressive-app":
+            raise AppRequestError("非应用项目缺少方法注册表，拒绝自动迁移")
+        registry = _record(
+            core,
+            "AppMethodRegistry",
+            "app-method-registry",
+            {
+                "active_method_version": "baseline-v1",
+                "active_guidance_sha256": None,
+                "history": [],
+                "formal_l4_authority": False,
+            },
+        )
+        core.guarded_mkdir_project(project, path.parent, "app method root")
+        core.atomic_create_json(path, registry)
+    if path.is_symlink() or not path.is_file():
+        raise AppRequestError("应用方法注册表不是普通文件")
+    registry = core.load_json(path)
+    if (
+        not isinstance(registry, dict)
+        or registry.get("kind") != "AppMethodRegistry"
+        or registry.get("id") != "app-method-registry"
+        or registry.get("content_hash") != core.app_record_content_hash(registry)
+        or not isinstance(registry.get("history"), list)
+        or not isinstance(registry.get("active_method_version"), str)
+    ):
+        raise AppRequestError("应用方法注册表合同或摘要无效")
+    return registry
+
+
+def _write_method_registry(core: Any, project: Path, registry: Mapping[str, Any]) -> None:
+    value = dict(registry)
+    value["content_hash"] = core.app_record_content_hash(value)
+    core.atomic_write_json(project / METHOD_REGISTRY_RELATIVE, value)
+
+
+def _feedback_normalized(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _feedback_finding_code(value: str) -> str:
+    digest = hashlib.sha256(_feedback_normalized(value).encode("utf-8")).hexdigest()[:12]
+    return f"APP-FEEDBACK-{digest.upper()}"
+
+
+def _feedback_finding(
+    core: Any,
+    project: Path,
+    receipt: Mapping[str, Any],
+) -> Optional[str]:
+    source = _mapping(receipt.get("source_evidence"), "receipt.source_evidence")
+    source_path = core.regular_project_file(
+        project, source.get("path"), "AppFeedbackSource"
+    )
+    source_payload = core.load_json(source_path)
+    feedback_text = (
+        source_payload.get("feedback_text")
+        if isinstance(source_payload, dict)
+        else None
+    )
+    if not isinstance(feedback_text, str) or not feedback_text.strip():
+        return None
+    run_id = _id(receipt.get("run_id"), "receipt.run_id")
+    attempt_id = _id(receipt.get("attempt_id"), "receipt.attempt_id")
+    code = _feedback_finding_code(feedback_text)
+    relative = (
+        "creative-system/memory/app-findings/"
+        f"{run_id}-{attempt_id}-{code.lower()}.json"
+    )
+    path = project / relative
+    finding = {
+        "code": code,
+        "category": "soft-quality",
+        "severity": "medium",
+        "confidence": 1.0,
+        "evidence": [
+            {
+                "path": str(source.get("path")),
+                "sha256": str(source.get("sha256")),
+                "authority": "direct-user-feedback",
+            }
+        ],
+        "owner": "creative-producer",
+        "suggested_action": feedback_text,
+        "normalized_feedback_sha256": hashlib.sha256(
+            _feedback_normalized(feedback_text).encode("utf-8")
+        ).hexdigest(),
+        "source_feedback_receipt": str(receipt.get("source_evidence", {}).get("path")),
+    }
+    encoded = (
+        json.dumps(finding, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    core.guarded_mkdir_project(project, path.parent, "app finding root")
+    if os.path.lexists(str(path)):
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+            raise AppRequestError("同一反馈已绑定不同 finding，拒绝覆盖")
+    else:
+        core.atomic_create_bytes(path, encoded)
+    return str(path)
+
+
 def _progressive_charter(display_name: str, intent: str) -> str:
     return (
         f"# {display_name} 基础创作约束\n\n"
@@ -156,6 +275,8 @@ def _work_task_receipt(
     work_id: str,
     task: str,
     context_sha256: str,
+    method_version: str = "baseline-v1",
+    method_guidance_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
     task_bytes = task.encode("utf-8")
     if len(task_bytes) > 100000:
@@ -179,6 +300,8 @@ def _work_task_receipt(
             or receipt.get("task_bytes") != len(task_bytes)
             or receipt.get("task_reference") != task_reference
             or receipt.get("context_sha256") != context_sha256
+            or receipt.get("method_version", "baseline-v1") != method_version
+            or receipt.get("method_guidance_sha256") != method_guidance_sha256
             or receipt.get("authority") != "direct-user-input"
             or receipt.get("public_log_disclosure") != "reference-only"
             or receipt.get("content_hash") != core.app_record_content_hash(receipt)
@@ -190,6 +313,14 @@ def _work_task_receipt(
             "task_sha256": task_sha256,
             "task_reference": task_reference,
             "context_sha256": context_sha256,
+            **(
+                {
+                    "method_version": method_version,
+                    "method_guidance_sha256": method_guidance_sha256,
+                }
+                if method_version != "baseline-v1"
+                else {}
+            ),
             "idempotent": True,
         }
 
@@ -205,6 +336,14 @@ def _work_task_receipt(
             "task_bytes": len(task_bytes),
             "task_reference": task_reference,
             "context_sha256": context_sha256,
+            **(
+                {
+                    "method_version": method_version,
+                    "method_guidance_sha256": method_guidance_sha256,
+                }
+                if method_version != "baseline-v1"
+                else {}
+            ),
             "authority": "direct-user-input",
             "public_log_disclosure": "reference-only",
         },
@@ -217,6 +356,14 @@ def _work_task_receipt(
         "task_sha256": task_sha256,
         "task_reference": task_reference,
         "context_sha256": context_sha256,
+        **(
+            {
+                "method_version": method_version,
+                "method_guidance_sha256": method_guidance_sha256,
+            }
+            if method_version != "baseline-v1"
+            else {}
+        ),
         "idempotent": False,
     }
 
@@ -303,6 +450,9 @@ def _bootstrap_intent(payload: Mapping[str, Any]) -> Dict[str, Any]:
         protected = set(str(item) for item in system.get("protected_surfaces", []))
         protected.update(
             {
+                "creative-system/app-methods/registry.json",
+                "creative-system/app-methods/promotions/",
+                "creative-system/app-methods/rollbacks/",
                 "creative-system/approvals/initial-intent/",
                 "creative-system/approvals/app-feedback/",
                 "creative-system/approvals/work-tasks/",
@@ -310,6 +460,22 @@ def _bootstrap_intent(payload: Mapping[str, Any]) -> Dict[str, Any]:
         )
         system["protected_surfaces"] = sorted(protected)
         core.atomic_write_json(core.system_path(staging), system)
+        method_registry = _record(
+            core,
+            "AppMethodRegistry",
+            "app-method-registry",
+            {
+                "active_method_version": "baseline-v1",
+                "active_guidance_sha256": None,
+                "history": [],
+                "formal_l4_authority": False,
+            },
+        )
+        method_registry_path = staging / METHOD_REGISTRY_RELATIVE
+        core.guarded_mkdir_project(
+            staging, method_registry_path.parent, "app method root"
+        )
+        core.atomic_create_json(method_registry_path, method_registry)
         report = core.validate_project(staging)
         if report["errors"]:
             raise AppRequestError(
@@ -361,14 +527,18 @@ def _begin_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
         run_id_value if run_id_value is not None else core.generated_run_id(), "run_id"
     )
     task = _text(payload.get("task"), "task", maximum=100000, multiline=True)
-    current_intent = _initial_intent_snapshot(core, project, core.load_system(project))
-    context_sha256 = payload.get("context_sha256", current_intent["sha256"])
+    production_context = _production_context_snapshot(
+        core, project, core.load_system(project)
+    )
+    context_sha256 = payload.get(
+        "context_sha256", production_context["context_sha256"]
+    )
     if (
         not isinstance(context_sha256, str)
         or not re.fullmatch(r"[0-9a-f]{64}", context_sha256)
-        or context_sha256 != current_intent["sha256"]
+        or context_sha256 != production_context["context_sha256"]
     ):
-        raise AppRequestError("context_sha256 必须绑定当前 InitialIntentReceipt")
+        raise AppRequestError("context_sha256 必须绑定当前生产方法上下文")
     task_receipt = _work_task_receipt(
         core,
         project,
@@ -376,6 +546,8 @@ def _begin_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
         work_id=work_id,
         task=task,
         context_sha256=context_sha256,
+        method_version=str(production_context["method_version"]),
+        method_guidance_sha256=production_context["guidance_sha256"],
     )
     task_reference = str(task_receipt["task_reference"])
     loop_id = _id(payload.get("loop") or "main-loop", "loop")
@@ -423,6 +595,25 @@ def _begin_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
         result = core.command_begin_run(args)
         result["idempotent_run"] = False
 
+    run_path = project / "creative-system" / "runs" / run_id / "run.json"
+    run_record = core.load_json(run_path)
+    if not isinstance(run_record, dict):
+        raise AppRequestError("run.json 无效")
+    expected_method = str(production_context["method_version"])
+    recorded_method = run_record.get("app_method_version_at_start")
+    if recorded_method is None and expected_method != "baseline-v1":
+        run_record["app_method_version_at_start"] = expected_method
+        run_record["app_method_guidance_sha256"] = production_context[
+            "guidance_sha256"
+        ]
+        run_record["app_method_context_sha256"] = context_sha256
+        core.atomic_write_json(run_path, run_record)
+        recorded_method = expected_method
+    elif recorded_method is None:
+        recorded_method = "baseline-v1"
+    if recorded_method != expected_method:
+        raise AppRequestError("已有 run 绑定不同应用方法版本")
+
     run_id = str(result["run_id"])
     dispatch_id = _id(
         raw_dispatch_id or f"dispatch-{run_id}", "dispatch_id"
@@ -462,6 +653,8 @@ def _begin_work(payload: Mapping[str, Any]) -> Dict[str, Any]:
             "task_receipt_sha256": task_receipt["sha256"],
             "task_sha256": task_receipt["task_sha256"],
             "context_sha256": context_sha256,
+            "method_version": expected_method,
+            "method_guidance_sha256": production_context["guidance_sha256"],
             "dispatch_id": dispatch_id,
             "allowed_writes_root": dispatch["allowed_writes_root"],
             "idempotent_dispatch": bool(dispatch.get("idempotent")),
@@ -1087,6 +1280,8 @@ def _attempt_snapshot(
         "human_direction": manifest.get("human_direction", "UNKNOWN"),
         "decision": manifest.get("decision"),
         "quality_status": manifest.get("quality_status", "NOT_EVALUATED"),
+        "method_version": run.get("app_method_version_at_start", "baseline-v1"),
+        "method_guidance_sha256": run.get("app_method_guidance_sha256"),
     }
 
 
@@ -1195,6 +1390,242 @@ def _initial_intent_snapshot(
     }
 
 
+def _candidate_root(project: Path, candidate_id: str) -> Path:
+    return project / "creative-system" / "app-methods" / "candidates" / candidate_id
+
+
+def _load_method_candidate(
+    core: Any, project: Path, candidate_id: str
+) -> tuple[Path, Dict[str, Any], Dict[str, Any]]:
+    root = _candidate_root(project, candidate_id)
+    if root.is_symlink() or not root.is_dir():
+        raise AppRequestError("方法候选不存在或不是普通目录")
+    proposal_path = core.regular_project_file(
+        project,
+        (root / "proposal.json").relative_to(project).as_posix(),
+        "AppMethodCandidate proposal",
+    )
+    status_path = core.regular_project_file(
+        project,
+        (root / "status.json").relative_to(project).as_posix(),
+        "AppMethodCandidate status",
+    )
+    proposal = core.load_json(proposal_path)
+    status = core.load_json(status_path)
+    if (
+        not isinstance(proposal, dict)
+        or proposal.get("kind") != "AppMethodCandidate"
+        or proposal.get("id") != candidate_id
+        or proposal.get("content_hash") != core.app_record_content_hash(proposal)
+        or not isinstance(status, dict)
+        or status.get("kind") != "AppMethodCandidateStatus"
+        or status.get("candidate_id") != candidate_id
+        or status.get("proposal_sha256") != core.sha256_file(proposal_path)
+        or status.get("content_hash") != core.app_record_content_hash(status)
+    ):
+        raise AppRequestError("方法候选合同或摘要无效")
+    return root, proposal, status
+
+
+def _production_context_snapshot(
+    core: Any, project: Path, system: Optional[Mapping[str, Any]] = None
+) -> Dict[str, Any]:
+    current_system = dict(system) if system is not None else core.load_system(project)
+    initial = _initial_intent_snapshot(core, project, current_system)
+    registry = _method_registry(core, project)
+    active = str(registry.get("active_method_version"))
+    if active == "baseline-v1":
+        if registry.get("active_guidance_sha256") is not None:
+            raise AppRequestError("基线方法不得绑定候选指导")
+        return {
+            "status": "PASS",
+            "method_version": active,
+            "guidance": None,
+            "guidance_sha256": None,
+            "context_sha256": initial["sha256"],
+            "initial_intent": initial["text"],
+            "formal_l4": False,
+        }
+    _, proposal, status = _load_method_candidate(core, project, active)
+    if status.get("lifecycle") != "PROMOTED":
+        raise AppRequestError("active method 未绑定 PROMOTED 候选")
+    promotion_relative = status.get("promotion_receipt")
+    promotion_path = core.regular_project_file(
+        project, promotion_relative, "AppMethodPromotionReceipt"
+    )
+    promotion = core.load_json(promotion_path)
+    guidance = proposal.get("guidance")
+    guidance_sha256 = proposal.get("guidance_sha256")
+    if (
+        not isinstance(promotion, dict)
+        or promotion.get("kind") != "AppMethodPromotionReceipt"
+        or promotion.get("candidate_id") != active
+        or promotion.get("content_hash") != core.app_record_content_hash(promotion)
+        or not isinstance(guidance, str)
+        or guidance_sha256 != core.sha256_bytes(guidance.encode("utf-8"))
+        or registry.get("active_guidance_sha256") != guidance_sha256
+    ):
+        raise AppRequestError("active method 晋升证据或指导摘要无效")
+    context_sha256 = core.sha256_bytes(
+        core.canonical_json_bytes(
+            {
+                "initial_intent_sha256": initial["sha256"],
+                "method_version": active,
+                "guidance_sha256": guidance_sha256,
+            }
+        )
+    )
+    return {
+        "status": "PASS",
+        "method_version": active,
+        "guidance": guidance,
+        "guidance_sha256": guidance_sha256,
+        "context_sha256": context_sha256,
+        "initial_intent": initial["text"],
+        "formal_l4": False,
+    }
+
+
+def _production_context(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"project"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    validation = core.validate_project(project)
+    if validation["errors"]:
+        raise AppRequestError("项目合同未通过：" + "; ".join(validation["errors"]))
+    return _production_context_snapshot(core, project)
+
+
+def _method_observations(core: Any, project: Path) -> list[Dict[str, Any]]:
+    clusters: Dict[str, Dict[str, Any]] = {}
+    for manifest in core.sealed_manifests(project):
+        run_id = manifest.get("run_id")
+        work_id = manifest.get("work_id")
+        task = manifest.get("task")
+        if not all(isinstance(value, str) for value in (run_id, work_id, task)):
+            continue
+        for finding in manifest.get("findings", []):
+            if not isinstance(finding, dict):
+                continue
+            code = finding.get("code")
+            feedback = finding.get("suggested_action")
+            if (
+                not isinstance(code, str)
+                or not code.startswith("APP-FEEDBACK-")
+                or not isinstance(feedback, str)
+                or not feedback.strip()
+            ):
+                continue
+            cluster = clusters.setdefault(
+                code,
+                {
+                    "id": code.lower(),
+                    "finding_code": code,
+                    "feedback": feedback,
+                    "run_ids": set(),
+                    "work_ids": set(),
+                    "tasks": set(),
+                    "evidence": [],
+                },
+            )
+            cluster["run_ids"].add(run_id)
+            cluster["work_ids"].add(work_id)
+            cluster["tasks"].add(task)
+            cluster["evidence"].append(
+                {
+                    "run_id": run_id,
+                    "work_id": work_id,
+                    "attempt_id": manifest.get("attempt_id"),
+                    "manifest": manifest.get("_manifest_path"),
+                }
+            )
+    result: list[Dict[str, Any]] = []
+    for cluster in clusters.values():
+        works = sorted(cluster.pop("work_ids"))
+        runs = sorted(cluster.pop("run_ids"))
+        tasks = sorted(cluster.pop("tasks"))
+        result.append(
+            {
+                **cluster,
+                "run_ids": runs,
+                "work_ids": works,
+                "independent_works": len(works),
+                "independent_runs": len(runs),
+                "independent_tasks": len(tasks),
+                "ready_for_candidate": len(works) >= 3
+                and len(runs) >= 3
+                and len(tasks) >= 3,
+            }
+        )
+    return sorted(result, key=lambda item: str(item["id"]))
+
+
+def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
+    registry = _method_registry(core, project)
+    active = _production_context_snapshot(core, project)
+    candidates: list[Dict[str, Any]] = []
+    root = project / "creative-system" / "app-methods" / "candidates"
+    if root.is_dir() and not root.is_symlink():
+        for candidate_dir in sorted(root.iterdir(), key=lambda path: path.name):
+            if not candidate_dir.is_dir() or candidate_dir.is_symlink():
+                continue
+            _, proposal, status = _load_method_candidate(
+                core, project, candidate_dir.name
+            )
+            comparisons = []
+            for phase in METHOD_PHASES:
+                input_path = candidate_dir / "comparisons" / phase / "public.json"
+                if input_path.is_file() and not input_path.is_symlink():
+                    _, _, public, _ = _validated_method_comparison(
+                        core, project, candidate_dir, candidate_dir.name, phase
+                    )
+                    decision = _validated_method_decision(
+                        core, project, candidate_dir, candidate_dir.name, phase
+                    )
+                    comparisons.append(
+                        {
+                            "phase": phase,
+                            "left": public.get("left"),
+                            "right": public.get("right"),
+                            "choice": (
+                                decision.get("choice")
+                                if isinstance(decision, dict)
+                                else None
+                            ),
+                        }
+                    )
+            candidates.append(
+                {
+                    "id": candidate_dir.name,
+                    "title": "针对重复反馈的新方式",
+                    "summary": proposal.get("guidance"),
+                    "tradeoff": "只改变后续作品的创作指导，不改写既有作品。",
+                    "status": status.get("lifecycle"),
+                    "ready": status.get("lifecycle") == "READY_FOR_HUMAN",
+                    "comparisons": comparisons,
+                    "evaluation_summary": status.get("evaluation_summary"),
+                }
+            )
+    principles = [
+        {
+            "version": item.get("version"),
+            "guidance": item.get("guidance"),
+            "adopted_at": item.get("created_at"),
+            "active": item.get("version") == registry.get("active_method_version"),
+        }
+        for item in registry.get("history", [])
+        if isinstance(item, dict) and item.get("action") == "PROMOTE"
+    ]
+    return {
+        "observations": _method_observations(core, project),
+        "adopted_principles": principles,
+        "candidates": candidates,
+        "active_version": active["method_version"],
+        "active_guidance": active["guidance"],
+        "history": list(registry.get("history", [])),
+    }
+
+
 def _system_snapshot(payload: Mapping[str, Any]) -> Dict[str, Any]:
     _exact_keys(payload, "payload", {"project"})
     core = load_controller()
@@ -1247,6 +1678,7 @@ def _system_snapshot(payload: Mapping[str, Any]) -> Dict[str, Any]:
     onboarding = system.get("onboarding", {})
     pending_feedback = _pending_feedback_snapshot(core, project)
     initial_intent = _initial_intent_snapshot(core, project, system)
+    method = _method_public_snapshot(core, project)
     return {
         "status": "PASS",
         "system_id": project_record.get("id"),
@@ -1258,7 +1690,17 @@ def _system_snapshot(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "initial_intent_sha256": initial_intent["sha256"],
         "initial_intent_receipt": initial_intent["receipt"],
         "initial_intent_receipt_sha256": initial_intent["receipt_sha256"],
-        "adopted_principles_available": False,
+        "adopted_principles_available": bool(method["adopted_principles"]),
+        "learning": {
+            "observations": method["observations"],
+            "adopted_principles": method["adopted_principles"],
+        },
+        "method": {
+            "active_version": method["active_version"],
+            "active_guidance": method["active_guidance"],
+            "history": method["history"],
+        },
+        "method_candidates": method["candidates"],
         "last_work": last_work,
         "recovery_required": interrupted_work is not None,
         "interrupted_run": interrupted_work,
@@ -2097,11 +2539,16 @@ def _roll_forward_feedback_transaction(
             core, project, recorded_path, intent
         )
 
+    feedback_receipt = _load_app_feedback_receipt(
+        core, project, recorded["receipt"]
+    )
+    finding_path = _feedback_finding(core, project, feedback_receipt)
     sealed = _seal_feedback(
         {
             "project": str(project),
             "feedback_receipt": recorded["receipt"],
             "machine_direction": semantic.get("machine_direction"),
+            **({"finding_paths": [finding_path]} if finding_path is not None else {}),
         }
     )
     if committed_exists:
@@ -2339,6 +2786,960 @@ def _resume_feedback(payload: Mapping[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _work_for_method_evaluation(
+    core: Any, project: Path, evidence: Mapping[str, Any]
+) -> Dict[str, Any]:
+    run_id = _id(evidence.get("run_id"), "evidence.run_id")
+    attempt_id = _id(evidence.get("attempt_id"), "evidence.attempt_id")
+    run_dir = project / "creative-system" / "runs" / run_id
+    run_path = core.regular_project_file(
+        project, (run_dir / "run.json").relative_to(project).as_posix(), "run"
+    )
+    run = core.load_json(run_path)
+    attempt_dir = run_dir / "attempts" / attempt_id
+    if not isinstance(run, dict) or not (attempt_dir / ".sealed.json").is_file():
+        raise AppRequestError("方法候选来源 run 尚未封存")
+    snapshot = _attempt_snapshot(core, project, run, run_dir, attempt_dir)
+    if snapshot is None or snapshot.get("sealed") is not True:
+        raise AppRequestError("方法候选来源作品不可用")
+    task_path = core.regular_project_file(
+        project,
+        f"creative-system/approvals/work-tasks/{run_id}.json",
+        "WorkTaskReceipt",
+    )
+    task_receipt = core.load_json(task_path)
+    provenance_path = core.regular_project_file(
+        project,
+        (attempt_dir / "runtime-provenance.json").relative_to(project).as_posix(),
+        "RuntimeProvenance",
+    )
+    provenance = core.load_json(provenance_path)
+    if (
+        not isinstance(task_receipt, dict)
+        or not isinstance(task_receipt.get("task"), str)
+        or not isinstance(provenance, dict)
+        or provenance.get("kind") != "RuntimeProvenance"
+        or provenance.get("content_hash") != core.app_record_content_hash(provenance)
+    ):
+        raise AppRequestError("方法候选来源任务或模型来源无效")
+    return {
+        "run_id": run_id,
+        "work_id": snapshot["work_id"],
+        "task": task_receipt["task"],
+        "task_sha256": task_receipt["task_sha256"],
+        "output": snapshot["output"],
+        "artifact_sha256": snapshot["artifact_sha256"],
+        "provenance": provenance,
+        "provenance_path": provenance_path.relative_to(project).as_posix(),
+        "provenance_sha256": core.sha256_file(provenance_path),
+    }
+
+
+def _candidate_context_value(
+    core: Any,
+    project: Path,
+    observation_id: str,
+    candidate_id: str,
+) -> Dict[str, Any]:
+    observation = next(
+        (
+            item
+            for item in _method_observations(core, project)
+            if item.get("id") == observation_id
+        ),
+        None,
+    )
+    if not isinstance(observation, dict) or observation.get("ready_for_candidate") is not True:
+        raise AppRequestError("这条观察尚未达到三个独立作品的候选门槛")
+    evidence = observation.get("evidence")
+    if not isinstance(evidence, list) or len(evidence) < 3:
+        raise AppRequestError("候选缺少三项独立封存证据")
+    selected = sorted(
+        evidence,
+        key=lambda item: (str(item.get("run_id")), str(item.get("attempt_id"))),
+    )[:3]
+    works = [_work_for_method_evaluation(core, project, item) for item in selected]
+    if len({str(item["work_id"]) for item in works}) != 3:
+        raise AppRequestError("候选来源必须是三个不同作品")
+    current = _production_context_snapshot(core, project)
+    initial = _initial_intent_snapshot(core, project, core.load_system(project))
+    builder_input = {
+        "candidate_id": candidate_id,
+        "observation_id": observation_id,
+        "finding_code": observation["finding_code"],
+        "feedback": observation["feedback"],
+        "initial_intent_sha256": initial["sha256"],
+        "current_method_version": current["method_version"],
+        "current_guidance_sha256": current["guidance_sha256"],
+        "source_works": [
+            {
+                "run_id": item["run_id"],
+                "work_id": item["work_id"],
+                "task_sha256": item["task_sha256"],
+                "artifact_sha256": item["artifact_sha256"],
+            }
+            for item in works
+        ],
+        "heldout_included": False,
+    }
+    context_sha256 = core.sha256_bytes(core.canonical_json_bytes(builder_input))
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "observation_id": observation_id,
+        "finding_code": observation["finding_code"],
+        "feedback": observation["feedback"],
+        "initial_intent": initial["text"],
+        "current_method_version": current["method_version"],
+        "current_guidance": current["guidance"],
+        "builder_context_sha256": context_sha256,
+        "heldout_included": False,
+        "source_works": works,
+    }
+
+
+def _method_candidate_context(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"candidate_id", "observation_id", "project"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    return _candidate_context_value(
+        core,
+        project,
+        _text(payload.get("observation_id"), "observation_id", maximum=100),
+        _id(payload.get("candidate_id"), "candidate_id"),
+    )
+
+
+def _method_generation_context_sha256(
+    core: Any,
+    *,
+    candidate_id: str,
+    phase: str,
+    role: str,
+    task: str,
+    guidance_sha256: Optional[str],
+) -> str:
+    return core.sha256_bytes(
+        core.canonical_json_bytes(
+            {
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "role": role,
+                "task_sha256": core.sha256_bytes(task.encode("utf-8")),
+                "guidance_sha256": guidance_sha256,
+            }
+        )
+    )
+
+
+def _candidate_evaluation_plan(
+    core: Any, project: Path, proposal: Mapping[str, Any]
+) -> Dict[str, Any]:
+    sources = proposal.get("source_works")
+    if not isinstance(sources, list) or len(sources) != 3:
+        raise AppRequestError("方法候选来源作品合同无效")
+    context = _candidate_context_value(
+        core,
+        project,
+        str(proposal.get("observation_id")),
+        str(proposal.get("id")),
+    )
+    works = context["source_works"]
+    heldout_task = proposal.get("heldout_task")
+    guidance_sha256 = proposal.get("guidance_sha256")
+    if not isinstance(heldout_task, str) or not isinstance(guidance_sha256, str):
+        raise AppRequestError("方法候选 held-out 或指导摘要无效")
+    current_guidance = context["current_guidance"]
+    baseline_guidance_sha256 = (
+        core.sha256_bytes(current_guidance.encode("utf-8"))
+        if isinstance(current_guidance, str)
+        else None
+    )
+    return {
+        "targeted": {
+            "task": works[2]["task"],
+            "baseline_output": works[2]["output"],
+            "source_run_id": works[2]["run_id"],
+            "candidate_context_sha256": _method_generation_context_sha256(
+                core,
+                candidate_id=str(proposal["id"]),
+                phase="targeted",
+                role="candidate",
+                task=works[2]["task"],
+                guidance_sha256=guidance_sha256,
+            ),
+        },
+        "regression": {
+            "task": works[0]["task"],
+            "baseline_output": works[0]["output"],
+            "source_run_id": works[0]["run_id"],
+            "candidate_context_sha256": _method_generation_context_sha256(
+                core,
+                candidate_id=str(proposal["id"]),
+                phase="regression",
+                role="candidate",
+                task=works[0]["task"],
+                guidance_sha256=guidance_sha256,
+            ),
+        },
+        "heldout": {
+            "task": heldout_task,
+            "baseline_context_sha256": _method_generation_context_sha256(
+                core,
+                candidate_id=str(proposal["id"]),
+                phase="heldout",
+                role="baseline",
+                task=heldout_task,
+                guidance_sha256=baseline_guidance_sha256,
+            ),
+            "candidate_context_sha256": _method_generation_context_sha256(
+                core,
+                candidate_id=str(proposal["id"]),
+                phase="heldout",
+                role="candidate",
+                task=heldout_task,
+                guidance_sha256=guidance_sha256,
+            ),
+        },
+    }
+
+
+def _create_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(
+        payload,
+        "payload",
+        {
+            "builder_attested_by",
+            "builder_context_id",
+            "builder_provenance",
+            "builder_role_id",
+            "builder_task_id",
+            "candidate_id",
+            "guidance",
+            "observation_id",
+            "project",
+        },
+    )
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    observation_id = _text(payload.get("observation_id"), "observation_id", maximum=100)
+    context = _candidate_context_value(core, project, observation_id, candidate_id)
+    guidance = _text(payload.get("guidance"), "guidance", maximum=2000, multiline=True)
+    if "```" in guidance or "<script" in guidance.casefold():
+        raise AppRequestError("方法候选只能是声明式创作指导，不接受代码块或脚本")
+    builder_provenance = _runtime_provenance(
+        core,
+        payload.get("builder_provenance"),
+        f"builder-{candidate_id}",
+        expected_context_sha256=context["builder_context_sha256"],
+    )
+    root = _candidate_root(project, candidate_id)
+    if os.path.lexists(str(root)):
+        _, proposal, status = _load_method_candidate(core, project, candidate_id)
+        if proposal.get("guidance") != guidance:
+            raise AppRequestError("同一 candidate_id 已绑定不同指导")
+        return {
+            "status": "PASS",
+            "candidate_id": candidate_id,
+            "lifecycle": status.get("lifecycle"),
+            "evaluation_plan": _candidate_evaluation_plan(core, project, proposal),
+            "idempotent": True,
+        }
+    current = _production_context_snapshot(core, project)
+    heldout_task = (
+        f"围绕这个创作方向完成一项全新的代表性作品，人物、情节或表达不得复用前三项："
+        f"{context['initial_intent']}"
+    )
+    proposal = _record(
+        core,
+        "AppMethodCandidate",
+        candidate_id,
+        {
+            "candidate_class": "APP_METHOD_MINIMUM",
+            "formal_l4_authority": False,
+            "observation_id": observation_id,
+            "finding_code": context["finding_code"],
+            "feedback": context["feedback"],
+            "source_works": [
+                {
+                    "run_id": item["run_id"],
+                    "work_id": item["work_id"],
+                    "task_sha256": item["task_sha256"],
+                    "artifact_sha256": item["artifact_sha256"],
+                    "provenance_sha256": item["provenance_sha256"],
+                }
+                for item in context["source_works"]
+            ],
+            "builder": {
+                "role_id": _id(payload.get("builder_role_id"), "builder_role_id"),
+                "context_id": _text(payload.get("builder_context_id"), "builder_context_id", maximum=300),
+                "task_id": _text(payload.get("builder_task_id"), "builder_task_id", maximum=300),
+                "attested_by": _text(payload.get("builder_attested_by"), "builder_attested_by", maximum=300),
+                "input_context_sha256": context["builder_context_sha256"],
+                "heldout_included": False,
+            },
+            "builder_provenance": "builder-provenance.json",
+            "guidance": guidance,
+            "guidance_sha256": core.sha256_bytes(guidance.encode("utf-8")),
+            "previous_method_version": current["method_version"],
+            "heldout_task": heldout_task,
+            "heldout_created_after_builder": True,
+            "evaluation_policy": "exact-three-human-blind",
+        },
+    )
+    status = _record(
+        core,
+        "AppMethodCandidateStatus",
+        f"status-{candidate_id}",
+        {
+            "candidate_id": candidate_id,
+            "proposal_sha256": "PENDING",
+            "lifecycle": "CANDIDATE",
+            "evaluation_summary": None,
+            "promotion_receipt": None,
+            "rejection_receipt": None,
+        },
+    )
+    core.guarded_mkdir_project(project, root.parent, "app method candidates root")
+    staging = Path(tempfile.mkdtemp(prefix=f".{candidate_id}.", dir=str(root.parent)))
+    try:
+        core.atomic_create_json(staging / "proposal.json", proposal)
+        core.atomic_create_json(staging / "builder-provenance.json", builder_provenance)
+        status["proposal_sha256"] = core.sha256_file(staging / "proposal.json")
+        status["content_hash"] = core.app_record_content_hash(status)
+        core.atomic_create_json(staging / "status.json", status)
+        os.rename(str(staging), str(root))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "lifecycle": "CANDIDATE",
+        "guidance": guidance,
+        "evaluation_plan": _candidate_evaluation_plan(core, project, proposal),
+        "idempotent": False,
+    }
+
+
+def _candidate_status_update(
+    core: Any, root: Path, status: Mapping[str, Any], **updates: Any
+) -> Dict[str, Any]:
+    value = {**dict(status), **updates}
+    value["content_hash"] = core.app_record_content_hash(value)
+    core.atomic_write_json(root / "status.json", value)
+    return value
+
+
+def _normalize_method_generation(
+    core: Any,
+    value: Any,
+    *,
+    candidate_id: str,
+    label: str,
+    expected_context_sha256: str,
+) -> Dict[str, Any]:
+    item = _mapping(value, label)
+    _exact_keys(item, label, {"output", "runtime_provenance"})
+    output = _text(item.get("output"), f"{label}.output", maximum=500000, multiline=True)
+    provenance = _runtime_provenance(
+        core,
+        item.get("runtime_provenance"),
+        f"{candidate_id}-{label.replace('_', '-')}",
+        expected_context_sha256=expected_context_sha256,
+    )
+    return {
+        "output": output,
+        "output_sha256": core.sha256_bytes(output.encode("utf-8")),
+        "provenance": provenance,
+    }
+
+
+def _stage_method_comparisons(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"candidate_id", "generations", "project"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    root, proposal, status = _load_method_candidate(core, project, candidate_id)
+    if status.get("lifecycle") not in {"CANDIDATE", "EVALUATING", "READY_FOR_HUMAN"}:
+        raise AppRequestError("当前方法候选不能建立盲比")
+    generations = _mapping(payload.get("generations"), "generations")
+    _exact_keys(
+        generations,
+        "generations",
+        {
+            "heldout_baseline",
+            "heldout_candidate",
+            "regression_candidate",
+            "targeted_candidate",
+        },
+    )
+    plan = _candidate_evaluation_plan(core, project, proposal)
+    normalized = {
+        "targeted_candidate": _normalize_method_generation(
+            core,
+            generations.get("targeted_candidate"),
+            candidate_id=candidate_id,
+            label="targeted_candidate",
+            expected_context_sha256=plan["targeted"]["candidate_context_sha256"],
+        ),
+        "regression_candidate": _normalize_method_generation(
+            core,
+            generations.get("regression_candidate"),
+            candidate_id=candidate_id,
+            label="regression_candidate",
+            expected_context_sha256=plan["regression"]["candidate_context_sha256"],
+        ),
+        "heldout_baseline": _normalize_method_generation(
+            core,
+            generations.get("heldout_baseline"),
+            candidate_id=candidate_id,
+            label="heldout_baseline",
+            expected_context_sha256=plan["heldout"]["baseline_context_sha256"],
+        ),
+        "heldout_candidate": _normalize_method_generation(
+            core,
+            generations.get("heldout_candidate"),
+            candidate_id=candidate_id,
+            label="heldout_candidate",
+            expected_context_sha256=plan["heldout"]["candidate_context_sha256"],
+        ),
+    }
+    context = _candidate_context_value(
+        core, project, str(proposal["observation_id"]), candidate_id
+    )
+    source_by_run = {item["run_id"]: item for item in context["source_works"]}
+    source_provenance = [
+        source_by_run[str(plan[phase]["source_run_id"])]["provenance"]
+        for phase in ("targeted", "regression")
+    ]
+    builder_provenance = core.load_json(
+        core.regular_project_file(
+            project,
+            (root / "builder-provenance.json").relative_to(project).as_posix(),
+            "builder provenance",
+        )
+    )
+    provenances = [
+        *source_provenance,
+        builder_provenance,
+        *(item["provenance"] for item in normalized.values()),
+    ]
+    models = {item.get("returned_model") for item in provenances if isinstance(item, dict)}
+    fingerprints = {
+        item.get("system_fingerprint") for item in provenances if isinstance(item, dict)
+    }
+    if len(models) != 1 or None in models or len(fingerprints) != 1 or None in fingerprints:
+        raise AppRequestError("候选比较期间模型或 system_fingerprint 已变化；请建立新基线")
+
+    pairs = {
+        "targeted": (
+            str(plan["targeted"]["baseline_output"]),
+            normalized["targeted_candidate"]["output"],
+        ),
+        "regression": (
+            str(plan["regression"]["baseline_output"]),
+            normalized["regression_candidate"]["output"],
+        ),
+        "heldout": (
+            normalized["heldout_baseline"]["output"],
+            normalized["heldout_candidate"]["output"],
+        ),
+    }
+    for phase, (baseline, candidate) in pairs.items():
+        phase_root = root / "comparisons" / phase
+        if os.path.lexists(str(phase_root)):
+            public = core.load_json(phase_root / "public.json")
+            if not isinstance(public, dict):
+                raise AppRequestError("既有盲比合同无效")
+            continue
+        candidate_left = int(
+            hashlib.sha256(f"{candidate_id}:{phase}".encode("utf-8")).hexdigest()[:2],
+            16,
+        ) % 2 == 0
+        left = candidate if candidate_left else baseline
+        right = baseline if candidate_left else candidate
+        mapping = _record(
+            core,
+            "AppMethodBlindMapping",
+            f"mapping-{candidate_id}-{phase}",
+            {
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "candidate_label": "A" if candidate_left else "B",
+                "baseline_label": "B" if candidate_left else "A",
+                "hidden_from_renderer_until_decision": True,
+            },
+        )
+        public = _record(
+            core,
+            "AppMethodBlindComparison",
+            f"comparison-{candidate_id}-{phase}",
+            {
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "left": left,
+                "left_sha256": core.sha256_bytes(left.encode("utf-8")),
+                "right": right,
+                "right_sha256": core.sha256_bytes(right.encode("utf-8")),
+                "model": next(iter(models)),
+                "system_fingerprint": next(iter(fingerprints)),
+                "mapping_disclosed": False,
+            },
+        )
+        core.guarded_mkdir_project(project, phase_root, "app method comparison")
+        core.atomic_create_json(phase_root / "mapping.json", mapping)
+        core.atomic_create_json(phase_root / "public.json", public)
+        generation_root = phase_root / "generation"
+        core.guarded_mkdir_project(project, generation_root, "comparison generation")
+        if phase == "heldout":
+            phase_generations = {
+                "baseline": normalized["heldout_baseline"],
+                "candidate": normalized["heldout_candidate"],
+            }
+        else:
+            phase_generations = {
+                "candidate": normalized[f"{phase}_candidate"],
+            }
+        for name, item in phase_generations.items():
+            core.atomic_create_json(
+                generation_root / f"{name}-provenance.json", item["provenance"]
+            )
+    _candidate_status_update(
+        core,
+        root,
+        status,
+        lifecycle="EVALUATING",
+        model=next(iter(models)),
+        system_fingerprint=next(iter(fingerprints)),
+    )
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "lifecycle": "EVALUATING",
+        "snapshot": _system_snapshot({"project": str(project)}),
+    }
+
+
+def _submit_method_comparison(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"candidate_id", "choice", "phase", "project"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    phase = _text(payload.get("phase"), "phase", maximum=20)
+    choice = _text(payload.get("choice"), "choice", maximum=10).upper()
+    if phase not in METHOD_PHASES or choice not in METHOD_CHOICES:
+        raise AppRequestError("盲比 phase 或 choice 无效")
+    root, _, status = _load_method_candidate(core, project, candidate_id)
+    if status.get("lifecycle") not in {"EVALUATING", "READY_FOR_HUMAN", "BLOCKED"}:
+        raise AppRequestError("当前候选不能提交盲比")
+    phase_root = root / "comparisons" / phase
+    public_path, mapping_path, _, mapping = _validated_method_comparison(
+        core, project, root, candidate_id, phase
+    )
+    decision_path = phase_root / "decision.json"
+    if os.path.lexists(str(decision_path)):
+        decision = _validated_method_decision(
+            core, project, root, candidate_id, phase
+        )
+        if decision is None or decision.get("choice") != choice:
+            raise AppRequestError("这组盲比已提交不同选择，拒绝覆盖")
+    else:
+        candidate_label = mapping.get("candidate_label") if isinstance(mapping, dict) else None
+        if candidate_label not in {"A", "B"}:
+            raise AppRequestError("盲比映射无效")
+        candidate_result = "TIE" if choice == "TIE" else (
+            "PREFERRED" if choice == candidate_label else "INFERIOR"
+        )
+        decision = _record(
+            core,
+            "AppMethodBlindDecision",
+            f"decision-{candidate_id}-{phase}",
+            {
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "choice": choice,
+                "candidate_result": candidate_result,
+                "public_comparison_sha256": core.sha256_file(public_path),
+                "mapping_sha256": core.sha256_file(mapping_path),
+                "decided_by": "local-app-user",
+            },
+        )
+        core.atomic_create_json(decision_path, decision)
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for item_phase in METHOD_PHASES:
+        raw = _validated_method_decision(
+            core, project, root, candidate_id, item_phase
+        )
+        if raw is not None:
+            decisions[item_phase] = raw
+    lifecycle = "EVALUATING"
+    summary: Optional[Dict[str, Any]] = None
+    if len(decisions) == 3:
+        targeted_pass = decisions["targeted"].get("candidate_result") == "PREFERRED"
+        regression_pass = decisions["regression"].get("candidate_result") in {"PREFERRED", "TIE"}
+        heldout_pass = decisions["heldout"].get("candidate_result") in {"PREFERRED", "TIE"}
+        summary = {
+            "targeted": "IMPROVED" if targeted_pass else "NOT_IMPROVED",
+            "regression": "NON_INFERIOR" if regression_pass else "REGRESSED",
+            "heldout": "NON_INFERIOR" if heldout_pass else "WORSE",
+            "exact_three": True,
+            "human_blind": True,
+        }
+        lifecycle = "READY_FOR_HUMAN" if all(
+            (targeted_pass, regression_pass, heldout_pass)
+        ) else "BLOCKED"
+    _candidate_status_update(
+        core, root, status, lifecycle=lifecycle, evaluation_summary=summary
+    )
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "lifecycle": lifecycle,
+        "snapshot": _system_snapshot({"project": str(project)}),
+    }
+
+
+def _validated_method_comparison(
+    core: Any,
+    project: Path,
+    root: Path,
+    candidate_id: str,
+    phase: str,
+) -> tuple[Path, Path, Dict[str, Any], Dict[str, Any]]:
+    phase_root = root / "comparisons" / phase
+    public_path = core.regular_project_file(
+        project,
+        (phase_root / "public.json").relative_to(project).as_posix(),
+        "comparison public",
+    )
+    mapping_path = core.regular_project_file(
+        project,
+        (phase_root / "mapping.json").relative_to(project).as_posix(),
+        "comparison mapping",
+    )
+    public = core.load_json(public_path)
+    mapping = core.load_json(mapping_path)
+    left = public.get("left") if isinstance(public, dict) else None
+    right = public.get("right") if isinstance(public, dict) else None
+    if (
+        not isinstance(public, dict)
+        or public.get("kind") != "AppMethodBlindComparison"
+        or public.get("candidate_id") != candidate_id
+        or public.get("phase") != phase
+        or public.get("mapping_disclosed") is not False
+        or public.get("content_hash") != core.app_record_content_hash(public)
+        or not isinstance(left, str)
+        or not isinstance(right, str)
+        or public.get("left_sha256") != core.sha256_bytes(left.encode("utf-8"))
+        or public.get("right_sha256") != core.sha256_bytes(right.encode("utf-8"))
+    ):
+        raise AppRequestError("候选盲比 public 合同或摘要无效")
+    candidate_label = mapping.get("candidate_label") if isinstance(mapping, dict) else None
+    baseline_label = mapping.get("baseline_label") if isinstance(mapping, dict) else None
+    if (
+        not isinstance(mapping, dict)
+        or mapping.get("kind") != "AppMethodBlindMapping"
+        or mapping.get("candidate_id") != candidate_id
+        or mapping.get("phase") != phase
+        or candidate_label not in {"A", "B"}
+        or baseline_label not in {"A", "B"}
+        or candidate_label == baseline_label
+        or mapping.get("hidden_from_renderer_until_decision") is not True
+        or mapping.get("content_hash") != core.app_record_content_hash(mapping)
+    ):
+        raise AppRequestError("候选盲比 mapping 合同或摘要无效")
+    return public_path, mapping_path, public, mapping
+
+
+def _validated_method_decision(
+    core: Any,
+    project: Path,
+    root: Path,
+    candidate_id: str,
+    phase: str,
+) -> Optional[Dict[str, Any]]:
+    decision_path = root / "comparisons" / phase / "decision.json"
+    if not os.path.lexists(str(decision_path)):
+        return None
+    decision_file = core.regular_project_file(
+        project,
+        decision_path.relative_to(project).as_posix(),
+        "comparison decision",
+    )
+    public_path, mapping_path, _, mapping = _validated_method_comparison(
+        core, project, root, candidate_id, phase
+    )
+    decision = core.load_json(decision_file)
+    choice = decision.get("choice") if isinstance(decision, dict) else None
+    candidate_label = mapping.get("candidate_label")
+    expected_result = (
+        "TIE"
+        if choice == "TIE"
+        else "PREFERRED"
+        if choice == candidate_label
+        else "INFERIOR"
+    )
+    if (
+        not isinstance(decision, dict)
+        or decision.get("kind") != "AppMethodBlindDecision"
+        or decision.get("candidate_id") != candidate_id
+        or decision.get("phase") != phase
+        or choice not in METHOD_CHOICES
+        or decision.get("candidate_result") != expected_result
+        or decision.get("public_comparison_sha256") != core.sha256_file(public_path)
+        or decision.get("mapping_sha256") != core.sha256_file(mapping_path)
+        or decision.get("decided_by") != "local-app-user"
+        or decision.get("content_hash") != core.app_record_content_hash(decision)
+    ):
+        raise AppRequestError("候选盲比 decision 合同或摘要无效")
+    return decision
+
+
+def _adopt_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"candidate_id", "project"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    with core.exclusive_controller_lock(project):
+        root, proposal, status = _load_method_candidate(core, project, candidate_id)
+        if status.get("lifecycle") not in {"READY_FOR_HUMAN", "PROMOTED"}:
+            raise AppRequestError("候选未通过三组盲比，不能采用")
+        summary = status.get("evaluation_summary")
+        if not isinstance(summary, dict) or (
+            summary.get("targeted") != "IMPROVED"
+            or summary.get("regression") != "NON_INFERIOR"
+            or summary.get("heldout") != "NON_INFERIOR"
+            or summary.get("exact_three") is not True
+            or summary.get("human_blind") is not True
+        ):
+            raise AppRequestError("候选评价摘要未通过采用门")
+        registry = _method_registry(core, project)
+        previous = str(proposal.get("previous_method_version"))
+        if registry.get("active_method_version") not in {previous, candidate_id}:
+            raise AppRequestError("当前方法已变化，请建立新候选")
+        promotion_path = (
+            project
+            / "creative-system"
+            / "app-methods"
+            / "promotions"
+            / f"{candidate_id}.json"
+        )
+        decision_hashes: Dict[str, str] = {}
+        for phase in METHOD_PHASES:
+            decision = _validated_method_decision(
+                core, project, root, candidate_id, phase
+            )
+            if decision is None:
+                raise AppRequestError("候选缺少 exact-three 盲比决定")
+            decision_hashes[phase] = core.sha256_file(
+                core.regular_project_file(
+                    project,
+                    (root / "comparisons" / phase / "decision.json")
+                    .relative_to(project)
+                    .as_posix(),
+                    f"{phase} decision",
+                )
+            )
+        if os.path.lexists(str(promotion_path)):
+            promotion = core.load_json(promotion_path)
+            if (
+                not isinstance(promotion, dict)
+                or promotion.get("candidate_id") != candidate_id
+                or promotion.get("decision_sha256") != decision_hashes
+                or promotion.get("content_hash")
+                != core.app_record_content_hash(promotion)
+            ):
+                raise AppRequestError("既有方法采用凭证无效")
+        else:
+            promotion = _record(
+                core,
+                "AppMethodPromotionReceipt",
+                f"promotion-{candidate_id}",
+                {
+                    "candidate_id": candidate_id,
+                    "previous_version": previous,
+                    "new_version": candidate_id,
+                    "guidance": proposal.get("guidance"),
+                    "guidance_sha256": proposal.get("guidance_sha256"),
+                    "decision_sha256": decision_hashes,
+                    "approved_by": "local-app-user",
+                    "approval_action": "adopt-new-method",
+                    "formal_l4_authority": False,
+                    "rollback_to": previous,
+                },
+            )
+            core.guarded_mkdir_project(
+                project, promotion_path.parent, "app method promotions"
+            )
+            core.atomic_create_json(promotion_path, promotion)
+        history = list(registry.get("history", []))
+        if not any(
+            isinstance(item, dict)
+            and item.get("action") == "PROMOTE"
+            and item.get("version") == candidate_id
+            for item in history
+        ):
+            history.append(
+                {
+                    "action": "PROMOTE",
+                    "version": candidate_id,
+                    "previous_version": previous,
+                    "guidance": proposal.get("guidance"),
+                    "guidance_sha256": proposal.get("guidance_sha256"),
+                    "created_at": promotion.get("created_at"),
+                    "receipt": promotion_path.relative_to(project).as_posix(),
+                    "receipt_sha256": core.sha256_file(promotion_path),
+                }
+            )
+        registry = {
+            **registry,
+            "active_method_version": candidate_id,
+            "active_guidance_sha256": proposal.get("guidance_sha256"),
+            "history": history,
+        }
+        status = _candidate_status_update(
+            core,
+            root,
+            status,
+            lifecycle="PROMOTED",
+            promotion_receipt=promotion_path.relative_to(project).as_posix(),
+        )
+        # A promoted-but-not-yet-active candidate is safe and recoverable: the
+        # production pointer still references the previous stable method.  The
+        # inverse ordering could make production point at an unpromoted
+        # candidate and block every status read after a crash.
+        _write_method_registry(core, project, registry)
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "active_method_version": candidate_id,
+        "formal_l4": False,
+        "snapshot": _system_snapshot({"project": str(project)}),
+    }
+
+
+def _reject_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"candidate_id", "project"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    with core.exclusive_controller_lock(project):
+        root, _, status = _load_method_candidate(core, project, candidate_id)
+        if status.get("lifecycle") == "PROMOTED":
+            raise AppRequestError("已采用方法不能改写为拒绝；请使用回滚")
+        receipt_path = root / "rejection.json"
+        if not os.path.lexists(str(receipt_path)):
+            receipt = _record(
+                core,
+                "AppMethodRejectionReceipt",
+                f"rejection-{candidate_id}",
+                {
+                    "candidate_id": candidate_id,
+                    "rejected_by": "local-app-user",
+                    "active_method_unchanged": True,
+                },
+            )
+            core.atomic_create_json(receipt_path, receipt)
+        _candidate_status_update(
+            core,
+            root,
+            status,
+            lifecycle="REJECTED",
+            rejection_receipt=receipt_path.relative_to(project).as_posix(),
+        )
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "snapshot": _system_snapshot({"project": str(project)}),
+    }
+
+
+def _rollback_method(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"project", "to_version"})
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    to_version = _id(payload.get("to_version"), "to_version")
+    with core.exclusive_controller_lock(project):
+        registry = _method_registry(core, project)
+        previous = str(registry.get("active_method_version"))
+        if previous == to_version:
+            return {
+                "status": "PASS",
+                "active_method_version": to_version,
+                "idempotent": True,
+                "snapshot": _system_snapshot({"project": str(project)}),
+            }
+        known = {"baseline-v1"}
+        for item in registry.get("history", []):
+            if isinstance(item, dict) and isinstance(item.get("version"), str):
+                known.add(str(item["version"]))
+        if to_version not in known:
+            raise AppRequestError("回滚目标不是已知稳定方法版本")
+        guidance_sha256: Optional[str] = None
+        if to_version != "baseline-v1":
+            _, proposal, status = _load_method_candidate(core, project, to_version)
+            if status.get("lifecycle") != "PROMOTED":
+                raise AppRequestError("回滚目标没有有效采用凭证")
+            guidance_sha256 = str(proposal.get("guidance_sha256"))
+        receipt_id = f"rollback-{previous}-to-{to_version}"
+        receipt_path = (
+            project
+            / "creative-system"
+            / "app-methods"
+            / "rollbacks"
+            / f"{receipt_id}.json"
+        )
+        if not os.path.lexists(str(receipt_path)):
+            receipt = _record(
+                core,
+                "AppMethodRollbackReceipt",
+                receipt_id,
+                {
+                    "previous_version": previous,
+                    "restored_version": to_version,
+                    "requested_by": "local-app-user",
+                    "history_retained": True,
+                    "formal_l4_authority": False,
+                },
+            )
+            core.guarded_mkdir_project(
+                project, receipt_path.parent, "app method rollbacks"
+            )
+            core.atomic_create_json(receipt_path, receipt)
+        else:
+            receipt = core.load_json(receipt_path)
+        history = list(registry.get("history", []))
+        history.append(
+            {
+                "action": "ROLLBACK",
+                "version": to_version,
+                "previous_version": previous,
+                "created_at": receipt.get("created_at") if isinstance(receipt, dict) else core.utc_now(),
+                "receipt": receipt_path.relative_to(project).as_posix(),
+                "receipt_sha256": core.sha256_file(receipt_path),
+            }
+        )
+        _write_method_registry(
+            core,
+            project,
+            {
+                **registry,
+                "active_method_version": to_version,
+                "active_guidance_sha256": guidance_sha256,
+                "history": history,
+            },
+        )
+    return {
+        "status": "PASS",
+        "previous_method_version": previous,
+        "active_method_version": to_version,
+        "idempotent": False,
+        "snapshot": _system_snapshot({"project": str(project)}),
+    }
+
+
 def _create_system_lab_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
     core = load_controller()
     project = _project_path(payload.get("project"))
@@ -2431,9 +3832,17 @@ def handle_request(request: Mapping[str, Any]) -> Dict[str, Any]:
         "begin_work": _begin_work,
         "cancel_work": _cancel_work,
         "complete_work": _complete_work,
+        "create_method_candidate": _create_method_candidate,
         "record_feedback": _record_feedback,
+        "adopt_method_candidate": _adopt_method_candidate,
+        "method_candidate_context": _method_candidate_context,
+        "production_context": _production_context,
+        "reject_method_candidate": _reject_method_candidate,
         "resume_feedback": _resume_feedback,
+        "rollback_method": _rollback_method,
         "seal_feedback": _seal_feedback,
+        "stage_method_comparisons": _stage_method_comparisons,
+        "submit_method_comparison": _submit_method_comparison,
         "submit_feedback": _submit_feedback,
         "create_system_lab_candidate": _create_system_lab_candidate,
         "candidate_summary": _candidate_summary,

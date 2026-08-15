@@ -12,10 +12,18 @@ export const CONTROLLER_OPERATIONS = [
   "candidate_summary",
   "cancel_work",
   "complete_work",
+  "create_method_candidate",
   "create_system_lab_candidate",
+  "adopt_method_candidate",
+  "method_candidate_context",
+  "production_context",
   "record_feedback",
+  "reject_method_candidate",
   "resume_feedback",
+  "rollback_method",
   "seal_feedback",
+  "stage_method_comparisons",
+  "submit_method_comparison",
   "submit_feedback",
   "system_snapshot",
 ] as const;
@@ -108,6 +116,61 @@ export interface SystemSnapshotPayload {
   readonly project: string;
 }
 
+export interface ProductionContextPayload {
+  readonly project: string;
+}
+
+export interface MethodCandidateContextPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly observation_id: string;
+}
+
+export interface CreateMethodCandidatePayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly observation_id: string;
+  readonly guidance: string;
+  readonly builder_role_id: string;
+  readonly builder_context_id: string;
+  readonly builder_task_id: string;
+  readonly builder_attested_by: string;
+  readonly builder_provenance: CompleteWorkRuntimeProvenance;
+}
+
+export interface MethodGeneration {
+  readonly output: string;
+  readonly runtime_provenance: CompleteWorkRuntimeProvenance;
+}
+
+export interface StageMethodComparisonsPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly generations: {
+    readonly targeted_candidate: MethodGeneration;
+    readonly regression_candidate: MethodGeneration;
+    readonly heldout_baseline: MethodGeneration;
+    readonly heldout_candidate: MethodGeneration;
+  };
+}
+
+export interface SubmitMethodComparisonPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly phase: "targeted" | "regression" | "heldout";
+  readonly choice: "A" | "B" | "TIE";
+}
+
+export interface MethodCandidateDecisionPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+}
+
+export interface RollbackMethodPayload {
+  readonly project: string;
+  readonly to_version: string;
+}
+
 export interface RecordFeedbackPayload {
   readonly project: string;
   readonly run_id: string;
@@ -198,10 +261,18 @@ export type ControllerRequest =
   | ControllerRequestBase<"candidate_summary", CandidateSummaryPayload>
   | ControllerRequestBase<"cancel_work", CancelWorkPayload>
   | ControllerRequestBase<"complete_work", CompleteWorkPayload>
+  | ControllerRequestBase<"create_method_candidate", CreateMethodCandidatePayload>
   | ControllerRequestBase<"create_system_lab_candidate", CreateSystemLabCandidatePayload>
+  | ControllerRequestBase<"adopt_method_candidate", MethodCandidateDecisionPayload>
+  | ControllerRequestBase<"method_candidate_context", MethodCandidateContextPayload>
+  | ControllerRequestBase<"production_context", ProductionContextPayload>
   | ControllerRequestBase<"record_feedback", RecordFeedbackPayload>
+  | ControllerRequestBase<"reject_method_candidate", MethodCandidateDecisionPayload>
   | ControllerRequestBase<"resume_feedback", ResumeFeedbackPayload>
+  | ControllerRequestBase<"rollback_method", RollbackMethodPayload>
   | ControllerRequestBase<"seal_feedback", SealFeedbackPayload>
+  | ControllerRequestBase<"stage_method_comparisons", StageMethodComparisonsPayload>
+  | ControllerRequestBase<"submit_method_comparison", SubmitMethodComparisonPayload>
   | ControllerRequestBase<"submit_feedback", SubmitFeedbackPayload>
   | ControllerRequestBase<"system_snapshot", SystemSnapshotPayload>;
 

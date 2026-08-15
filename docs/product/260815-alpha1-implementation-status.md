@@ -17,6 +17,8 @@
 - sandboxed Preload 采用单文件 CommonJS bundle；真实 hidden BrowserWindow smoke 验证凭证页、窄 IPC、默认 Session 零 HTTP/HTTPS 请求和无 Node 全局暴露。
 - Computer Use 已从 GUI 完成 Key 验证、Flash 选择、首次创作、直接编辑、反馈封存、四入口检查和跨进程恢复；见 [GUI 验收报告](260815-Computer-Use-GUI验收报告.md)。
 - 反馈事务中断后由 Main 依据 Controller 已保存的 intent 自动恢复；恢复失败时界面保留明确状态，并阻止新反馈和新作品覆盖原编辑。
+- 三项独立作品出现规范化后完全相同的直接反馈时，应用会形成“暂时观察”；用户可生成声明式方法候选，完成 targeted、regression、held-out 三组 A/B/TIE 盲比，并明确采用、拒绝或回滚。
+- 新方法采用后，下一项作品会把 method version、指导摘要和 context SHA256 绑定进 Controller 证据；该最小闭环不改写正式 L0–L5 成熟度。
 - CPython 3.11 PyInstaller `--onedir` Controller sidecar 构建器，以及源码/sidecar 协议差分检查。
 - Node/Python 自动测试、公开树审计、DCO、完整历史 Gitleaks、源码 archive、SBOM 与许可证清单预检。
 
@@ -44,8 +46,8 @@
 | M1 Monorepo 与治理拆包 | 已实现 | Python 采用 facade-first；旧 Skill 脚本仍是唯一治理实现，尚未反转成薄 wrapper |
 | M2 安全运行骨架 | 已实现、部分未验证 | mock、真实 DSH 启停、无 Key且零模型 fetch/lease 的 Electron 预检和 sandboxed Preload 真实 smoke 通过；macOS/Windows 打包进程与 DSH OS 级出网隔离尚未验收 |
 | M3 首个可用闭环 | 源码 GUI operational PASS | macOS arm64 当前源码 build 的 Flash Chat、GUI 编辑反馈、封存和跨进程恢复 PASS；Pro、Windows、packaged app 与非程序员体验未验证。取消只证明本地 lease revoke，不证明供应商侧在途或零计费，见 [Headless 验收](260815-Flash真实验收报告.md) 与 [GUI 验收](260815-Computer-Use-GUI验收报告.md) |
-| M4 个人创作系统 | 部分实现 | 初始意图、作品与明确反馈已落治理证据；跨作品 finding 聚类和用户可见原则管理未接通 |
-| M5 可验证自我改进 | 未接入应用 | Python 已有候选、三类评价、晋升和回滚内核；桌面端尚无真实 Candidate/Evaluator Worker 闭环 |
+| M4 个人创作系统 | 已实现最小切片、未前向验收 | 初始意图、作品、直接反馈、跨作品 exact-text 聚类和用户可见原则已接通；同义反馈聚类、正式 L2/L3 校准仍未实现 |
+| M5 可验证自我改进 | 已实现最小应用闭环、未前向验收 | DSH Candidate 生成、三组人类盲比、采用、下一作品生效和回滚已接通；没有独立模型 Judge，不满足正式 L4，也尚未由打包应用独立执行者验证 |
 | M6 系统实验室 | 协议原型 | 只能建立 `CANDIDATE_ONLY` 治理记录；应用没有生成维护者 patch 包，也不运行模型生成代码 |
 | M7 无签名预览发布 | 未完成 | 没有 DMG、EXE、portable ZIP、packaged smoke、GitHub Release 或真人安装测试 |
 
@@ -56,4 +58,8 @@
 3. 在 macOS arm64 和 Windows x64 hosted runner 生成可运行的 unpacked app，并用打包 sidecar 做 smoke test。
 4. 解决 installer 依赖供应链门禁后再生成 DMG、Windows 安装器与 portable ZIP；为每个产物绑定 SHA256、SBOM、许可证和来源 manifest。
 5. 完成 5 名非程序员验收后，才发布无签名 alpha；签名、公证与无警告安装仍是 stable blocker。
-6. 在此基础上接通跨作品 finding → 候选 → targeted/regression/held-out → 用户采用/回滚，才把应用描述为“可验证自我改进闭环”。
+6. 用打包应用和独立 `simulated-user` 完成三作品同反馈 → 候选 → exact-three 盲比 → 采用 → 第四作品生效 → 回滚；通过前仅标 `IMPLEMENTED`，不得升为 `FORWARD-TESTED`。
+
+## 当前实施目标：最小闭环，不改写正式成熟度
+
+当前实现切片遵循 [最小可验证自我改进闭环实施合同](260815-最小可验证自我改进闭环实施合同.md)：三项独立作品同一条直接反馈、声明式方法候选、三组人类盲比、明确采用、第 4 项作品实际使用和回滚已经接通自动测试。下一步是把源码与 sidecar 绑定到 clean commit，生成 macOS arm64 packaged preview，再交给独立 `simulated-user` 走完整 GUI；在此之前不会绕过 `loopctl.py` 的 L3 前置门，也不会把项目标成正式 L4。

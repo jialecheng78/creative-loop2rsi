@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -46,6 +47,31 @@ def atomic_write_json(path: Path, value: object) -> None:
         raise
 
 
+def git_text(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.stdout
+
+
+def tracked_sidecar_inputs(root: Path) -> list[str]:
+    output = subprocess.run(
+        ["git", "ls-files", "-z", "--", "python", "skills/creative-loop2rsi"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    ).stdout
+    values = [item.decode("utf-8") for item in output.split(b"\0") if item]
+    if not values:
+        raise RuntimeError("no tracked controller sidecar inputs")
+    return sorted(values)
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -75,6 +101,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not entrypoint.is_file() or not (skill_root / "scripts" / "loopctl.py").is_file():
         print("repository sidecar inputs are incomplete", file=sys.stderr)
         return 2
+    if git_text(root, "status", "--porcelain=v1", "--untracked-files=all") != "":
+        print("controller sidecar build requires a clean tracked and untracked source tree", file=sys.stderr)
+        return 2
+    git_commit = git_text(root, "rev-parse", "HEAD").strip()
+    git_tree = git_text(root, "rev-parse", "HEAD^{tree}").strip()
+    tracked_inputs = tracked_sidecar_inputs(root)
 
     suffix = "macos-arm64" if system == "Darwin" else "windows-x64"
     output = (args.output or root / "dist" / f"controller-sidecar-{suffix}").resolve()
@@ -99,20 +131,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     temporary = Path(tempfile.mkdtemp(prefix="creative-rsi-sidecar-build-"))
     try:
+        source_root = temporary / "source"
+        source_hashes: Dict[str, str] = {}
+        for relative in tracked_inputs:
+            source = root / relative
+            if not source.is_file() or source.is_symlink():
+                raise RuntimeError(f"tracked sidecar input must be a regular file: {relative}")
+            destination = source_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            source_hashes[relative] = sha256_file(source)
+        staged_entrypoint = source_root / "python" / "controller_sidecar.py"
+        staged_skill_root = source_root / "skills" / "creative-loop2rsi"
         dist_path = temporary / "dist"
         work_path = temporary / "work"
         spec_path = temporary / "spec"
-        data_argument = f"{skill_root}{os.pathsep}skills/creative-loop2rsi"
+        data_argument = f"{staged_skill_root}{os.pathsep}skills/creative-loop2rsi"
         PyInstaller.__main__.run(
             [
-                str(entrypoint),
+                str(staged_entrypoint),
                 "--name",
                 SIDECAR_NAME,
                 "--onedir",
                 "--noupx",
                 "--noconfirm",
                 "--paths",
-                str(root / "python"),
+                str(source_root / "python"),
                 "--hidden-import",
                 "uuid",
                 "--add-data",
@@ -131,9 +175,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         os.replace(built, output)
         files: Dict[str, Dict[str, object]] = {}
-        for path in sorted(item for item in output.rglob("*") if item.is_file()):
+        for path in sorted(output.rglob("*")):
             relative = path.relative_to(output).as_posix()
-            files[relative] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
+            if path.is_symlink():
+                try:
+                    path.resolve(strict=True).relative_to(output)
+                except (FileNotFoundError, ValueError) as error:
+                    raise RuntimeError(
+                        f"sidecar symlink escapes or is broken: {relative}"
+                    ) from error
+                files[relative] = {"type": "symlink", "target": os.readlink(path)}
+            elif path.is_dir():
+                continue
+            elif path.is_file():
+                files[relative] = {
+                    "type": "file",
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+            else:
+                raise RuntimeError(f"unsupported sidecar output entry: {relative}")
         atomic_write_json(
             manifest_path,
             {
@@ -145,6 +206,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "entrypoint": "python/controller_sidecar.py",
                 "bundled_skill": "skills/creative-loop2rsi",
                 "sidecar_name": SIDECAR_NAME,
+                "source": {
+                    "git_commit": git_commit,
+                    "git_tree": git_tree,
+                    "inputs": source_hashes,
+                    "builder_sha256": sha256_file(root / "tools" / "build_controller_sidecar.py"),
+                    "requirements_sha256": sha256_file(
+                        root / "python" / "requirements-build-hashed.txt"
+                    ),
+                },
                 "files": files,
             },
         )

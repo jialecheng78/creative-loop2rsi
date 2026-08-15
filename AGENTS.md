@@ -47,6 +47,10 @@
 - 已封存 attempt 不得修改；候选不得修改创作宪法、原始素材、held-out 答案、许可证、晋升政策或人工审批边界。
 - Producer 与 Judge 分离；机器不得替用户决定核心审美，无法判断时返回 `NEEDS_TASTE`。
 - 硬合同、软质量和人类立宪三类判断必须分开；结构 `PASS` 不得被描述为创作质量已通过。
+- 应用的“最小可验证自我改进”与正式 L4 必须分层：最小闭环可以在三项独立作品出现同一条直接用户反馈后建立声明式方法候选，但不得因此改写正式成熟度；正式 L4 仍受 `loopctl.py` 的 L0–L3、独立 Judge、exact-three 与晋升合同约束。
+- 最小方法候选只允许修改应用读取的声明式生产指导。候选 Builder 不得读取 held-out；评价固定为 targeted、regression、held-out 各一次盲比，由本地用户作最终审美选择。候选不得读取盲比映射、API Key、active method pointer 或回滚政策。
+- 最小方法版本必须有独立的内容寻址注册表、人工采用凭证与回滚凭证；只有三组盲比门齐全且用户明确点击采用，才可改变应用的 active method version。该版本变化不得被描述为正式 L4 晋升。
+- 新方法采用后的下一项作品必须把 active method version 与指导摘要绑定进 Controller provenance；否则不得声称系统已实际使用新方法。
 - Git commit message 使用中文；未经用户明确要求，不执行 `git push` 或公开发布。
 
 ## 验证要求

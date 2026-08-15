@@ -7,9 +7,11 @@ const rendererPath = requiredAbsoluteOption('--renderer')
 const userDataPath = requiredAbsoluteOption('--user-data-dir')
 const STATUS_CHANNEL = 'studio:status'
 const EXPECTED_TOP_LEVEL_API = [
+  'candidates',
   'credentials',
   'getStatus',
   'model',
+  'releases',
   'runtime',
   'systems',
   'works',
@@ -91,6 +93,8 @@ async function run() {
         worksOnEventType: typeof api.works?.onEvent,
         rootFrozen: Object.isFrozen(api),
         credentialsFrozen: Object.isFrozen(api.credentials),
+        candidatesFrozen: Object.isFrozen(api.candidates),
+        releasesFrozen: Object.isFrozen(api.releases),
         worksFrozen: Object.isFrozen(api.works),
         rawRequireType: typeof window.require,
         rawProcessType: typeof window.process,
@@ -107,7 +111,8 @@ async function run() {
     api_object: probe.apiType === 'object',
     api_keys_exact: JSON.stringify(probe.topLevelKeys) === JSON.stringify(EXPECTED_TOP_LEVEL_API),
     expected_functions: probe.getStatusType === 'function' && probe.worksOnEventType === 'function',
-    api_frozen: probe.rootFrozen && probe.credentialsFrozen && probe.worksFrozen,
+    api_frozen: probe.rootFrozen && probe.credentialsFrozen && probe.candidatesFrozen
+      && probe.releasesFrozen && probe.worksFrozen,
     no_raw_globals: probe.rawRequireType === 'undefined'
       && probe.rawProcessType === 'undefined'
       && probe.rawIpcRendererType === 'undefined'

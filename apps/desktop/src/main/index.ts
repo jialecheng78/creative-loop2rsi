@@ -1,5 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { pathToFileURL } from 'node:url'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 
 import { app, BrowserWindow, safeStorage, session } from 'electron'
 
@@ -32,11 +34,11 @@ const runtime = new RuntimeWorkerManager({
   },
 })
 
-function createMainWindow(): BrowserWindow {
+function createMainWindow(showWhenReady = true): BrowserWindow {
   const window = new BrowserWindow(createWindowOptions(preloadPath))
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', event => event.preventDefault())
-  window.once('ready-to-show', () => window.show())
+  if (showWhenReady) window.once('ready-to-show', () => window.show())
   void window.loadFile(rendererPath)
   return window
 }
@@ -89,7 +91,14 @@ async function bootstrapDesktop(): Promise<void> {
       webContentsId: mainWindow.webContents.id,
     }
   })
-  mainWindow = createMainWindow()
+  const packagedSmoke = app.isPackaged && process.argv.includes('--packaged-smoke')
+  mainWindow = createMainWindow(!packagedSmoke)
+
+  if (packagedSmoke) {
+    await runPackagedSmoke(mainWindow, service)
+    setImmediate(() => app.quit())
+    return
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createMainWindow()
@@ -98,6 +107,52 @@ async function bootstrapDesktop(): Promise<void> {
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit()
   })
+}
+
+async function runPackagedSmoke(window: BrowserWindow, activeService: StudioService): Promise<void> {
+  if (window.webContents.isLoadingMainFrame()) {
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      window.webContents.once('did-finish-load', () => resolvePromise())
+      window.webContents.once('did-fail-load', (_event, code) => rejectPromise(new Error(`PACKAGED_RENDERER_LOAD_FAILED_${code}`)))
+    })
+  }
+  const renderer = await window.webContents.executeJavaScript(`(() => {
+    const api = window.creativeRsi;
+    return {
+      hasApi: typeof api === 'object' && api !== null,
+      status: typeof api?.getStatus === 'function',
+      configure: typeof api?.credentials?.configure === 'function',
+      start: typeof api?.works?.start === 'function',
+      feedback: typeof api?.works?.submitFeedback === 'function',
+      nodeGlobalsAbsent: typeof window.require === 'undefined' && typeof window.process === 'undefined',
+    };
+  })()`, true) as Record<string, unknown>
+  if (Object.values(renderer).some(value => value !== true)) {
+    throw new Error('PACKAGED_RENDERER_CONTRACT_FAILED')
+  }
+  const system = await activeService.createSystem({
+    intent: '只用于打包预检的纯虚构微型故事',
+    displayName: '打包预检创作系统',
+  })
+  const status = await activeService.getStatus()
+  if (status.credential !== 'not-configured'
+    || status.activeSystem?.systemId !== system.systemId
+    || status.runtime.state !== 'unconfigured') {
+    throw new Error('PACKAGED_CONTROLLER_CONTRACT_FAILED')
+  }
+  await writeFile(
+    join(app.getPath('userData'), 'packaged-smoke.json'),
+    `${JSON.stringify({
+      status: 'PASS',
+      app_version: app.getVersion(),
+      packaged: app.isPackaged,
+      renderer,
+      controller_system_id: system.systemId,
+      credential: status.credential,
+      model_requests: 0,
+    }, null, 2)}\n`,
+    { encoding: 'utf8', mode: 0o600 },
+  )
 }
 
 async function shutdownDesktop(): Promise<void> {

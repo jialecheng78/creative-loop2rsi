@@ -16,6 +16,11 @@ export const IPC_CHANNELS = {
   worksStart: 'studio:works:start',
   worksCancel: 'studio:works:cancel',
   worksSubmitFeedback: 'studio:works:submit-feedback',
+  candidatesPrepare: 'studio:candidates:prepare',
+  candidatesCompare: 'studio:candidates:compare',
+  candidatesAdopt: 'studio:candidates:adopt',
+  candidatesReject: 'studio:candidates:reject',
+  releasesRollback: 'studio:releases:rollback',
   studioEvent: 'studio:event',
 } as const
 
@@ -39,6 +44,58 @@ export interface WorkSnapshot {
   readonly humanAccepted: boolean | null
   readonly humanDirection: 'BLOCK' | 'PASS' | 'UNKNOWN'
   readonly decision: string | null
+  readonly methodVersion: string
+  readonly methodGuidanceSha256: string | null
+}
+
+export interface MethodObservationSnapshot {
+  readonly id: string
+  readonly findingCode: string
+  readonly feedback: string
+  readonly independentWorks: number
+  readonly independentRuns: number
+  readonly independentTasks: number
+  readonly readyForCandidate: boolean
+}
+
+export interface AdoptedPrincipleSnapshot {
+  readonly version: string
+  readonly guidance: string
+  readonly adoptedAt: string
+  readonly active: boolean
+}
+
+export type MethodComparisonPhase = 'targeted' | 'regression' | 'heldout'
+export type MethodComparisonChoice = 'A' | 'B' | 'TIE'
+
+export interface MethodComparisonSnapshot {
+  readonly phase: MethodComparisonPhase
+  readonly left: string
+  readonly right: string
+  readonly choice: MethodComparisonChoice | null
+}
+
+export interface MethodCandidateSnapshot {
+  readonly id: string
+  readonly title: string
+  readonly summary: string
+  readonly tradeoff: string
+  readonly status: string
+  readonly ready: boolean
+  readonly comparisons: readonly MethodComparisonSnapshot[]
+}
+
+export interface MethodHistorySnapshot {
+  readonly action: 'PROMOTE' | 'ROLLBACK'
+  readonly version: string
+  readonly previousVersion: string
+  readonly createdAt: string
+}
+
+export interface MethodSnapshot {
+  readonly activeVersion: string
+  readonly activeGuidance: string | null
+  readonly history: readonly MethodHistorySnapshot[]
 }
 
 export interface SystemSnapshot {
@@ -55,6 +112,10 @@ export interface SystemSnapshot {
   readonly interruptedRun: InterruptedRunSnapshot | null
   readonly feedbackRecoveryRequired: boolean
   readonly pendingFeedback: PendingFeedbackSnapshot | null
+  readonly observations: readonly MethodObservationSnapshot[]
+  readonly adoptedPrinciples: readonly AdoptedPrincipleSnapshot[]
+  readonly method: MethodSnapshot
+  readonly methodCandidates: readonly MethodCandidateSnapshot[]
 }
 
 export interface InterruptedRunSnapshot {
@@ -118,6 +179,24 @@ export interface SubmitFeedbackResult {
   readonly snapshot: SystemSnapshot
 }
 
+export interface PrepareCandidateInput {
+  readonly observationId: string
+}
+
+export interface CompareCandidateInput {
+  readonly candidateId: string
+  readonly phase: MethodComparisonPhase
+  readonly choice: MethodComparisonChoice
+}
+
+export interface CandidateDecisionInput {
+  readonly candidateId: string
+}
+
+export interface RollbackMethodInput {
+  readonly version: string
+}
+
 /**
  * Public run handle. `runId` is the governed Controller run, not DSH's
  * process-local run id. `sessionId` is opaque and exists only for the
@@ -147,6 +226,15 @@ export interface CreativeRsiApi {
     cancel(input: CancelWorkInput): Promise<void>
     submitFeedback(input: SubmitFeedbackInput): Promise<SubmitFeedbackResult>
     onEvent(listener: (event: StudioEvent) => void): () => void
+  }
+  candidates: {
+    prepare(input: PrepareCandidateInput): Promise<SystemSnapshot>
+    compare(input: CompareCandidateInput): Promise<SystemSnapshot>
+    adopt(input: CandidateDecisionInput): Promise<SystemSnapshot>
+    reject(input: CandidateDecisionInput): Promise<SystemSnapshot>
+  }
+  releases: {
+    rollback(input: RollbackMethodInput): Promise<SystemSnapshot>
   }
   /** Governed compatibility surface for the initial renderer. */
   runtime: {

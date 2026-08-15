@@ -2,7 +2,7 @@
 
 `creative-loop2rsi` 正在演进为 **Creative RSI Studio**：一套中文优先、本地优先的开源桌面应用，帮助普通用户从第一次创作开始，把自己的创作标准逐步变成一套可运行、可恢复、可审计、可验证改进的系统。
 
-原有 Codex Builder Skill 和 Python `loopctl` 治理控制器继续保留。当前应用源码已接通普通用户首次创作与反馈，DSH 只承载 Production 创作 Worker；Judge、Candidate、Evaluator 与应用内晋升/回滚仍是目标架构。Python Controller 继续负责证据与既有治理命令。即使后续 DSH 候选工作流运行成功，也不等于候选已获准进入生产。
+原有 Codex Builder Skill 和 Python `loopctl` 治理控制器继续保留。当前应用源码已接通普通用户首次创作、跨作品重复反馈、声明式方法候选、三组人类盲比、明确采用与回滚。DSH 承载 Production 与 Candidate 生成，Python Controller 保存证据并执行门禁；Judge、模型 Evaluator 与正式 L4 仍未接入应用。候选工作流运行成功不等于候选已获准进入生产。
 
 ```text
 创作立宪
@@ -42,9 +42,9 @@
 
 | 层 | 负责什么 | 不负责什么 |
 |---|---|---|
-| Creative RSI Studio | 当前负责普通用户首次创作与反馈；候选比较和版本操作为 `PROPOSED` | 不向用户暴露运行时和治理细节 |
+| Creative RSI Studio | 负责普通用户创作、反馈、重复观察、三组盲比、方法采用与回滚 | 不向用户暴露运行时和治理细节，不把最小闭环冒充正式 L4 |
 | Builder Skill | 用自然语言引导立宪、选择下一成熟度、解释阻塞原因 | 不保存运行事实，不代替控制器 |
-| DSH Runtime Adapter | 当前运行 Production Producer；Judge、Builder 和 Evaluator 为 `PROPOSED` | 不决定候选能否晋升 |
+| DSH Runtime Adapter | 当前运行 Production 与声明式 Candidate Builder；Judge 和模型 Evaluator 为 `PROPOSED` | 不决定候选能否晋升 |
 | 领域 Skill / System Recipe | 承载使用者自己的创作方法、语境和交互方式 | 不自行改变受保护规则 |
 | Python Controller 与运行项目 | 保存合同、状态、证据、候选、晋升与回滚记录 | 不调用模型，不判断作品是否“有灵魂” |
 
@@ -71,7 +71,7 @@
 | Electron Main → DSH → Gateway → Controller 的 Flash 创作、封存、重启恢复与本地取消边界 | `IMPLEMENTED` | macOS arm64 当前 headless build 已取得一次真实 Flash PASS；`quality_status=NOT_EVALUATED`，且本次未绑定忽略目录 build digest，不能外推为文学质量或可复现发布产物，见 [验收报告](docs/product/260815-Flash真实验收报告.md) |
 | Renderer / Preload / IPC 的普通用户 GUI 闭环 | `IMPLEMENTED` | macOS arm64 当前源码 build 已取得一次 Computer Use + 真实 Flash operational PASS；不是独立真人测试、安装包或可复现发布证据，见 [GUI 验收报告](docs/product/260815-Computer-Use-GUI验收报告.md) |
 | DSH 运行中 Session 的跨进程恢复 | `UNVALIDATED` | v1 主动禁用：rc.6 持久化会落盘 reasoning；只从 Controller 封存边界重新派发 |
-| 应用内跨作品 finding、候选三评估、采用与回滚 | `PROPOSED` | Renderer 只有诚实空态；现有 Python 治理能力尚未接成普通用户闭环 |
+| 应用内跨作品重复反馈、候选三组盲比、采用与回滚 | `IMPLEMENTED` | 仅聚合三项独立作品中规范化后完全相同的直接反馈；评价者是本地用户，尚未做打包应用的独立模拟用户验收，也不改变正式 L0–L5 成熟度 |
 | 无签名 macOS / Windows 安装包 | `PROPOSED` | 当前只完成编译和 sidecar 预检；没有可下载的 DMG、EXE 或 portable ZIP |
 
 ## Skill 基线安装
