@@ -16,7 +16,7 @@ import {
 } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
@@ -39,7 +39,21 @@ if (process.versions.electron === undefined) {
     process.exitCode = 1
   }
 } else {
-  await runElectronPhase()
+  const outerTracker = {
+    phase: optionalOption('--phase') ?? 'electron',
+    stage: 'boot',
+  }
+  // Electron's default app waits for this ESM entrypoint to finish loading
+  // before it emits `ready`. Awaiting runElectronPhase() here would therefore
+  // deadlock on app.whenReady(). Schedule it and let module evaluation finish.
+  void runElectronPhase().catch(error => {
+    const report = JSON.stringify({
+      kind: 'live-phase-result-v1',
+      status: 'BLOCK',
+      error: publicError(error, outerTracker),
+    })
+    process.stdout.write(`${report}\n`, () => process.exit(1))
+  })
 }
 
 async function runLauncher() {
@@ -61,12 +75,16 @@ async function runLauncher() {
   const stateDirectory = await mkdtemp(join(tmpdir(), 'creative-rsi-flash-live-'))
   let finalReport
   let keyHandle
+  let preflight
   let produced
   let restartedBeforeCancel
   let cancelled
   let restartedAfterCancel
   try {
     await chmod(stateDirectory, 0o700)
+    preflight = runPhase(electronBinary, 'preflight', stateDirectory)
+    if (preflight.status !== 'PASS') throw phaseError('preflight', preflight)
+
     keyHandle = await open(keyFile, 'r')
     produced = runPhase(electronBinary, 'produce', stateDirectory, keyHandle.fd)
     await keyHandle.close()
@@ -94,6 +112,7 @@ async function runLauncher() {
       status: 'PASS',
       test: 'creative-rsi-studio-flash-live-acceptance',
       source: sourceAfter,
+      preflight: preflight.preflight,
       credential: produced.credential,
       model_discovery: produced.model_discovery,
       success: produced.success,
@@ -119,6 +138,7 @@ async function runLauncher() {
       source: sourceIdentity(),
       error: publicError(error),
       checks: {
+        preflight: phaseSummary(preflight),
         produce: phaseSummary(produced),
         restart_before_cancel: phaseSummary(restartedBeforeCancel),
         cancellation: phaseSummary(cancelled),
@@ -175,22 +195,25 @@ async function runElectronPhase() {
   const tracker = { phase, stage: 'boot', startedAt: Date.now() }
   checkpoint(tracker, 'boot')
   const stateDirectory = resolve(requiredOption('--state-directory'))
-  if (!stateDirectory.startsWith(resolve(tmpdir()) + '/creative-rsi-flash-live-')) {
+  if (!isAcceptanceTemporaryDirectory(stateDirectory)) {
     throw new Error('state directory is outside the acceptance namespace')
   }
   const { app, safeStorage } = await import('electron')
+  checkpoint(tracker, 'electron-module-loaded')
   app.setName('Creative RSI Studio Live Acceptance')
   app.setPath('userData', stateDirectory)
   await app.whenReady()
   checkpoint(tracker, 'electron-ready')
   try {
-    const report = phase === 'produce'
-      ? await producePhase({ app, safeStorage, stateDirectory, tracker })
-      : phase === 'cancel'
-        ? await cancelPhase({ app, safeStorage, stateDirectory, tracker })
-        : phase === 'restart-success' || phase === 'restart-cancel'
-          ? await restartPhase({ app, safeStorage, stateDirectory, tracker })
-          : fail('unknown acceptance phase')
+    const report = phase === 'preflight'
+      ? await preflightPhase({ app, safeStorage, stateDirectory, tracker })
+      : phase === 'produce'
+        ? await producePhase({ app, safeStorage, stateDirectory, tracker })
+        : phase === 'cancel'
+          ? await cancelPhase({ app, safeStorage, stateDirectory, tracker })
+          : phase === 'restart-success' || phase === 'restart-cancel'
+            ? await restartPhase({ app, safeStorage, stateDirectory, tracker })
+            : fail('unknown acceptance phase')
     await writeElectronReport(app, { kind: 'live-phase-result-v1', ...report }, 0)
   } catch (error) {
     await writeElectronReport(app, {
@@ -198,6 +221,38 @@ async function runElectronPhase() {
       status: 'BLOCK',
       error: publicError(error, tracker),
     }, 1)
+  }
+}
+
+async function preflightPhase({ app, safeStorage, stateDirectory, tracker }) {
+  const originalFetch = globalThis.fetch
+  let fetchAttempts = 0
+  let context
+  globalThis.fetch = async () => {
+    fetchAttempts += 1
+    throw new Error('network access is forbidden during Electron preflight')
+  }
+  try {
+    context = await createLiveContext({ app, safeStorage, stateDirectory })
+    checkpoint(tracker, 'context-ready')
+    if (fetchAttempts !== 0 || context.loopback.leases.length !== 0) {
+      fail('preflight attempted a model request')
+    }
+    checkpoint(tracker, 'shutdown')
+    await requireBoundedShutdown(context.service, tracker)
+    context.shutdown = true
+    return {
+      status: 'PASS',
+      preflight: {
+        separate_electron_process: true,
+        key_file_opened: false,
+        model_api_fetch_attempts: fetchAttempts,
+        model_gateway_leases_issued: context.loopback.leases.length,
+      },
+    }
+  } finally {
+    if (context !== undefined && !context.shutdown) await boundedShutdown(context.service)
+    globalThis.fetch = originalFetch
   }
 }
 
@@ -681,7 +736,7 @@ async function allRegularFiles(root) {
 }
 
 async function oneFileNamed(root, name) {
-  const matches = (await allRegularFiles(root)).filter(path => path.endsWith(`/${name}`))
+  const matches = (await allRegularFiles(root)).filter(path => basename(path) === name)
   if (matches.length !== 1) fail(`${name} count is not exactly one`)
   return matches[0]
 }
@@ -795,10 +850,16 @@ function launcherEnvironment() {
   return result
 }
 
-function requiredOption(name) {
+function optionalOption(name) {
   const index = process.argv.indexOf(name)
-  if (index < 0 || index + 1 >= process.argv.length) throw new Error(`missing ${name}`)
+  if (index < 0 || index + 1 >= process.argv.length) return undefined
   return process.argv[index + 1]
+}
+
+function requiredOption(name) {
+  const value = optionalOption(name)
+  if (value === undefined) throw new Error(`missing ${name}`)
+  return value
 }
 
 function parseJsonLines(stdout) {
@@ -917,8 +978,19 @@ async function fileMode(path) {
 
 async function removeValidatedTemporaryDirectory(path) {
   const resolved = resolve(path)
-  if (!resolved.startsWith(resolve(tmpdir()) + '/creative-rsi-flash-live-')) fail('refusing unsafe temporary cleanup')
+  if (!isAcceptanceTemporaryDirectory(resolved)) fail('refusing unsafe temporary cleanup')
   await rm(resolved, { recursive: true, force: true })
+}
+
+function isAcceptanceTemporaryDirectory(path) {
+  const temporaryRoot = resolve(tmpdir())
+  const candidate = resolve(path)
+  const relativePath = relative(temporaryRoot, candidate)
+  return relativePath !== ''
+    && relativePath !== '..'
+    && !relativePath.startsWith(`..${sep}`)
+    && !isAbsolute(relativePath)
+    && basename(candidate).startsWith('creative-rsi-flash-live-')
 }
 
 function sha256FileSync(path) {
