@@ -49,8 +49,9 @@ describe('preview build inventory', () => {
   it('binds sidecar bytes and all tracked controller inputs to the source identity', async () => {
     const sidecar = await mkdtemp(join(tmpdir(), 'preview-sidecar-'))
     temporary.push(sidecar)
-    const executable = join(sidecar, 'creative-rsi-controller')
+    const executable = join(sidecar, 'Python')
     await writeFile(executable, 'synthetic-sidecar')
+    await writeFile(join(sidecar, 'base_library.zip'), 'base')
     const tracked = git('ls-files', '-z', '--', 'python', 'skills/creative-loop2rsi')
       .split('\0').filter(Boolean).sort()
     const inputs = Object.fromEntries(await Promise.all(tracked.map(async path => [
@@ -72,8 +73,11 @@ describe('preview build inventory', () => {
         requirements_sha256: sha256(await readFile(join(repositoryRoot, 'python/requirements-build-hashed.txt'))),
       },
       files: {
-        'creative-rsi-controller': {
+        Python: {
           type: 'file', bytes: 17, sha256: sha256(Buffer.from('synthetic-sidecar')),
+        },
+        'base_library.zip': {
+          type: 'file', bytes: 4, sha256: sha256(Buffer.from('base')),
         },
       },
     }

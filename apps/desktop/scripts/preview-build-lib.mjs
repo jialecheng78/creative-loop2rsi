@@ -177,7 +177,7 @@ export async function validateSidecarEvidence(directory, evidence, options) {
   const declared = Object.entries(declaredFiles).map(([path, value]) => value?.type === 'file'
     ? { path, type: 'file', bytes: value.bytes, sha256: value.sha256 }
     : { path, type: 'symlink', target: value?.target })
-    .sort((left, right) => left.path.localeCompare(right.path))
+    .sort((left, right) => left.path === right.path ? 0 : left.path < right.path ? -1 : 1)
   if (JSON.stringify(declared) !== JSON.stringify(actual)) {
     throw new Error('controller sidecar bytes differ from its manifest')
   }
