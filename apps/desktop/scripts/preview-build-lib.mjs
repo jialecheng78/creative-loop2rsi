@@ -42,7 +42,7 @@ export async function buildPreview(options) {
     root, source, platform, arch,
   })
 
-  const outputRoot = resolve(options.outputRoot ?? join(root, 'dist', 'studio-preview', `${platform}-${arch}`))
+  const outputRoot = resolve(options.outputRoot ?? previewOutputPath(root, platform, arch))
   if (await exists(outputRoot)) throw new Error(`refusing to overwrite preview target: ${outputRoot}`)
   await mkdir(dirname(outputRoot), { recursive: true })
   const stagingRoot = await mkdtemp(join(tmpdir(), 'creative-rsi-preview-build-'))
@@ -118,6 +118,13 @@ export async function buildPreview(options) {
   } finally {
     await rm(stagingRoot, { force: true, recursive: true })
   }
+}
+
+export function previewOutputPath(root, platform, arch) {
+  const target = platform === 'darwin'
+    ? `${PRODUCT_NAME}.app`
+    : `${PRODUCT_NAME}-win32-x64`
+  return join(resolve(root), 'dist', 'studio-preview', `${platform}-${arch}`, target)
 }
 
 export async function inventoryTree(root) {

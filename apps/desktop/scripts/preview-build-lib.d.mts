@@ -30,6 +30,7 @@ export interface PreviewBuildResult {
 }
 
 export function buildPreview(options: PreviewBuildOptions): Promise<PreviewBuildResult>
+export function previewOutputPath(root: string, platform: string, arch: string): string
 export function inventoryTree(root: string): Promise<readonly PreviewInventoryEntry[]>
 export function removePnpmWorkspaceSelfReference(root: string): Promise<boolean>
 export function validateSidecarEvidence(

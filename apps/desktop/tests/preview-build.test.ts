@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   inventoryTree,
+  previewOutputPath,
   removePnpmWorkspaceSelfReference,
   validateSidecarEvidence,
 } from '../scripts/preview-build-lib.mjs'
@@ -22,6 +23,13 @@ afterEach(async () => {
 })
 
 describe('preview build inventory', () => {
+  it('uses a Finder-recognizable macOS app path', () => {
+    expect(previewOutputPath('/repo', 'darwin', 'arm64'))
+      .toBe('/repo/dist/studio-preview/darwin-arm64/Creative RSI Studio.app')
+    expect(previewOutputPath('/repo', 'win32', 'x64'))
+      .toBe('/repo/dist/studio-preview/win32-x64/Creative RSI Studio-win32-x64')
+  })
+
   it('hashes regular files and preserves internal symlinks', async () => {
     const root = await mkdtemp(join(tmpdir(), 'preview-inventory-'))
     temporary.push(root)
