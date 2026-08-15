@@ -854,6 +854,7 @@ function validatedProvenance(value: LoopbackLeaseProvenance): ValidatedProvenanc
     || value.completedAt === undefined
     || value.responseId === undefined
     || value.returnedModels.length !== 1
+    || value.returnedModels[0] !== value.requestedModel
     || value.systemFingerprints.length !== 1
     || value.systemFingerprints[0] === ''
     || !Number.isSafeInteger(value.usage.total_tokens)

@@ -38,6 +38,7 @@ release/
 # Secrets and local configuration
 .env
 .env.*
+.env-*
 *.pem
 *.key
 private-denylist.txt

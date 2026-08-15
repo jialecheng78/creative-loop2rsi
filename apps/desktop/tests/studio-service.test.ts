@@ -220,6 +220,19 @@ describe('StudioService governed alpha loop', () => {
     expect(fixture.events.some(item => item.type === 'state' && item.state === 'completed')).toBe(false)
   })
 
+  it('does not claim success when the returned model differs from the selected model', async () => {
+    const fixture = await readyFixture({ provenance: { returnedModels: ['deepseek-v4-flash'] } })
+    const handle = await fixture.service.startWork('写一段场景')
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: 'runtime-one', text: '模型来源不一致的作品' })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: 'runtime-one', state: 'completed' })
+
+    expect(fixture.controller.requests.some(item => item.operation === 'complete_work')).toBe(false)
+    expect(fixture.controller.requests.some(item => item.operation === 'cancel_work')).toBe(true)
+    expect(fixture.events).toContainEqual({
+      type: 'state', runId: handle.runId, state: 'failed',
+    })
+  })
+
   it('does not mistake an older identical work for a successful current commit', async () => {
     const fixture = await readyFixture()
     fixture.controller.primeLastWork({

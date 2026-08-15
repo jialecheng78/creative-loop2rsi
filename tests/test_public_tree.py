@@ -69,6 +69,16 @@ class PublicTreeAuditTests(unittest.TestCase):
             self.assertIn("ASSIGNED_SECRET", result.stdout)
             self.assertIn("ABSOLUTE_MAC_PATH", result.stdout)
 
+    def test_hyphenated_environment_file_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".env-deepseek").write_text("placeholder\n", encoding="utf-8")
+
+            result = self.run_audit(root, "--mode", "full")
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("SECRET_FILE", result.stdout)
+
     def test_binary_large_cache_and_root_runtime_artifacts_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -249,6 +259,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("DCO", contribution_text)
         self.assertIn("不要求签署 CLA", contribution_text)
         self.assertIn("web_commit_signoff_required", contribution_text)
+        gitignore = (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(".env-*", gitignore.splitlines())
         for status in ("IMPLEMENTED", "FORWARD-TESTED", "PROPOSED", "UNVALIDATED"):
             self.assertIn(status, readme)
 

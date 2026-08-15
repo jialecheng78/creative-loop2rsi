@@ -7,6 +7,7 @@
   "main": "dist/main/index.js",
   "scripts": {
     "build": "pnpm --filter @creative-loop2rsi/controller-bridge build && pnpm --filter @creative-loop2rsi/model-gateway build && pnpm --filter @creative-loop2rsi/runtime-dsh build && tsc -p tsconfig.build.json && node scripts/build-renderer.mjs",
+    "acceptance:flash": "pnpm run build && node scripts/live-flash-acceptance.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "start": "pnpm run build && electron .",

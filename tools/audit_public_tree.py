@@ -196,7 +196,7 @@ def _path_findings(path: Path, root: Path) -> List[Finding]:
         findings.append(
             Finding(display, "RUNTIME_ARTIFACT", "root-level input, output, or run data must not be public")
         )
-    if name == ".env" or name.startswith(".env."):
+    if name == ".env" or name.startswith((".env.", ".env-")):
         findings.append(Finding(display, "SECRET_FILE", "environment file must not be public"))
     if path.suffix.lower() in SENSITIVE_FILE_SUFFIXES:
         findings.append(Finding(display, "SECRET_FILE", "credential-like file must not be public"))
