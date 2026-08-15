@@ -346,6 +346,42 @@ describe("strict DeepSeek SSE", () => {
     });
   });
 
+  it("settles an aborted SSE read even when reader cancellation never settles", async () => {
+    let markReadStarted!: () => void;
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve;
+    });
+    const cancel = vi.fn(() => new Promise<void>(() => {}));
+    const stream = new ReadableStream<Uint8Array>({
+      pull() {
+        markReadStarted();
+        return new Promise<void>(() => {});
+      },
+      cancel,
+    });
+    const gateway = new DeepSeekGateway({
+      keyStore: keyStore(),
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+      ),
+      budget: { timeoutMs: 10_000 },
+    });
+    const abortController = new AbortController();
+    const collect = (async () => {
+      for await (const _event of gateway.streamChatCompletion(request(), {
+        signal: abortController.signal,
+      })) {
+        // The source deliberately never emits an event.
+      }
+    })();
+
+    await readStarted;
+    abortController.abort(new Error("test-abort"));
+
+    await expect(settleWithin(collect, 250)).rejects.toMatchObject({ code: "NETWORK_ERROR" });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("rejects malformed usage rather than logging it", async () => {
     const body = 'data: {"choices":[],"usage":{"total_tokens":-1}}\n\ndata: [DONE]\n\n';
     const gateway = new DeepSeekGateway({
@@ -383,6 +419,20 @@ describe("strict DeepSeek SSE", () => {
     await expect(collect()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
   });
 });
+
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("operation did not settle within the test bound")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
 
 describe("budgets and redaction", () => {
   it("enforces request count and response byte budgets", async () => {

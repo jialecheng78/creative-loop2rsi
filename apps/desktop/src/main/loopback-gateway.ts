@@ -13,6 +13,7 @@ import {
 import type { DshModelId, RuntimeRole } from '@creative-loop2rsi/runtime-dsh'
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024
+const DEFAULT_SHUTDOWN_GRACE_MS = 1_000
 const DEFAULT_WORKER_BUDGET: Partial<GatewayBudgetPolicy> = {
   maxRequests: 12,
   maxRequestBytes: 4 * 1024 * 1024,
@@ -37,6 +38,13 @@ interface LeaseRecord {
   readonly abortController: AbortController
   readonly requests: MutableLoopbackRequestProvenance[]
   nextRequestNumber: number
+}
+
+interface ActiveRequest {
+  readonly response: ServerResponse
+  readonly abortScope: RequestAbortScope
+  readonly observation: MutableLeaseObservation
+  readonly record: MutableLoopbackRequestProvenance
 }
 
 interface MutableLeaseObservation {
@@ -99,16 +107,25 @@ export interface LoopbackGatewayLease {
 export interface LoopbackGatewayOptions {
   readonly keyStore: ApiKeyStore
   readonly gatewayFactory?: (budget: Partial<GatewayBudgetPolicy>) => GatewayStream
+  readonly shutdownGraceMs?: number
 }
 
 /** Main-process-only loopback capability server for DSH workers. */
 export class LoopbackModelGateway {
   private readonly leases = new Map<string, LeaseRecord>()
+  private readonly activeRequests = new Set<ActiveRequest>()
   private readonly server: Server
   private readonly gatewayFactory: (budget: Partial<GatewayBudgetPolicy>) => GatewayStream
+  private readonly shutdownGraceMs: number
   private port: number | undefined
+  private closePromise: Promise<void> | undefined
 
   constructor(options: LoopbackGatewayOptions) {
+    if (!Number.isSafeInteger(options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS)
+      || (options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS) < 0) {
+      throw new TypeError('shutdownGraceMs 必须是非负安全整数。')
+    }
+    this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS
     this.gatewayFactory = options.gatewayFactory
       ?? (budget => new DeepSeekGateway({ keyStore: options.keyStore, budget }))
     this.server = createServer((request, response) => {
@@ -187,15 +204,47 @@ export class LoopbackModelGateway {
   }
 
   async close(): Promise<void> {
+    if (this.closePromise !== undefined) return await this.closePromise
+    this.closePromise = this.closeOnce()
+    try {
+      await this.closePromise
+    } finally {
+      this.closePromise = undefined
+    }
+  }
+
+  private async closeOnce(): Promise<void> {
     for (const lease of this.leases.values()) {
       lease.abortController.abort(new Error('gateway-closed'))
     }
     this.leases.clear()
     this.port = undefined
+
+    // A hostile upstream iterator may ignore AbortSignal forever. Seal every
+    // in-flight request as failed before waiting for network teardown so a
+    // later iterator result can never be interpreted as a successful run.
+    for (const active of this.activeRequests) {
+      failRequestRecord(
+        active.record,
+        active.observation,
+        active.abortScope.error(),
+        active.abortScope.controller.signal.reason,
+      )
+    }
+
     if (!this.server.listening) return
-    await new Promise<void>((resolve, reject) => {
+    const gracefulClose = new Promise<void>((resolve, reject) => {
       this.server.close(error => error === undefined ? resolve() : reject(error))
     })
+    const forceClose = new Promise<void>(resolve => {
+      const timeout = setTimeout(() => {
+        for (const active of this.activeRequests) active.response.destroy()
+        this.server.closeAllConnections()
+        resolve()
+      }, this.shutdownGraceMs)
+      void gracefulClose.finally(() => clearTimeout(timeout)).catch(() => undefined)
+    })
+    await Promise.race([gracefulClose, forceClose])
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -203,6 +252,7 @@ export class LoopbackModelGateway {
     let iterator: AsyncIterator<ChatStreamEvent> | undefined
     let requestObservation: MutableLeaseObservation | undefined
     let requestRecord: MutableLoopbackRequestProvenance | undefined
+    let activeRequest: ActiveRequest | undefined
     try {
       const lease = this.authorize(request)
       if (request.method !== 'POST' || request.url !== '/chat/completions') {
@@ -233,6 +283,13 @@ export class LoopbackModelGateway {
         usage: {},
       }
       requestRecord = beginRequestRecord(lease)
+      activeRequest = {
+        response,
+        abortScope,
+        observation: requestObservation,
+        record: requestRecord,
+      }
+      this.activeRequests.add(activeRequest)
       iterator = lease.gateway.streamChatCompletion(
         governedRequest as unknown as ChatCompletionRequest,
         { signal: abortScope.controller.signal },
@@ -255,8 +312,12 @@ export class LoopbackModelGateway {
       writeStreamEvent(response, first.value, requestObservation)
       for (;;) {
         const next = await iterator.next()
+        if (abortScope.controller.signal.aborted) throw abortScope.error()
         if (next.done) break
         writeStreamEvent(response, next.value, requestObservation)
+      }
+      if (abortScope.controller.signal.aborted || requestRecord.status !== 'STARTED') {
+        throw abortScope.error()
       }
       if (requestObservation.responseId === undefined
         || requestObservation.returnedModels.size !== 1
@@ -280,6 +341,7 @@ export class LoopbackModelGateway {
       }
       writeJson(response, safe.status, { error: { code: safe.code, message: safe.message } })
     } finally {
+      if (activeRequest !== undefined) this.activeRequests.delete(activeRequest)
       abortScope?.cleanup()
       if (iterator?.return !== undefined) {
         try {

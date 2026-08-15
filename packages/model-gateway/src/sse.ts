@@ -119,8 +119,22 @@ export async function* parseDeepSeekSse(
     }
     if (!sawDone) throw invalidResponse("SSE 响应在 [DONE] 前结束");
   } finally {
-    await reader.cancel().catch(() => undefined);
-    reader.releaseLock();
+    // Cancellation is best effort: a custom or broken stream source is
+    // allowed to return a promise that never settles from cancel(). Waiting
+    // for it here would turn an already-observed AbortSignal into an
+    // unbounded shutdown. Calling cancel() still closes the reader and
+    // settles pending reads synchronously according to the Streams contract.
+    try {
+      void reader.cancel().catch(() => undefined);
+    } catch {
+      // A non-conforming reader must not mask the original parse/abort result.
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // Releasing is also best effort when a non-conforming reader leaves a
+      // read request pending after cancellation.
+    }
   }
 }
 

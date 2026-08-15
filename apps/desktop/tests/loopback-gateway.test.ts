@@ -242,6 +242,67 @@ describe('LoopbackModelGateway', () => {
     await closing
   })
 
+  it('bounds shutdown, force-closes an abort-ignoring stream, and never records it as completed', async () => {
+    const entered = deferred<void>()
+    const releaseMaliciousStream = deferred<void>()
+    const maliciousStreamSettled = deferred<void>()
+    const stream = vi.fn(async function * (
+      body: ChatCompletionRequest,
+      options?: { readonly signal?: AbortSignal },
+    ): AsyncGenerator<ChatStreamEvent> {
+      try {
+        requiredSignal(options?.signal)
+        entered.resolve()
+        // Deliberately ignore the AbortSignal to model a broken transport.
+        await releaseMaliciousStream.promise
+        yield {
+          type: 'chunk',
+          chunk: {
+            id: 'must-not-be-accepted',
+            model: body.model,
+            system_fingerprint: 'must-not-be-accepted',
+            choices: [],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          },
+        }
+        yield { type: 'done' }
+      } finally {
+        maliciousStreamSettled.resolve()
+      }
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+      shutdownGraceMs: 10,
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+    const pending = post(lease.url, lease.token, requestBody()).then(
+      value => ({ kind: 'response' as const, value }),
+      () => ({ kind: 'disconnected' as const }),
+    )
+    await entered.promise
+
+    await settleWithin(gateway.close(), 250)
+    expect(await settleWithin(pending, 250)).toMatchObject({ kind: 'disconnected' })
+    expect(lease.provenance()).toMatchObject({ completedRequests: 0, failedRequests: 1 })
+    expect(lease.provenance().requests[0]).toMatchObject({
+      status: 'FAILED', errorCode: 'LEASE_REVOKED', httpStatus: 503,
+    })
+
+    // Even if the hostile iterator later fabricates a complete response, the
+    // aborted request remains failed and cannot update aggregate provenance.
+    releaseMaliciousStream.resolve()
+    await settleWithin(maliciousStreamSettled.promise, 250)
+    expect(lease.provenance()).toMatchObject({
+      completedRequests: 0,
+      returnedModels: [],
+      systemFingerprints: [],
+    })
+    expect(lease.provenance().responseId).toBeUndefined()
+    expect(lease.provenance().requests[0]).toMatchObject({ status: 'FAILED' })
+  })
+
   it('aborts the upstream stream when the loopback client disconnects', async () => {
     const entered = deferred<void>()
     const upstreamAborted = deferred<AbortSignal>()
@@ -346,6 +407,20 @@ async function post(
     request.once('error', reject)
     request.end(JSON.stringify(body))
   })
+}
+
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error('operation did not settle within the test bound')), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
 }
 
 function startPost(base: string, token: string, body: unknown) {

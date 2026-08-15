@@ -2,7 +2,7 @@
 
 import { spawnSync, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { closeSync, readFileSync } from 'node:fs'
+import { closeSync, readFileSync, writeFileSync } from 'node:fs'
 import {
   chmod,
   lstat,
@@ -25,6 +25,11 @@ const REPOSITORY_ROOT = resolve(SCRIPT_DIR, '..', '..', '..')
 const MAX_KEY_FILE_BYTES = 4 * 1024
 const FLASH_MODEL = 'deepseek-v4-flash'
 const TERMINAL_TIMEOUT_MS = 240_000
+const PHASE_TIMEOUT_MS = Object.freeze({
+  produce: 600_000,
+  cancel: 360_000,
+  restart: 120_000,
+})
 
 if (process.versions.electron === undefined) {
   try {
@@ -56,16 +61,30 @@ async function runLauncher() {
   const stateDirectory = await mkdtemp(join(tmpdir(), 'creative-rsi-flash-live-'))
   let finalReport
   let keyHandle
+  let produced
+  let restartedBeforeCancel
+  let cancelled
+  let restartedAfterCancel
   try {
     await chmod(stateDirectory, 0o700)
     keyHandle = await open(keyFile, 'r')
-    const produced = runPhase(electronBinary, 'produce', stateDirectory, keyHandle.fd)
+    produced = runPhase(electronBinary, 'produce', stateDirectory, keyHandle.fd)
     await keyHandle.close()
     keyHandle = undefined
     if (produced.status !== 'PASS') throw phaseError('produce', produced)
 
-    const restarted = runPhase(electronBinary, 'restart', stateDirectory)
-    if (restarted.status !== 'PASS') throw phaseError('restart', restarted)
+    restartedBeforeCancel = runPhase(electronBinary, 'restart-success', stateDirectory)
+    if (restartedBeforeCancel.status !== 'PASS') {
+      throw phaseError('restart-success', restartedBeforeCancel)
+    }
+
+    cancelled = runPhase(electronBinary, 'cancel', stateDirectory)
+    if (cancelled.status !== 'PASS') throw phaseError('cancel', cancelled)
+
+    restartedAfterCancel = runPhase(electronBinary, 'restart-cancel', stateDirectory)
+    if (restartedAfterCancel.status !== 'PASS') {
+      throw phaseError('restart-cancel', restartedAfterCancel)
+    }
 
     const sourceAfter = sourceIdentity()
     if (JSON.stringify(sourceBefore) !== JSON.stringify(sourceAfter)) {
@@ -78,12 +97,13 @@ async function runLauncher() {
       credential: produced.credential,
       model_discovery: produced.model_discovery,
       success: produced.success,
-      cancellation: produced.cancellation,
-      restart: restarted.restart,
+      cancellation: cancelled.cancellation,
+      restart: restartedAfterCancel.restart,
       privacy: {
         ...produced.privacy,
-        restart_plaintext_key_matches: restarted.privacy.plaintext_key_matches,
-        restart_session_artifacts: restarted.privacy.session_artifacts,
+        cancellation_plaintext_key_matches: cancelled.privacy.plaintext_key_matches,
+        restart_plaintext_key_matches: restartedAfterCancel.privacy.plaintext_key_matches,
+        restart_session_artifacts: restartedAfterCancel.privacy.session_artifacts,
       },
       limitations: [
         'renderer-preload-ipc-not-exercised',
@@ -92,6 +112,24 @@ async function runLauncher() {
         'installer-not-exercised',
       ],
     }
+  } catch (error) {
+    finalReport = {
+      status: 'BLOCK',
+      test: 'creative-rsi-studio-flash-live-acceptance',
+      source: sourceIdentity(),
+      error: publicError(error),
+      checks: {
+        produce: phaseSummary(produced),
+        restart_before_cancel: phaseSummary(restartedBeforeCancel),
+        cancellation: phaseSummary(cancelled),
+        restart_after_cancel: phaseSummary(restartedAfterCancel),
+      },
+      ...(produced?.status === 'PASS' ? { verified_success: produced.success } : {}),
+      ...(restartedBeforeCancel?.status === 'PASS'
+        ? { verified_restart_before_cancel: restartedBeforeCancel.restart }
+        : {}),
+    }
+    process.exitCode = 1
   } finally {
     await keyHandle?.close().catch(() => undefined)
     if (!keepTemporary) await removeValidatedTemporaryDirectory(stateDirectory)
@@ -110,21 +148,32 @@ function runPhase(electronBinary, phase, stateDirectory, keyFd) {
     encoding: 'utf8',
     maxBuffer: 4 * 1024 * 1024,
     stdio,
-    timeout: 720_000,
+    timeout: phase === 'produce'
+      ? PHASE_TIMEOUT_MS.produce
+      : phase === 'cancel'
+        ? PHASE_TIMEOUT_MS.cancel
+        : PHASE_TIMEOUT_MS.restart,
   })
-  const report = parseLastJsonLine(result.stdout)
-  if (result.error !== undefined) throw new Error(`electron ${phase} failed to launch`)
+  const entries = parseJsonLines(result.stdout)
+  const report = findLastEntry(entries, item => item.kind === 'live-phase-result-v1')
+  const checkpoint = findLastEntry(entries, item => item.kind === 'live-checkpoint-v1')
+  if (result.error !== undefined) {
+    const code = result.error.code === 'ETIMEDOUT' ? 'PHASE_HARD_TIMEOUT' : 'PHASE_LAUNCH_FAILED'
+    throw acceptanceError(code, phase, checkpoint?.stage ?? 'spawn')
+  }
   if (report === null) {
-    throw new Error(`electron ${phase} failed without a valid report`)
+    throw acceptanceError('PHASE_REPORT_MISSING', phase, checkpoint?.stage ?? 'spawn')
   }
   if (result.status !== 0 && report.status !== 'BLOCK') {
-    throw new Error(`electron ${phase} exited inconsistently`)
+    throw acceptanceError('PHASE_EXIT_INCONSISTENT', phase, checkpoint?.stage ?? 'report')
   }
   return report
 }
 
 async function runElectronPhase() {
   const phase = requiredOption('--phase')
+  const tracker = { phase, stage: 'boot', startedAt: Date.now() }
+  checkpoint(tracker, 'boot')
   const stateDirectory = resolve(requiredOption('--state-directory'))
   if (!stateDirectory.startsWith(resolve(tmpdir()) + '/creative-rsi-flash-live-')) {
     throw new Error('state directory is outside the acceptance namespace')
@@ -133,22 +182,27 @@ async function runElectronPhase() {
   app.setName('Creative RSI Studio Live Acceptance')
   app.setPath('userData', stateDirectory)
   await app.whenReady()
+  checkpoint(tracker, 'electron-ready')
   try {
     const report = phase === 'produce'
-      ? await producePhase({ app, safeStorage, stateDirectory })
-      : phase === 'restart'
-        ? await restartPhase({ app, safeStorage, stateDirectory })
-        : fail('unknown acceptance phase')
-    await writeElectronReport(app, report, 0)
+      ? await producePhase({ app, safeStorage, stateDirectory, tracker })
+      : phase === 'cancel'
+        ? await cancelPhase({ app, safeStorage, stateDirectory, tracker })
+        : phase === 'restart-success' || phase === 'restart-cancel'
+          ? await restartPhase({ app, safeStorage, stateDirectory, tracker })
+          : fail('unknown acceptance phase')
+    await writeElectronReport(app, { kind: 'live-phase-result-v1', ...report }, 0)
   } catch (error) {
     await writeElectronReport(app, {
+      kind: 'live-phase-result-v1',
       status: 'BLOCK',
-      error: publicError(error),
+      error: publicError(error, tracker),
     }, 1)
   }
 }
 
-async function producePhase({ app, safeStorage, stateDirectory }) {
+async function producePhase({ app, safeStorage, stateDirectory, tracker }) {
+  checkpoint(tracker, 'credential-read')
   let sourceBuffer
   try {
     sourceBuffer = readFileSync(3)
@@ -158,21 +212,26 @@ async function producePhase({ app, safeStorage, stateDirectory }) {
   let apiKey = extractApiKey(sourceBuffer.toString('utf8'))
   const keyBytes = Buffer.from(apiKey, 'utf8')
   const context = await createLiveContext({ app, safeStorage, stateDirectory })
+  checkpoint(tracker, 'context-ready')
   try {
     if (!safeStorage.isEncryptionAvailable()) fail('Electron safeStorage is unavailable')
+    checkpoint(tracker, 'models-and-credential')
     const configured = await context.service.configureCredential(apiKey)
     apiKey = ''
     if (!configured.configured || !configured.secureStorageAvailable) fail('credential was not securely configured')
 
     const selected = await context.service.selectModel(FLASH_MODEL)
     if (selected.selectedModel !== FLASH_MODEL) fail('Flash model selection did not persist')
+    checkpoint(tracker, 'controller-bootstrap')
     const system = await context.service.createSystem({
       displayName: '真实 Flash 验收系统',
       intent: '创作克制、可信、用行动推进的中文微型悬疑故事。',
     })
+    checkpoint(tracker, 'work-start')
     const work = await context.service.startWork(
       '写一篇 180 至 260 个汉字的完整微型悬疑故事。只输出正文；用可见动作和细节推进，结尾要完成一次合理反转。',
     )
+    checkpoint(tracker, 'runtime-terminal')
     const terminal = await waitForStudioTerminal(context, work.runId)
     if (terminal.state !== 'completed') fail(`successful work ended as ${terminal.state}`)
     if (context.runtimeFailure !== undefined) throw context.runtimeFailure
@@ -192,6 +251,7 @@ async function producePhase({ app, safeStorage, stateDirectory }) {
     const provenance = JSON.parse(provenanceBytes.toString('utf8'))
     validateSuccessfulProvenance(provenance, original, provenanceBytes)
 
+    checkpoint(tracker, 'feedback-seal')
     const editedOutput = `${original.output}\n\n【用户验收编辑：保留这个结尾。】`
     const feedback = await context.service.submitFeedback({
       runId: work.runId,
@@ -217,33 +277,6 @@ async function producePhase({ app, safeStorage, stateDirectory }) {
     const successLease = context.loopback.leases[0]
     if (successLease === undefined) fail('successful model lease is absent')
     const successLedger = successLease.provenance()
-    const cancelWork = await context.service.startWork(
-      '写一篇超过一万字的连续叙事长篇，不要提前结束；这是取消边界验收，模型开始返回后会立即停止。',
-    )
-    const cancelLease = context.loopback.leases[1]
-    if (cancelLease === undefined) fail('cancellation model lease is absent')
-    await waitUntil(() => cancelLease.provenance().requests.some(item => item.status === 'STARTED'), 30_000)
-    await context.service.cancelWork(cancelWork.runId)
-    const cancelTerminal = await waitForStudioTerminal(context, cancelWork.runId)
-    if (cancelTerminal.state !== 'cancelled') fail('cancelled work did not end as cancelled')
-    const cancelLedger = cancelLease.provenance()
-    const cancelErrorCodes = cancelLedger.requests.map(item => item.errorCode).filter(Boolean)
-    if (cancelLedger.requestCount < 1
-      || cancelLedger.completedRequests !== 0
-      || cancelLedger.requests.some(item => item.status === 'STARTED')
-      || cancelLedger.failedRequests < 1
-      || !cancelErrorCodes.includes('LEASE_REVOKED')) {
-      fail('cancelled request ledger is incomplete')
-    }
-    const countAfterCancel = cancelLedger.requestCount
-    await delay(5_000)
-    if (cancelLease.provenance().requestCount !== countAfterCancel) fail('model requests continued after cancellation')
-    const cancelledSnapshot = await context.service.systemSnapshot()
-    if (cancelledSnapshot?.lastWork?.runId !== work.runId
-      || cancelledSnapshot.lastWork.output !== editedOutput
-      || cancelledSnapshot.interruptedRun?.runId !== cancelWork.runId) {
-      fail('cancellation damaged the sealed work or lost interrupted-run evidence')
-    }
 
     await writePrivateJson(join(stateDirectory, 'live-acceptance-expected.json'), {
       system_id: system.systemId,
@@ -253,12 +286,13 @@ async function producePhase({ app, safeStorage, stateDirectory }) {
       artifact_sha256: sealed.artifactSha256,
       runtime_provenance_sha256: sealed.runtimeProvenanceSha256,
       review_subject_sha256: sealed.reviewSubjectSha256,
-      interrupted_run_id: cancelWork.runId,
       selected_model: FLASH_MODEL,
     })
-    await context.service.shutdown()
+    checkpoint(tracker, 'shutdown')
+    await requireBoundedShutdown(context.service, tracker)
     context.shutdown = true
 
+    checkpoint(tracker, 'privacy-scan')
     const privacy = await privacyEvidence(stateDirectory, keyBytes)
     const repositoryMatches = await publicRepositoryKeyMatches(keyBytes)
     if (privacy.plaintext_key_matches !== 0 || repositoryMatches !== 0) fail('plaintext key was persisted')
@@ -308,16 +342,6 @@ async function producePhase({ app, safeStorage, stateDirectory }) {
         normalized_events: summarizeEvents(context.studioEvents, work.runId),
         gateway_ledger: summarizeLedger(successLedger),
       },
-      cancellation: {
-        run_state: cancelTerminal.state,
-        request_count: cancelLedger.requestCount,
-        completed_requests: cancelLedger.completedRequests,
-        failed_requests: cancelLedger.failedRequests,
-        error_codes: cancelErrorCodes,
-        no_new_requests_after_five_seconds: true,
-        sealed_work_preserved: true,
-        interrupted_run_linked: true,
-      },
       privacy: {
         ...privacy,
         public_repository_plaintext_key_matches: repositoryMatches,
@@ -329,11 +353,101 @@ async function producePhase({ app, safeStorage, stateDirectory }) {
     apiKey = ''
     sourceBuffer.fill(0)
     keyBytes.fill(0)
-    if (!context.shutdown) await context.service.shutdown().catch(() => undefined)
+    if (!context.shutdown) await boundedShutdown(context.service)
   }
 }
 
-async function restartPhase({ app, safeStorage, stateDirectory }) {
+async function cancelPhase({ app, safeStorage, stateDirectory, tracker }) {
+  const context = await createLiveContext({ app, safeStorage, stateDirectory })
+  checkpoint(tracker, 'context-ready')
+  let decrypted = ''
+  let keyBytes = Buffer.alloc(0)
+  try {
+    const expected = JSON.parse(await readFile(join(stateDirectory, 'live-acceptance-expected.json'), 'utf8'))
+    const status = await context.service.getStatus()
+    if (status.credential !== 'configured'
+      || status.selectedModel !== FLASH_MODEL
+      || status.activeSystem?.systemId !== expected.system_id
+      || status.activeSystem.lastWork?.runId !== expected.run_id
+      || !status.activeSystem.lastWork.sealed) {
+      fail('cancellation preflight differs from the sealed success evidence')
+    }
+
+    checkpoint(tracker, 'cancel-work-start')
+    const cancelWork = await context.service.startWork(
+      '写一篇超过一万字的连续叙事长篇，不要提前结束；这是取消边界验收，模型开始返回后会立即停止。',
+    )
+    const cancelLease = context.loopback.leases[0]
+    if (cancelLease === undefined) fail('cancellation model lease is absent')
+    checkpoint(tracker, 'cancel-request-started')
+    await waitUntil(
+      () => cancelLease.provenance().requests.some(item => item.status === 'STARTED'),
+      30_000,
+    )
+    checkpoint(tracker, 'cancel-requested')
+    await context.service.cancelWork(cancelWork.runId)
+    const cancelTerminal = await waitForStudioTerminal(context, cancelWork.runId)
+    if (cancelTerminal.state !== 'cancelled') fail('cancelled work did not end as cancelled')
+    const cancelLedger = cancelLease.provenance()
+    const cancelErrorCodes = cancelLedger.requests.map(item => item.errorCode).filter(Boolean)
+    if (cancelLedger.requestCount < 1
+      || cancelLedger.completedRequests !== 0
+      || cancelLedger.requests.some(item => item.status === 'STARTED')
+      || cancelLedger.failedRequests < 1
+      || !cancelErrorCodes.includes('LEASE_REVOKED')) {
+      fail('cancelled request ledger is incomplete')
+    }
+    const countAfterCancel = cancelLedger.requestCount
+    await delay(5_000)
+    if (cancelLease.provenance().requestCount !== countAfterCancel) {
+      fail('model requests continued after cancellation')
+    }
+    const cancelledSnapshot = await context.service.systemSnapshot()
+    if (cancelledSnapshot?.lastWork?.runId !== expected.run_id
+      || sha256Text(cancelledSnapshot.lastWork.output) !== expected.edited_sha256
+      || cancelledSnapshot.interruptedRun?.runId !== cancelWork.runId) {
+      fail('cancellation damaged the sealed work or lost interrupted-run evidence')
+    }
+    await writePrivateJson(join(stateDirectory, 'live-acceptance-cancel.json'), {
+      interrupted_run_id: cancelWork.runId,
+    })
+
+    checkpoint(tracker, 'shutdown')
+    await requireBoundedShutdown(context.service, tracker)
+    context.shutdown = true
+    decrypted = await context.credentials.get() ?? ''
+    if (decrypted === '') fail('safeStorage credential is unavailable after cancellation')
+    keyBytes = Buffer.from(decrypted, 'utf8')
+    decrypted = ''
+    checkpoint(tracker, 'privacy-scan')
+    const privacy = await privacyEvidence(stateDirectory, keyBytes)
+    if (privacy.plaintext_key_matches !== 0
+      || privacy.session_artifacts !== 0
+      || privacy.raw_reasoning_fields !== 0) {
+      fail('cancellation privacy scan failed')
+    }
+    return {
+      status: 'PASS',
+      cancellation: {
+        run_state: cancelTerminal.state,
+        request_count: cancelLedger.requestCount,
+        completed_requests: cancelLedger.completedRequests,
+        failed_requests: cancelLedger.failedRequests,
+        error_codes: cancelErrorCodes,
+        no_new_requests_after_five_seconds: true,
+        sealed_work_preserved: true,
+        interrupted_run_linked: true,
+      },
+      privacy,
+    }
+  } finally {
+    decrypted = ''
+    keyBytes.fill(0)
+    if (!context.shutdown) await boundedShutdown(context.service)
+  }
+}
+
+async function restartPhase({ app, safeStorage, stateDirectory, tracker }) {
   const originalFetch = globalThis.fetch
   let modelFetchAttempts = 0
   globalThis.fetch = async () => {
@@ -341,6 +455,7 @@ async function restartPhase({ app, safeStorage, stateDirectory }) {
     throw new Error('model API access is forbidden during restart recovery')
   }
   const context = await createLiveContext({ app, safeStorage, stateDirectory })
+  checkpoint(tracker, 'context-ready')
   let decrypted = ''
   let keyBytes = Buffer.alloc(0)
   try {
@@ -349,6 +464,9 @@ async function restartPhase({ app, safeStorage, stateDirectory }) {
     keyBytes = Buffer.from(decrypted, 'utf8')
     decrypted = ''
     const expected = JSON.parse(await readFile(join(stateDirectory, 'live-acceptance-expected.json'), 'utf8'))
+    const cancellation = await readOptionalJson(join(stateDirectory, 'live-acceptance-cancel.json'))
+    const expectedInterruptedRunId = cancellation?.interrupted_run_id ?? null
+    checkpoint(tracker, 'snapshot-read')
     const status = await context.service.getStatus()
     const work = status.activeSystem?.lastWork
     if (status.credential !== 'configured'
@@ -361,7 +479,7 @@ async function restartPhase({ app, safeStorage, stateDirectory }) {
       || work.artifactSha256 !== expected.artifact_sha256
       || work.runtimeProvenanceSha256 !== expected.runtime_provenance_sha256
       || work.reviewSubjectSha256 !== expected.review_subject_sha256
-      || status.activeSystem?.interruptedRun?.runId !== expected.interrupted_run_id
+      || (status.activeSystem?.interruptedRun?.runId ?? null) !== expectedInterruptedRunId
       || status.activeSystem.feedbackRecoveryRequired
       || status.activeSystem.pendingFeedback !== null) {
       fail('cross-process restored snapshot differs from the sealed evidence')
@@ -369,7 +487,8 @@ async function restartPhase({ app, safeStorage, stateDirectory }) {
     if (modelFetchAttempts !== 0 || context.loopback.leases.length !== 0) {
       fail('restart recovery attempted a model request')
     }
-    await context.service.shutdown()
+    checkpoint(tracker, 'shutdown')
+    await requireBoundedShutdown(context.service, tracker)
     context.shutdown = true
     const privacy = await privacyEvidence(stateDirectory, keyBytes)
     if (privacy.plaintext_key_matches !== 0 || privacy.session_artifacts !== 0 || privacy.raw_reasoning_fields !== 0) {
@@ -384,6 +503,7 @@ async function restartPhase({ app, safeStorage, stateDirectory }) {
         sealed_work_sha256_equal: true,
         governance_hashes_equal: true,
         interrupted_run_link_equal: true,
+        cancellation_evidence_present: cancellation !== null,
         model_api_fetch_attempts: modelFetchAttempts,
         model_gateway_leases_issued: context.loopback.leases.length,
       },
@@ -392,7 +512,7 @@ async function restartPhase({ app, safeStorage, stateDirectory }) {
   } finally {
     decrypted = ''
     keyBytes.fill(0)
-    if (!context.shutdown) await context.service.shutdown().catch(() => undefined)
+    if (!context.shutdown) await boundedShutdown(context.service)
     globalThis.fetch = originalFetch
   }
 }
@@ -681,35 +801,70 @@ function requiredOption(name) {
   return process.argv[index + 1]
 }
 
-function parseLastJsonLine(stdout) {
+function parseJsonLines(stdout) {
   const lines = String(stdout ?? '').split(/\r?\n/u).map(line => line.trim()).filter(Boolean)
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    try { return JSON.parse(lines[index]) } catch { /* keep looking */ }
+  const result = []
+  for (const line of lines) {
+    try {
+      const value = JSON.parse(line)
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) result.push(value)
+    } catch {
+      // Electron or a dependency may emit non-JSON diagnostics. They never
+      // become acceptance evidence and are not forwarded by the launcher.
+    }
+  }
+  return result
+}
+
+function findLastEntry(entries, predicate) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (predicate(entries[index])) return entries[index]
   }
   return null
 }
 
 function phaseError(phase, report) {
   const code = report.error?.code ?? 'UNKNOWN'
-  const message = report.error?.message ?? 'phase returned no public error message'
-  return new Error(`${phase} phase blocked [${code}]: ${message}`)
+  return acceptanceError(code, phase, report.error?.stage ?? 'report')
 }
 
-function publicError(error) {
+function acceptanceError(code, phase = 'launcher', stage = 'launcher') {
+  const error = new Error(code)
+  error.code = code
+  error.phase = phase
+  error.stage = stage
+  return error
+}
+
+function publicError(error, tracker = undefined) {
+  const candidateCode = typeof error?.code === 'string' ? error.code : 'LIVE_ACCEPTANCE_BLOCKED'
   return {
-    name: error instanceof Error ? error.name : 'Error',
-    code: typeof error?.code === 'string' ? error.code : 'LIVE_ACCEPTANCE_BLOCKED',
-    message: redactError(error instanceof Error ? error.message : 'live acceptance blocked'),
+    code: /^[A-Z][A-Z0-9_]{2,80}$/u.test(candidateCode)
+      ? candidateCode
+      : 'LIVE_ACCEPTANCE_BLOCKED',
+    phase: typeof error?.phase === 'string' ? error.phase : tracker?.phase ?? 'launcher',
+    stage: typeof error?.stage === 'string' ? error.stage : tracker?.stage ?? 'launcher',
   }
 }
 
-function redactError(value) {
-  return value
-    .replaceAll(REPOSITORY_ROOT, '[repository]')
-    .replace(/\/Users\/[^/\s]+\/[^\s"'`]+/gu, '[local-path]')
-    .replace(/[A-Za-z]:\\Users\\[^\\\s]+\\[^\s"'`]+/gu, '[local-path]')
-    .replace(/sk-[A-Za-z0-9_-]{8,}/gu, '[redacted]')
-    .slice(0, 500)
+function checkpoint(tracker, stage) {
+  tracker.stage = stage
+  writeFileSync(1, `${JSON.stringify({
+    kind: 'live-checkpoint-v1',
+    phase: tracker.phase,
+    stage,
+    elapsed_ms: Date.now() - tracker.startedAt,
+  })}\n`)
+}
+
+function phaseSummary(report) {
+  if (report === undefined) return { status: 'SKIPPED' }
+  if (report.status === 'PASS') return { status: 'PASS' }
+  return {
+    status: 'BLOCK',
+    code: report.error?.code ?? 'UNKNOWN',
+    stage: report.error?.stage ?? 'unknown',
+  }
 }
 
 async function writeElectronReport(app, value, code) {
@@ -720,6 +875,40 @@ async function writeElectronReport(app, value, code) {
 async function writePrivateJson(path, value) {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
   await chmod(path, 0o600)
+}
+
+async function readOptionalJson(path) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'))
+  } catch (error) {
+    if (error instanceof Error && error.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+async function requireBoundedShutdown(service, tracker) {
+  const completed = await completionWithin(service.shutdown(), 15_000)
+  if (!completed) throw acceptanceError('SHUTDOWN_TIMEOUT', tracker.phase, tracker.stage)
+}
+
+async function boundedShutdown(service) {
+  await completionWithin(service.shutdown().catch(() => undefined), 15_000)
+}
+
+function completionWithin(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs)
+    promise.then(
+      () => {
+        clearTimeout(timer)
+        resolve(true)
+      },
+      error => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
 }
 
 async function fileMode(path) {
@@ -740,4 +929,8 @@ function sha256FileSync(path) {
 function sha256Text(value) { return sha256Bytes(Buffer.from(value, 'utf8')) }
 function sha256Bytes(value) { return createHash('sha256').update(value).digest('hex') }
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
-function fail(message) { throw new Error(message) }
+function fail(message) {
+  const error = new Error(message)
+  error.code = 'LIVE_CONTRACT_VIOLATION'
+  throw error
+}
