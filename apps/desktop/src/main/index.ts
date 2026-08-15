@@ -21,7 +21,7 @@ let removeIpc: (() => void) | undefined
 let service: StudioService | undefined
 let loopback: LoopbackModelGateway | undefined
 
-const preloadPath = fileURLToPath(new URL('../preload/index.js', import.meta.url))
+const preloadPath = fileURLToPath(new URL('../preload/index.cjs', import.meta.url))
 const workerPath = fileURLToPath(new URL('../worker/index.js', import.meta.url))
 const rendererPath = fileURLToPath(new URL('../renderer/index.html', import.meta.url))
 

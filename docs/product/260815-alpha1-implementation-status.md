@@ -2,7 +2,7 @@
 
 ## 结论
 
-当前仓库已经具备“从源码运行的首个创作闭环”和可复核的安全边界，但还不是可交付给普通用户下载安装的 v1。macOS arm64 当前 headless build 已完成一次真实 Flash API、封存、重启恢复与本地取消边界 PASS；这不包含 GUI、安装包或文学质量。`alpha.1` 现在是开发里程碑名称，不是已经发布的安装包。
+当前仓库已经具备“从源码运行的首个创作闭环”和可复核的安全边界，但还不是可交付给普通用户下载安装的 v1。macOS arm64 当前 headless build 已完成一次真实 Flash API、封存、重启恢复与本地取消边界 PASS；当前源码 GUI 也完成一次 Computer Use + 真实 Flash operational PASS。两者都不等于安装包、真人验收或文学质量证明。`alpha.1` 现在是开发里程碑名称，不是已经发布的安装包。
 
 ## 已实现
 
@@ -10,10 +10,12 @@
 - `safeStorage` 凭据封装、仅允许 DeepSeek 官方地址的 Model Gateway、Pro/Flash 固定模型选择和请求预算。
 - DSH rc.6 受信 Profile、公开 SDK JSON-RPC Adapter、loopback capability 与 Worker 取消/退出处理。
 - Electron ESM 入口采用非阻塞 bootstrap；应用只允许单实例，重复实例聚焦已有窗口，关闭最多等待 15 秒。
-- live harness 在打开 Key 前先运行无 Key、无网络、零模型 lease 的独立 Electron 预检。
+- live harness 在打开 Key 前先运行无 Key、零模型 fetch、零模型 lease 的独立 Electron 预检。
 - Flash 实网验收已验证 requested/returned model、fingerprint、usage、SSE 完成、harness 固定测试修订封存与跨进程恢复；本次 app-state 扫描未发现 Key 原文、已知 Session 文件或 raw reasoning 字段。
 - Python Controller 应用协议：初始意图、作品 dispatch、完成、取消、反馈、封存和系统快照。
 - Key → 模型 → 创作方向 → 生成 → 编辑/保留/拒绝/重写反馈的界面与 Main 业务链路。
+- sandboxed Preload 采用单文件 CommonJS bundle；真实 hidden BrowserWindow smoke 验证凭证页、窄 IPC、默认 Session 零 HTTP/HTTPS 请求和无 Node 全局暴露。
+- Computer Use 已从 GUI 完成 Key 验证、Flash 选择、首次创作、直接编辑、反馈封存、四入口检查和跨进程恢复；见 [GUI 验收报告](260815-Computer-Use-GUI验收报告.md)。
 - 反馈事务中断后由 Main 依据 Controller 已保存的 intent 自动恢复；恢复失败时界面保留明确状态，并阻止新反馈和新作品覆盖原编辑。
 - CPython 3.11 PyInstaller `--onedir` Controller sidecar 构建器，以及源码/sidecar 协议差分检查。
 - Node/Python 自动测试、公开树审计、DCO、完整历史 Gitleaks、源码 archive、SBOM 与许可证清单预检。
@@ -40,8 +42,8 @@
 |---|---|---|
 | M0 规则与 Skill 基线 | 已完成 | 仍需在最终 commit 后重跑完整历史与 archive 审计 |
 | M1 Monorepo 与治理拆包 | 已实现 | Python 采用 facade-first；旧 Skill 脚本仍是唯一治理实现，尚未反转成薄 wrapper |
-| M2 安全运行骨架 | 已实现、部分未验证 | mock、真实 DSH 启停和 macOS arm64 无 Key/无网络 Electron 预检通过；真实 GUI、macOS/Windows 打包进程与 DSH OS 级出网隔离尚未验收 |
-| M3 首个可用闭环 | Main 链路实网通过、GUI 未验证 | 当前 macOS arm64 headless build 的 Flash Chat、封存和重启恢复 PASS；Pro、Renderer/Preload/IPC、GUI 与 packaged app 未验证。取消只证明本地 lease revoke，不证明供应商侧在途或零计费，见 [真实验收报告](260815-Flash真实验收报告.md) |
+| M2 安全运行骨架 | 已实现、部分未验证 | mock、真实 DSH 启停、无 Key且零模型 fetch/lease 的 Electron 预检和 sandboxed Preload 真实 smoke 通过；macOS/Windows 打包进程与 DSH OS 级出网隔离尚未验收 |
+| M3 首个可用闭环 | 源码 GUI operational PASS | macOS arm64 当前源码 build 的 Flash Chat、GUI 编辑反馈、封存和跨进程恢复 PASS；Pro、Windows、packaged app 与非程序员体验未验证。取消只证明本地 lease revoke，不证明供应商侧在途或零计费，见 [Headless 验收](260815-Flash真实验收报告.md) 与 [GUI 验收](260815-Computer-Use-GUI验收报告.md) |
 | M4 个人创作系统 | 部分实现 | 初始意图、作品与明确反馈已落治理证据；跨作品 finding 聚类和用户可见原则管理未接通 |
 | M5 可验证自我改进 | 未接入应用 | Python 已有候选、三类评价、晋升和回滚内核；桌面端尚无真实 Candidate/Evaluator Worker 闭环 |
 | M6 系统实验室 | 协议原型 | 只能建立 `CANDIDATE_ONLY` 治理记录；应用没有生成维护者 patch 包，也不运行模型生成代码 |
