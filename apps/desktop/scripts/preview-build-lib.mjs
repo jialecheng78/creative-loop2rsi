@@ -64,6 +64,17 @@ export async function buildPreview(options) {
       timeoutMs: 300_000,
       env: { ...process.env, CI: 'true' },
     })
+    await run(process.execPath, [
+      pnpmCli,
+      '--filter',
+      '@creative-loop2rsi/desktop',
+      'rebuild',
+      'electron',
+    ], {
+      cwd: workspace,
+      timeoutMs: 300_000,
+      env: { ...process.env, CI: 'true' },
+    })
     const deployed = join(stagingRoot, 'deployed-app')
     await run(process.execPath, [
       pnpmCli,
