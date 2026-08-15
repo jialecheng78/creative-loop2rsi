@@ -1,8 +1,8 @@
 # 最小可验证自我改进 Computer Use 验收报告
 
-> 状态：`IN_PROGRESS / PAUSED_BY_OS_LOCK`
+> 状态：`STOPPED / MAX_PROGRAM_ITERATIONS_REACHED`
 >
-> 本文只记录已经发生且有证据支持的事实。当前尚未完成三个独立作品、候选评价、人工采用、第四个作品和回滚，因此不得把本轮称为最小 RSI 已跑通。
+> 本文只记录已经发生且有证据支持的事实。五次程序迭代用尽后，本轮完成 1 个作品和 1 份反馈，未完成三个独立作品、候选评价、人工采用、第四个作品和回滚，因此结论是“最小 RSI 未跑通”。
 
 ## 一、验收目标与成功条件
 
@@ -168,15 +168,15 @@ legacy `pnpm deploy` 在桌面应用中保留了 `runtime-dsh`，但遗漏其直
 
 **状态**
 
-代码已经进入最后一次迭代；仍需重新生成 source-bound sidecar 和标准应用包，再让 simulated-user 从同一系统重试。若此后仍有程序 blocker，本轮必须停止，不得进行第 6 次修复。
+代码进入最后一次迭代后，source-bound sidecar、标准应用包、打包 smoke 和包内 DSH initialize→shutdown 均通过。最终包绑定 source commit `db24d7ed162db3d829fc99cd40bdc77c39c9b977`，simulated-user 随后成功完成作品 1，但作品 2 连续三次触发 Gateway timeout。本轮依约停止，没有进行第 6 次修复。
 
-## 五、第 3 次迭代后的打包证据
+## 五、最终打包证据
 
 | 项目 | 证据 |
 |---|---|
-| source commit | `0ad697aa5528da5c841c7e9b540d87f14311b04b` |
-| package tree SHA256 | `2eb4b75fc7696123bc465b3cb1de97c28e91a49463d6a4be361c14130868490e` |
-| manifest entries | `35,961` |
+| source commit | `db24d7ed162db3d829fc99cd40bdc77c39c9b977` |
+| package tree SHA256 | `b86b875b1aac6f734fb393dc7bc880208451bfb4c1e7c651b14deff682d6cb5d` |
+| manifest entries | `35,979` |
 | app version | `1.0.0-alpha.1` |
 | packaged smoke | `PASS` |
 | preload API | status/configure/start/feedback 均可用 |
@@ -184,51 +184,120 @@ legacy `pnpm deploy` 在桌面应用中保留了 `runtime-dsh`，但遗漏其直
 | smoke model requests | `0`，离线 smoke 没有冒充实网调用 |
 | DSH SDK client | 从 app bundle 内解析成功 |
 | DSH JSON-RPC bin | 从 app bundle 内解析成功 |
+| DSH plugin tree | 无 Key initialize→shutdown `PASS` |
 
-Controller sidecar 已为同一 source commit 重建，并通过源码/sidecar 相同输入的结构化响应等价检查。旧 sidecar 和旧预览包只做可恢复归档，没有覆盖用户数据。
+Controller sidecar 已为同一 source commit 重建。旧 sidecar 和旧预览包只做可恢复归档，没有覆盖用户数据。
 
-## 六、当前断点
+## 六、最终 simulated-user 结果
 
-新应用已使用原有本地系统打开，以下状态均被保留：
+### 作品 1：成功并形成第一份真实 finding
+
+| 证据 | 值 |
+|---|---|
+| run | `run-593326da-b7d9-4fd5-b929-2e9dadb75241` |
+| work | `work-31802337-2a07-4a69-9a33-6dae1c7ebeeb` |
+| attempt | `attempt-001`，已封存 |
+| requested / returned model | `deepseek-v4-flash` / `deepseek-v4-flash` |
+| system fingerprint | `a26a7955944dc5c60445bff77fac9c8e` |
+| requests | 1 completed / 0 failed |
+| usage | prompt 208 / completion 13,329 / total 13,537 |
+| response ID SHA256 | `b6da820ce8f4d035722b2624685058cd11de2e123d0a4e458c1ea4e395850aef` |
+| artifact | 1,782 bytes；SHA256 `f971d4cd60235e8e0a46b5e633090c6e760112ce26371606a0406ce4369fd146` |
+| execution / quality | `PASS / WARN` |
+| human decision | `BLOCK / revise`，没有伪装成机器质量 PASS |
+
+simulated-user 逐字提交固定反馈：
+
+> 开头进入冲突太慢；请在前两句建立异常和明确风险，同时保留结尾反转。
+
+系统生成 `APP-FEEDBACK-79C72D29335B`，`normalized_feedback_sha256=79c72d29335beaec7fd3ab6f1e7d025ac03cd7bf51b935b171707a52559cceba`，并明确标记 `direct-user-feedback`。由于操作者是 simulated-user，Controller 诚实记录 `human_identity_verified=false`。
+
+### 作品 2：三次 120 秒超时，未形成作品证据
+
+| 证据 | 值 |
+|---|---|
+| run | `run-bd95d8d8-6499-4fb7-93f9-c67361149d91` |
+| work | `work-89b8c69e-ff2f-4dca-8229-e3b036702040` |
+| requested model | `deepseek-v4-flash` |
+| Gateway requests | 3 failed / 0 completed |
+| 每次持续时间 | 约 120 秒 |
+| error | `DEEPSEEK_TIMEOUT` / HTTP 504 |
+| fingerprint | 三次均为 `a26a7955944dc5c60445bff77fac9c8e` |
+| response ID SHA256 | `5de38e…a0e8` / `51bc51…cd6d` / `41f9e2…0f32` |
+| artifact files | 0 |
+| Controller stall | `runtime-failed-before-commit` |
+
+应用没有把部分流保存成完成作品，也没有把失败的作品 2 计为第二份独立证据。界面最终显示“本次创作没有完成”，simulated-user 依约停止，未点击重试。
+
+### 保留状态
+
+以下状态仍被保留：
 
 - DeepSeek credential 已配置；
 - 当前选择 `V4 Flash`；
 - 原创作系统仍是 active system；
-- 上一次中断 run 仍在治理记录中；
-- UI 要求重新生成，并保留与中断 run 的关联；
-- 尚无完成作品、HumanFeedbackReceipt、候选、晋升或回滚证据。
+- 作品 1、封存 manifest、反馈 receipt 和 finding；
+- 作品 2 的三次脱敏请求 ledger 与 zero-file stall；
+- active method 仍为 `baseline-v1`；
+- `candidates/` 和 `releases/` 只有占位文件，没有候选、晋升或回滚记录。
 
-macOS 解锁后，simulated-user 从同一系统重新提交作品 1；旧预览包仍在 DSH 初始化阶段失败，没有模型请求、作品或反馈。第 5 次修复已经完成代码和真实运行时初始化验证，等待生成最终预览包后从同一断点重试。
+## 七、最终根因分析
 
-## 七、当前判断
+### 直接阻断
+
+作品 2 的三个请求都被 Studio Gateway 在 120 秒整附近终止。DeepSeek 已返回目标模型、fingerprint 和 response ID，说明 Key、路由、模型选择和网络连接均生效；但没有一条请求在 120 秒内完成，因此 DSH 最终返回失败。
+
+作品 1 的成功请求耗时约 114 秒，距离 120 秒硬上限只有约 6 秒。这说明当前 `thinking=enabled + reasoning_effort=high + max_tokens=16384` 与固定 120 秒总时限组合过于脆弱：同类短作品只要推理稍慢，就会被当作传输失败。
+
+### 为什么三次重试没有解决
+
+DSH 对 timeout 自动重试两次，加上初始请求共三次。三次都使用相同模型和同一 120 秒总时限，所以重试没有改变失败条件，只把等待时间和潜在费用放大到约 361 秒。
+
+### 治理层仍暴露的问题
+
+- Controller 正确保留 zero-file stall 和失败 request ledger；
+- 但失败 run/attempt 仍显示 `RUNNING`、dispatch 仍为 `OPEN`，终态没有收敛为明确的 `BLOCK/INTERRUPTED`；
+- UI 只显示通用失败文案，没有告诉普通用户这是超时、已经尝试三次以及下一步如何降低任务规模；
+- retry 期间没有进度提示，用户只能看到持续生成。
+
+### 不是根因的项目
+
+- 不是 API Key 无效；作品 1 已真实完成；
+- 不是模型选错；requested/returned 都是 Flash；
+- 不是 DSH 包缺失；最终包已真实初始化 plugin tree；
+- 不是 ScreenCaptureKit 临时错误；捕捉恢复后应用仍持续运行，最终失败来自应用自身的 timeout 证据；
+- 不是候选或 RSI 逻辑错误；流程尚未走到候选形成阶段。
+
+## 八、最终判断
 
 | 判断 | 状态 | 说明 |
 |---|---|---|
 | 标准 macOS 预览包可启动 | `PASS` | packaged smoke 证明 |
 | 包内 DSH Runtime 可解析 | `PASS` | 从 app bundle 真实 resolve |
-| Flash 真实创作 | `NOT_RUN_IN_THIS_FORWARD_TEST` | 首次失败发生在请求前；修复后尚未因锁屏重试 |
-| 三个独立作品 | `NOT_STARTED` | 0/3 |
-| 三份相同反馈 | `NOT_STARTED` | 0/3 |
+| Flash 真实创作 | `PARTIAL PASS` | 作品 1 成功，作品 2 三次超时 |
+| 三个独立作品 | `BLOCK` | 1/3 |
+| 三份相同反馈 | `BLOCK` | 1/3 |
 | 候选 exact-three 评价 | `NOT_STARTED` | 无候选 |
 | 人工采用与第四个作品 | `NOT_STARTED` | 无晋升 |
 | 回滚 | `NOT_STARTED` | 无可回滚晋升 |
-| 最小自我改进闭环 | `NOT_PROVEN` | 不得宣称已跑通 |
+| 最小自我改进闭环 | `FAIL / NOT_PROVEN` | 五次程序迭代已用尽，必须停止 |
 
-## 八、解锁后的下一步
+## 九、下一轮计划
 
-1. 为第 5 次修复生成 source-bound sidecar 和最终预览包；
-2. 从保留的创作系统重新提交作品 1，不重置系统；
-3. 若作品 1 成功，封存并提交固定反馈；
-4. 依次完成作品 2、作品 3，核对三者拥有不同 work/run/attempt；
-5. 只在三份独立反馈齐全后检查候选；
-6. 完成 targeted、regression、held-out 盲比；
-7. 采用通过的候选，完成作品 4；
-8. 回滚并证明旧稳定版本和历史证据仍在；
-9. 若再遇程序问题，立即停止并交付失败根因与下一步计划，不进行第 6 次修复。
+本轮不再修改程序。下一轮应重新建立独立的迭代预算，并按以下顺序处理：
 
-## 九、尚不能外推的能力
+1. 将模型超时拆成“首事件等待、流空闲、绝对总时限”三种，不再用 120 秒总时限截断仍有进展的 thinking stream；
+2. 给前台创作配置更合理的总时限，并把 timeout/retry 次数与费用风险展示给用户；
+3. 重新评估普通创作是否需要 Flash `high` effort 和 16,384 输出 token；Builder、关键盲评与日常创作可以使用不同受控预算，但不得在后台偷偷换模型；
+4. 只对真正的传输失败重试；一旦收到有效模型身份/流进展，优先恢复或给出可行动提示，避免三个完全相同的长请求；
+5. 让失败 run/attempt/dispatch 原子收敛为 `BLOCK/INTERRUPTED`，不保留 `RUNNING/OPEN` 假象；
+6. 为“作品 1 已封存、作品 2 超时”建立重启恢复回归测试；
+7. 下一轮从同一系统的作品 1 断点继续，不重新生成作品 1、不重复计数已有 finding；
+8. 完成作品 2、作品 3 后，再检查候选 exact-three、采用、作品 4 和回滚。
 
-即使后续本轮通过，也只能证明：macOS arm64 unsigned preview 在一个独立 simulated-user 场景中跑通最小应用级自我改进闭环。它不能证明：
+## 十、尚不能外推的能力
+
+未来某轮即使通过，也只能证明：macOS arm64 unsigned preview 在一个独立 simulated-user 场景中跑通最小应用级自我改进闭环。它不能证明：
 
 - 真实非程序员可用性；
 - Windows、Intel Mac 或已签名安装包；
