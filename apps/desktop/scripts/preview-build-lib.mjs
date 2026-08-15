@@ -92,6 +92,7 @@ export async function buildPreview(options) {
     ], { cwd: workspace, timeoutMs: 300_000, env: { ...process.env, CI: 'true' } })
     await restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace)
     await verifyDeployedRuntimeResolution(deployed)
+    await probeDeployedRuntime(deployed)
     await reduceDeployedApp(deployed)
 
     const electronDist = join(electronPackage, 'dist')
@@ -302,77 +303,167 @@ export async function removePnpmWorkspaceSelfReference(directory) {
 }
 
 export async function restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace) {
-  const packageName = '@creative-loop2rsi/runtime-dsh'
-  const workspaceRuntime = join(workspace, 'packages', 'runtime-dsh')
+  const definitions = [
+    { name: '@creative-loop2rsi/desktop', source: join(workspace, 'apps', 'desktop'), target: deployed },
+    {
+      name: '@creative-loop2rsi/controller-bridge',
+      source: join(workspace, 'packages', 'controller-bridge'),
+      target: join(deployed, 'node_modules', '@creative-loop2rsi', 'controller-bridge'),
+    },
+    {
+      name: '@creative-loop2rsi/model-gateway',
+      source: join(workspace, 'packages', 'model-gateway'),
+      target: join(deployed, 'node_modules', '@creative-loop2rsi', 'model-gateway'),
+    },
+    {
+      name: '@creative-loop2rsi/runtime-dsh',
+      source: join(workspace, 'packages', 'runtime-dsh'),
+      target: join(deployed, 'node_modules', '@creative-loop2rsi', 'runtime-dsh'),
+    },
+  ]
+  const byName = new Map(definitions.map(definition => [definition.name, definition]))
+  const workspaceRoot = await realpath(workspace)
   const workspaceVirtualStore = await realpath(join(workspace, 'node_modules', '.pnpm'))
   const deployedRoot = await realpath(deployed)
-  const deployedVirtualStore = await realpath(join(deployed, 'node_modules', '.pnpm'))
-  const deployedRuntimeLink = join(deployed, 'node_modules', '@creative-loop2rsi', 'runtime-dsh')
-  const deployedRuntime = await realpath(deployedRuntimeLink)
-  if (!inside(deployedRoot, deployedRuntime)) throw new Error('deployed runtime package escapes application root')
-  const manifest = JSON.parse(await readFile(join(workspaceRuntime, 'package.json'), 'utf8'))
-  if (manifest.name !== packageName || manifest.dependencies === null
-    || typeof manifest.dependencies !== 'object' || Array.isArray(manifest.dependencies)) {
-    throw new Error('workspace runtime dependency manifest is invalid')
+  const lexicalDeployedRoot = resolve(deployed)
+  const deployedNodeModules = join(deployed, 'node_modules')
+  const deployedVirtualStore = join(deployedNodeModules, '.pnpm')
+  const replacementStore = join(deployedNodeModules, '.pnpm-fresh')
+  if (await exists(replacementStore)) throw new Error('fresh virtual store target already exists')
+
+  const manifests = new Map()
+  for (const definition of definitions) {
+    await assertRegularDirectory(definition.source, `workspace package ${definition.name}`)
+    const manifest = JSON.parse(await readFile(join(definition.source, 'package.json'), 'utf8'))
+    if (manifest.name !== definition.name
+      || manifest.dependencies === null
+      || (manifest.dependencies !== undefined
+        && (typeof manifest.dependencies !== 'object' || Array.isArray(manifest.dependencies)))) {
+      throw new Error(`workspace package manifest is invalid: ${definition.name}`)
+    }
+    manifests.set(definition.name, manifest)
   }
 
-  for (const [dependency, expectedVersion] of Object.entries(manifest.dependencies).sort()) {
-    if (!dependency.startsWith('@deepseek-ai/') || typeof expectedVersion !== 'string') {
-      throw new Error(`runtime dependency is outside the trusted DSH scope: ${dependency}`)
+  const closure = new Set()
+  const addStoreTarget = async (link, label) => {
+    const info = await lstat(link)
+    if (!info.isSymbolicLink()) throw new Error(`${label} is not a pnpm symlink`)
+    const target = await realpath(link)
+    if (!inside(workspaceVirtualStore, target)) {
+      if (inside(workspaceRoot, target)) return
+      throw new Error(`${label} escapes the fresh workspace`)
     }
-    const parts = dependency.split('/')
-    const workspaceLink = join(workspaceRuntime, 'node_modules', ...parts)
-    const sourceInfo = await lstat(workspaceLink)
-    if (!sourceInfo.isSymbolicLink()) throw new Error(`workspace runtime dependency is not a symlink: ${dependency}`)
-    const workspaceTarget = await realpath(workspaceLink)
-    if (!inside(workspaceVirtualStore, workspaceTarget)) {
-      throw new Error(`workspace runtime dependency escapes the virtual store: ${dependency}`)
+    closure.add(relative(workspaceVirtualStore, target).split(sep)[0])
+  }
+
+  for (const definition of definitions) {
+    for (const dependency of Object.keys(manifests.get(definition.name).dependencies ?? {}).sort()) {
+      if (byName.has(dependency)) continue
+      await addStoreTarget(
+        join(definition.source, 'node_modules', ...dependency.split('/')),
+        `${definition.name} dependency ${dependency}`,
+      )
     }
-    const deployedTarget = await findDeployedPackage(
-      deployedVirtualStore,
-      dependency,
-      expectedVersion,
-    )
-    if (!inside(deployedRoot, deployedTarget)) throw new Error(`deployed runtime dependency escapes application root: ${dependency}`)
-    const deployedManifest = JSON.parse(await readFile(join(deployedTarget, 'package.json'), 'utf8'))
-    if (deployedManifest.name !== dependency || deployedManifest.version !== expectedVersion) {
-      throw new Error(`deployed runtime dependency identity differs: ${dependency}`)
-    }
-    const destination = join(deployedRuntime, 'node_modules', ...parts)
-    if (await exists(destination)) {
-      if (await realpath(destination) !== await realpath(deployedTarget)) {
-        throw new Error(`deployed runtime dependency target differs: ${dependency}`)
+  }
+
+  const queued = [...closure]
+  for (let index = 0; index < queued.length; index += 1) {
+    const entry = queued[index]
+    const nodeModules = join(workspaceVirtualStore, entry, 'node_modules')
+    await assertRegularDirectory(nodeModules, `pnpm entry ${entry}`)
+    for (const name of (await readdir(nodeModules)).sort()) {
+      const path = join(nodeModules, name)
+      const info = await lstat(path)
+      const links = name.startsWith('@') && info.isDirectory() && !info.isSymbolicLink()
+        ? (await readdir(path)).sort().map(child => join(path, child))
+        : [path]
+      for (const link of links) {
+        const linkInfo = await lstat(link)
+        if (!linkInfo.isSymbolicLink()) continue
+        const target = await realpath(link)
+        if (!inside(workspaceVirtualStore, target)) {
+          if (inside(workspaceRoot, target)) continue
+          throw new Error(`pnpm dependency link escapes the fresh workspace: ${link}`)
+        }
+        const targetEntry = relative(workspaceVirtualStore, target).split(sep)[0]
+        if (!closure.has(targetEntry)) {
+          closure.add(targetEntry)
+          queued.push(targetEntry)
+        }
       }
-      continue
     }
-    await mkdir(dirname(destination), { recursive: true })
-    await symlink(relative(dirname(destination), deployedTarget), destination)
   }
-}
 
-async function findDeployedPackage(virtualStore, dependency, expectedVersion) {
-  const parts = dependency.split('/')
-  const matches = []
-  for (const entry of (await readdir(virtualStore)).sort()) {
-    const entryPath = join(virtualStore, entry)
-    const entryInfo = await lstat(entryPath)
-    if (!entryInfo.isDirectory() || entryInfo.isSymbolicLink()) continue
-    const candidate = join(virtualStore, entry, 'node_modules', ...parts)
-    if (!(await exists(candidate))) continue
-    const info = await lstat(candidate)
-    if (!info.isDirectory() || info.isSymbolicLink()) continue
-    const manifestPath = join(candidate, 'package.json')
-    if (!(await exists(manifestPath))) continue
-    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-    if (manifest.name === dependency && manifest.version === expectedVersion) {
-      matches.push(await realpath(candidate))
+  await mkdir(replacementStore)
+  for (const entry of [...closure].sort()) {
+    await cp(join(workspaceVirtualStore, entry), join(replacementStore, entry), {
+      recursive: true,
+      verbatimSymlinks: true,
+    })
+  }
+  const workspaceHoist = join(workspaceVirtualStore, 'node_modules')
+  const replacementHoist = join(replacementStore, 'node_modules')
+  await mkdir(replacementHoist)
+  for (const name of (await readdir(workspaceHoist)).sort()) {
+    const source = join(workspaceHoist, name)
+    const info = await lstat(source)
+    const links = name.startsWith('@') && info.isDirectory() && !info.isSymbolicLink()
+      ? (await readdir(source)).sort().map(child => join(source, child))
+      : [source]
+    for (const link of links) {
+      const linkInfo = await lstat(link)
+      if (!linkInfo.isSymbolicLink()) continue
+      const target = await realpath(link)
+      if (!inside(workspaceVirtualStore, target)) continue
+      const targetEntry = relative(workspaceVirtualStore, target).split(sep)[0]
+      if (!closure.has(targetEntry)) continue
+      const destination = join(replacementHoist, relative(workspaceHoist, link))
+      await mkdir(dirname(destination), { recursive: true })
+      await symlink(await readlink(link), destination)
     }
   }
-  const unique = [...new Set(matches)]
-  if (unique.length !== 1) {
-    throw new Error(`expected exactly one deployed runtime package for ${dependency}; found ${unique.length}`)
+  await rm(deployedVirtualStore, { force: true, recursive: true })
+  await rename(replacementStore, deployedVirtualStore)
+
+  for (const definition of definitions.filter(item => item.name !== '@creative-loop2rsi/desktop')) {
+    if (!inside(lexicalDeployedRoot, resolve(definition.target))) {
+      throw new Error(`workspace package target escapes deployed application: ${definition.name}`)
+    }
+    await rm(definition.target, { force: true, recursive: true })
+    await mkdir(definition.target, { recursive: true })
+    for (const name of (await readdir(definition.source)).sort()) {
+      if (name === 'node_modules') continue
+      await cp(join(definition.source, name), join(definition.target, name), {
+        recursive: true,
+        verbatimSymlinks: true,
+      })
+    }
   }
-  return unique[0]
+
+  for (const definition of definitions) {
+    for (const dependency of Object.keys(manifests.get(definition.name).dependencies ?? {}).sort()) {
+      const destination = join(definition.target, 'node_modules', ...dependency.split('/'))
+      const local = byName.get(dependency)
+      if (local !== undefined) {
+        if (resolve(destination) !== resolve(local.target)) {
+          throw new Error(`workspace dependency target differs: ${dependency}`)
+        }
+        await assertRegularDirectory(local.target, `deployed workspace dependency ${dependency}`)
+        continue
+      }
+      const workspaceTarget = await realpath(join(
+        definition.source,
+        'node_modules',
+        ...dependency.split('/'),
+      ))
+      const storeRelative = relative(workspaceVirtualStore, workspaceTarget)
+      const deployedTarget = join(deployedVirtualStore, storeRelative)
+      await assertRegularDirectory(deployedTarget, `deployed dependency ${dependency}`)
+      await rm(destination, { force: true, recursive: true })
+      await mkdir(dirname(destination), { recursive: true })
+      await symlink(relative(dirname(destination), deployedTarget), destination)
+    }
+  }
 }
 
 export async function verifyDeployedRuntimeResolution(deployed) {
@@ -383,6 +474,77 @@ export async function verifyDeployedRuntimeResolution(deployed) {
   for (const request of ['@deepseek-ai/dsh-sdk-client', '@deepseek-ai/dsh-sdk-jsonrpc-demo/bin']) {
     const resolved = require.resolve(request)
     if (!inside(deployedRoot, resolved)) throw new Error(`deployed DSH resolution escapes application root: ${request}`)
+  }
+}
+
+export async function probeDeployedRuntime(deployed) {
+  const runtimePackage = await realpath(join(
+    deployed,
+    'node_modules',
+    '@creative-loop2rsi',
+    'runtime-dsh',
+  ))
+  const require = createRequire(join(runtimePackage, 'package.json'))
+  const runtimeEntry = require.resolve('@deepseek-ai/dsh-sdk-jsonrpc-demo/bin')
+  const profile = join(runtimePackage, 'profiles', 'studio.cordis.yml')
+  await assertRegularFile(profile, 'deployed DSH profile')
+  const work = await mkdtemp(join(tmpdir(), 'creative-rsi-packaged-runtime-probe-'))
+  try {
+    const child = spawn(process.execPath, [runtimeEntry, profile], {
+      cwd: work,
+      env: {
+        PATH: process.env.PATH,
+        CREATIVE_RSI_GATEWAY_URL: 'http://127.0.0.1:43123',
+        CREATIVE_RSI_GATEWAY_TOKEN: 'packaged-runtime-probe-capability',
+        DSH_CWD: work,
+        DSH_HOME: join(work, 'dsh-home'),
+        DSH_TELEMETRY_DISABLED: '1',
+      },
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    let initialized = false
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.stdout.on('data', chunk => {
+      stdout += chunk
+      for (;;) {
+        const newline = stdout.indexOf('\n')
+        if (newline < 0) break
+        const line = stdout.slice(0, newline)
+        stdout = stdout.slice(newline + 1)
+        if (line === '') continue
+        const frame = JSON.parse(line)
+        if (frame.id === 1) {
+          initialized = frame.result?.serverInfo?.name === 'deepseek-harness-sdk-runtime'
+          child.stdin.write(`${JSON.stringify({
+            jsonrpc: '2.0', id: 2, method: 'shutdown', params: {},
+          })}\n`)
+        }
+      }
+    })
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        cwd: work,
+        provider: 'deepseek-official',
+        model: 'deepseek-v4-flash',
+        maxTokens: 128,
+      },
+    })}\n`)
+    const timer = setTimeout(() => child.kill('SIGKILL'), 15_000)
+    const code = await new Promise(resolveExit => child.once('exit', resolveExit))
+    clearTimeout(timer)
+    if (!initialized || code !== 0) {
+      throw new Error(`deployed DSH initialize probe failed: exit=${String(code)} ${stderr.slice(0, 500)}`)
+    }
+  } finally {
+    await rm(work, { recursive: true, force: true })
   }
 }
 

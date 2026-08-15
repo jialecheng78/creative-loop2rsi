@@ -88,7 +88,7 @@ describe('preview build inventory', () => {
     await expect(removePnpmWorkspaceSelfReference(deployed)).rejects.toThrow('target is unexpected')
   })
 
-  it('restores runtime dependency links omitted by legacy workspace deploy', async () => {
+  it('replaces the legacy peer graph with the fresh installed runtime closure', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'preview-runtime-links-'))
     temporary.push(parent)
     const workspace = join(parent, 'workspace')
@@ -97,54 +97,135 @@ describe('preview build inventory', () => {
       '@deepseek-ai/dsh-sdk-client': '0.1.0-rc.6',
       '@deepseek-ai/dsh-sdk-jsonrpc-demo': '0.1.0-rc.6',
     }
-    const runtimeVirtual = '@creative-loop2rsi+runtime-dsh@file+packages+runtime-dsh'
+    const workspacePackages = {
+      '@creative-loop2rsi/controller-bridge': 'packages/controller-bridge',
+      '@creative-loop2rsi/model-gateway': 'packages/model-gateway',
+      '@creative-loop2rsi/runtime-dsh': 'packages/runtime-dsh',
+    }
+    const desktop = join(workspace, 'apps', 'desktop')
     const workspaceRuntime = join(workspace, 'packages', 'runtime-dsh')
-    const deployedRuntime = join(
-      deployed, 'node_modules', '.pnpm', runtimeVirtual,
-      'node_modules', '@creative-loop2rsi', 'runtime-dsh',
-    )
+    await mkdir(desktop, { recursive: true })
     await mkdir(workspaceRuntime, { recursive: true })
-    await mkdir(deployedRuntime, { recursive: true })
+    await mkdir(deployed, { recursive: true })
     const runtimeManifest = JSON.stringify({ name: '@creative-loop2rsi/runtime-dsh', dependencies })
     await writeFile(join(workspaceRuntime, 'package.json'), runtimeManifest)
-    await writeFile(join(deployedRuntime, 'package.json'), runtimeManifest)
-    await writeFile(join(deployed, 'node_modules', '.pnpm', 'lock.yaml'), 'lockfileVersion: 9\n')
-    const deployedRuntimeLink = join(deployed, 'node_modules', '@creative-loop2rsi', 'runtime-dsh')
-    await mkdir(dirname(deployedRuntimeLink), { recursive: true })
-    await symlink(relative(dirname(deployedRuntimeLink), deployedRuntime), deployedRuntimeLink)
+    await writeFile(join(workspaceRuntime, 'profile.txt'), 'trusted-runtime')
+    await writeFile(join(desktop, 'package.json'), JSON.stringify({
+      name: '@creative-loop2rsi/desktop',
+      dependencies: Object.fromEntries(Object.keys(workspacePackages).map(name => [name, 'workspace:*'])),
+    }))
+    await writeFile(join(deployed, 'package.json'), await readFile(join(desktop, 'package.json')))
+    for (const [name, path] of Object.entries(workspacePackages)) {
+      const source = join(workspace, path)
+      await mkdir(source, { recursive: true })
+      if (name !== '@creative-loop2rsi/runtime-dsh') {
+        await writeFile(join(source, 'package.json'), JSON.stringify({ name }))
+      }
+      const desktopLink = join(desktop, 'node_modules', ...name.split('/'))
+      await mkdir(dirname(desktopLink), { recursive: true })
+      await symlink(relative(dirname(desktopLink), source), desktopLink)
+    }
+
+    const legacyStore = join(deployed, 'node_modules', '.pnpm')
+    await mkdir(join(legacyStore, 'legacy-peer-context'), { recursive: true })
+    await writeFile(join(legacyStore, 'lock.yaml'), 'lockfileVersion: 9\n')
 
     for (const [dependency, version] of Object.entries(dependencies)) {
       const simpleName = dependency.slice('@deepseek-ai/'.length)
       const workspaceVirtualName = `${dependency.replace('/', '+')}@${version}_workspace-peer-context`
-      const deployedVirtualName = `${dependency.replace('/', '+')}@${version}_deployed-peer-context`
       const workspaceTarget = join(
         workspace, 'node_modules', '.pnpm', workspaceVirtualName,
-        'node_modules', '@deepseek-ai', simpleName,
-      )
-      const deployedTarget = join(
-        deployed, 'node_modules', '.pnpm', deployedVirtualName,
         'node_modules', '@deepseek-ai', simpleName,
       )
       const packageJson = dependency.endsWith('jsonrpc-demo')
         ? { name: dependency, version, exports: { './bin': './lib/bin.js' } }
         : { name: dependency, version, main: './lib/index.js' }
-      for (const target of [workspaceTarget, deployedTarget]) {
-        await mkdir(join(target, 'lib'), { recursive: true })
-        await writeFile(join(target, 'package.json'), JSON.stringify(packageJson))
-        await writeFile(join(target, 'lib', dependency.endsWith('jsonrpc-demo') ? 'bin.js' : 'index.js'), '')
-      }
+      await mkdir(join(workspaceTarget, 'lib'), { recursive: true })
+      await writeFile(join(workspaceTarget, 'package.json'), JSON.stringify(packageJson))
+      await writeFile(join(
+        workspaceTarget,
+        'lib',
+        dependency.endsWith('jsonrpc-demo') ? 'bin.js' : 'index.js',
+      ), '')
       const workspaceLink = join(workspaceRuntime, 'node_modules', '@deepseek-ai', simpleName)
       await mkdir(dirname(workspaceLink), { recursive: true })
       await symlink(relative(dirname(workspaceLink), workspaceTarget), workspaceLink)
+      const hoistLink = join(
+        workspace,
+        'node_modules',
+        '.pnpm',
+        'node_modules',
+        '@deepseek-ai',
+        simpleName,
+      )
+      await mkdir(dirname(hoistLink), { recursive: true })
+      await symlink(relative(dirname(hoistLink), workspaceTarget), hoistLink)
+
+      if (dependency.endsWith('jsonrpc-demo')) {
+        const groupTarget = join(
+          workspace,
+          'node_modules',
+          '.pnpm',
+          '@deepseek-ai+cordis-plugin-group@1.0.1_workspace-peer-context',
+          'node_modules',
+          '@deepseek-ai',
+          'cordis-plugin-group',
+        )
+        await mkdir(groupTarget, { recursive: true })
+        await writeFile(join(groupTarget, 'package.json'), JSON.stringify({
+          name: '@deepseek-ai/cordis-plugin-group', version: '1.0.1', main: './index.js',
+        }))
+        await writeFile(join(groupTarget, 'index.js'), '')
+        const peerLink = join(
+          workspace,
+          'node_modules',
+          '.pnpm',
+          workspaceVirtualName,
+          'node_modules',
+          '@deepseek-ai',
+          'cordis-plugin-group',
+        )
+        await symlink(relative(dirname(peerLink), groupTarget), peerLink)
+      }
     }
 
     await expect(restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace)).resolves.toBeUndefined()
     await expect(verifyDeployedRuntimeResolution(deployed)).resolves.toBeUndefined()
     for (const dependency of Object.keys(dependencies)) {
-      const destination = join(deployedRuntime, 'node_modules', ...dependency.split('/'))
+      const destination = join(
+        deployed,
+        'node_modules',
+        '@creative-loop2rsi',
+        'runtime-dsh',
+        'node_modules',
+        ...dependency.split('/'),
+      )
       await expect((await import('node:fs/promises')).lstat(destination).then(info => info.isSymbolicLink()))
         .resolves.toBe(true)
     }
+    const copiedDemo = await (await import('node:fs/promises')).realpath(join(
+      deployed,
+      'node_modules',
+      '@creative-loop2rsi',
+      'runtime-dsh',
+      'node_modules',
+      '@deepseek-ai',
+      'dsh-sdk-jsonrpc-demo',
+    ))
+    await expect((await import('node:fs/promises')).realpath(join(
+      dirname(copiedDemo),
+      'cordis-plugin-group',
+    ))).resolves.toContain('@deepseek-ai+cordis-plugin-group@1.0.1_workspace-peer-context')
+    await expect(readFile(join(deployed, 'node_modules', '.pnpm', 'lock.yaml')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+    await expect((await import('node:fs/promises')).realpath(join(
+      deployed,
+      'node_modules',
+      '.pnpm',
+      'node_modules',
+      '@deepseek-ai',
+      'dsh-sdk-jsonrpc-demo',
+    ))).resolves.toContain('@deepseek-ai+dsh-sdk-jsonrpc-demo@0.1.0-rc.6_workspace-peer-context')
   })
 
   it('binds sidecar bytes and all tracked controller inputs to the source identity', async () => {

@@ -31,7 +31,7 @@
 - 模型：`deepseek-v4-flash`。
 - Key：只从既有安全存储读取；本轮修复、打包和离线 smoke 均未重新读取或输出 Key。
 - 作品：只记录 ID、字节数、哈希和状态，不在报告中保存未发表正文。
-- 程序迭代上限：5 次；当前已使用 3 次。
+- 程序迭代上限：5 次；当前已使用 5 次，不再保留程序修复额度。
 - 断点原则：修复后从同一创作系统和已保存治理状态继续，不为凑证据重置系统。
 
 ## 三、首次运行与保留断点
@@ -132,6 +132,44 @@ legacy `pnpm deploy` 在桌面应用中保留了 `runtime-dsh`，但遗漏其直
 
 真实打包、应用 smoke 和包内 DSH 解析全部通过。
 
+### 第 4/5 次：修复 DSH 的传递 peer 依赖闭包
+
+**现象**
+
+第 3 次打包能从 `runtime-dsh` 解析 SDK client 和 JSON-RPC bin，但 simulated-user 再次点击创作后仍立即失败。新 run 的 Gateway ledger 仍为 0，Controller 将原因记为 `runtime-launch-failed-before-output`。
+
+**根因**
+
+前一轮只证明两个入口文件可解析，没有启动 Cordis plugin tree。legacy deploy 遗漏了更深层 peer 链接，例如 `dsh-app-boot → cordis-plugin-group`。因此“入口存在”是假阴性门，不能证明 DSH 能初始化。
+
+**结果**
+
+这一轮完成了根因定位并将门禁提升为真实 initialize→shutdown；修复实现进入第 5 次迭代。
+
+### 第 5/5 次：复制可达依赖图与受控 hoist 视图
+
+**修复**
+
+- 以 fresh、frozen-lockfile 安装结果作为运行拓扑事实源；
+- 从 Desktop 和三个 workspace package 的生产依赖出发，沿 pnpm symlink 构建可达闭包；
+- 只复制闭包中的虚拟存储 entry，不复制全部开发依赖；
+- 物化三个 workspace runtime package，并重建其直接依赖链接；
+- 只复制闭包内的 pnpm hoist 链接，供 Cordis 按 Profile 名称解析插件；
+- 所有链接必须留在部署树内；
+- 打包过程中强制运行无 Key、无模型请求的 DSH initialize→shutdown probe。
+
+**已取得的修复前置证据**
+
+- 合成 peer-context/hoist fixture：`PASS`；
+- 当前真实安装图闭包：540 个 entry；
+- 真实 JSON-RPC runtime initialize→shutdown：`PASS`；
+- Desktop：16 files / 103 tests `PASS`；
+- TypeScript typecheck：`PASS`。
+
+**状态**
+
+代码已经进入最后一次迭代；仍需重新生成 source-bound sidecar 和标准应用包，再让 simulated-user 从同一系统重试。若此后仍有程序 blocker，本轮必须停止，不得进行第 6 次修复。
+
 ## 五、第 3 次迭代后的打包证据
 
 | 项目 | 证据 |
@@ -160,7 +198,7 @@ Controller sidecar 已为同一 source commit 重建，并通过源码/sidecar �
 - UI 要求重新生成，并保留与中断 run 的关联；
 - 尚无完成作品、HumanFeedbackReceipt、候选、晋升或回滚证据。
 
-simulated-user 恢复操作时，macOS 锁屏阻止 Computer Use。该阻断没有修改应用、没有消耗模型请求，也不计入程序迭代次数。
+macOS 解锁后，simulated-user 从同一系统重新提交作品 1；旧预览包仍在 DSH 初始化阶段失败，没有模型请求、作品或反馈。第 5 次修复已经完成代码和真实运行时初始化验证，等待生成最终预览包后从同一断点重试。
 
 ## 七、当前判断
 
@@ -178,14 +216,15 @@ simulated-user 恢复操作时，macOS 锁屏阻止 Computer Use。该阻断没�
 
 ## 八、解锁后的下一步
 
-1. 从保留的创作系统重新提交作品 1，不重置系统；
-2. 若作品 1 成功，封存并提交固定反馈；
-3. 依次完成作品 2、作品 3，核对三者拥有不同 work/run/attempt；
-4. 只在三份独立反馈齐全后检查候选；
-5. 完成 targeted、regression、held-out 盲比；
-6. 采用通过的候选，完成作品 4；
-7. 回滚并证明旧稳定版本和历史证据仍在；
-8. 若再遇程序问题，只剩 2 次修复额度；第 5 次后仍无法完成则停止并交付失败根因与下一步计划。
+1. 为第 5 次修复生成 source-bound sidecar 和最终预览包；
+2. 从保留的创作系统重新提交作品 1，不重置系统；
+3. 若作品 1 成功，封存并提交固定反馈；
+4. 依次完成作品 2、作品 3，核对三者拥有不同 work/run/attempt；
+5. 只在三份独立反馈齐全后检查候选；
+6. 完成 targeted、regression、held-out 盲比；
+7. 采用通过的候选，完成作品 4；
+8. 回滚并证明旧稳定版本和历史证据仍在；
+9. 若再遇程序问题，立即停止并交付失败根因与下一步计划，不进行第 6 次修复。
 
 ## 九、尚不能外推的能力
 
