@@ -328,10 +328,12 @@ export async function restoreLegacyWorkspaceRuntimeDependencies(deployed, worksp
     if (!inside(workspaceVirtualStore, workspaceTarget)) {
       throw new Error(`workspace runtime dependency escapes the virtual store: ${dependency}`)
     }
-    const storeRelative = relative(workspaceVirtualStore, workspaceTarget)
-    const deployedTarget = join(deployedVirtualStore, storeRelative)
+    const deployedTarget = await findDeployedPackage(
+      deployedVirtualStore,
+      dependency,
+      expectedVersion,
+    )
     if (!inside(deployedRoot, deployedTarget)) throw new Error(`deployed runtime dependency escapes application root: ${dependency}`)
-    await assertRegularDirectory(deployedTarget, `deployed runtime dependency ${dependency}`)
     const deployedManifest = JSON.parse(await readFile(join(deployedTarget, 'package.json'), 'utf8'))
     if (deployedManifest.name !== dependency || deployedManifest.version !== expectedVersion) {
       throw new Error(`deployed runtime dependency identity differs: ${dependency}`)
@@ -346,6 +348,28 @@ export async function restoreLegacyWorkspaceRuntimeDependencies(deployed, worksp
     await mkdir(dirname(destination), { recursive: true })
     await symlink(relative(dirname(destination), deployedTarget), destination)
   }
+}
+
+async function findDeployedPackage(virtualStore, dependency, expectedVersion) {
+  const parts = dependency.split('/')
+  const matches = []
+  for (const entry of (await readdir(virtualStore)).sort()) {
+    const candidate = join(virtualStore, entry, 'node_modules', ...parts)
+    if (!(await exists(candidate))) continue
+    const info = await lstat(candidate)
+    if (!info.isDirectory() || info.isSymbolicLink()) continue
+    const manifestPath = join(candidate, 'package.json')
+    if (!(await exists(manifestPath))) continue
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    if (manifest.name === dependency && manifest.version === expectedVersion) {
+      matches.push(await realpath(candidate))
+    }
+  }
+  const unique = [...new Set(matches)]
+  if (unique.length !== 1) {
+    throw new Error(`expected exactly one deployed runtime package for ${dependency}; found ${unique.length}`)
+  }
+  return unique[0]
 }
 
 export async function verifyDeployedRuntimeResolution(deployed) {

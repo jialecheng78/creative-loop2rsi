@@ -114,13 +114,14 @@ describe('preview build inventory', () => {
 
     for (const [dependency, version] of Object.entries(dependencies)) {
       const simpleName = dependency.slice('@deepseek-ai/'.length)
-      const virtualName = `${dependency.replace('/', '+')}@${version}_fixture`
+      const workspaceVirtualName = `${dependency.replace('/', '+')}@${version}_workspace-peer-context`
+      const deployedVirtualName = `${dependency.replace('/', '+')}@${version}_deployed-peer-context`
       const workspaceTarget = join(
-        workspace, 'node_modules', '.pnpm', virtualName,
+        workspace, 'node_modules', '.pnpm', workspaceVirtualName,
         'node_modules', '@deepseek-ai', simpleName,
       )
       const deployedTarget = join(
-        deployed, 'node_modules', '.pnpm', virtualName,
+        deployed, 'node_modules', '.pnpm', deployedVirtualName,
         'node_modules', '@deepseek-ai', simpleName,
       )
       const packageJson = dependency.endsWith('jsonrpc-demo')
