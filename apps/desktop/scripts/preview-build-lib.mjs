@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -41,7 +41,8 @@ const PUBLIC_REGISTRY_HOSTS = new Set([
   'registry.npmmirror.com',
   'registry.yarnpkg.com',
 ])
-const GENERIC_POSIX_HOME_PATH = /(?:\/(?:Users|home)\/[^/\u0000\s"'<>:]+|\/root(?:\/[^/\u0000\s"'<>:]+)?)(?:\/|(?=$|[\s"'<>:,}\]]))/
+const GENERIC_POSIX_HOME_PATH = /(?:^|[\s"'`<>{}\[\](),;:=])(?:\/(?:Users|home)\/[^/\u0000\s"'<>:]+|\/root(?:\/[^/\u0000\s"'<>:]+)?)(?:\/|(?=$|[\s"'<>:,}\]]))/
+const GENERIC_LOCAL_URI_HOME_PATH = /(?:file|webpack):\/{3,}(?:(?:Users|home)\/[^/\u0000\s"'<>:]+|root(?:\/[^/\u0000\s"'<>:]+)?)(?:\/|(?=$|[\s"'<>:,}\]]))/i
 const GENERIC_WINDOWS_HOME_PATH = /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]+Users[\\/]+[^\\/\u0000\s"'<>:]+(?:[\\/]+|(?=$|[\s"'<>:,}\]]))/i
 const POSIX_PACKAGE_STORE_PATH = /\/(?:[^/\u0000\s"'<>:]+\/)*(?:\.pnpm-store|pnpm\/store|npm-cache|npm\/cache|yarn-cache|yarn\/cache)\//i
 const WINDOWS_PACKAGE_STORE_PATH = /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]+(?:[^\\/\u0000\s"'<>:]+[\\/]+)*(?:\.pnpm-store|pnpm[\\/]+store|npm-cache|npm[\\/]+cache|yarn-cache|yarn[\\/]+cache)[\\/]+/i
@@ -51,6 +52,22 @@ const TEXT_EXTENSIONS = new Set([
   '.yaml', '.yml',
 ])
 const TEXT_BASENAMES = new Set(['license', 'notice', 'readme'])
+const NON_RUNTIME_DOCUMENT_PREFIXES = [
+  'authors',
+  'changelog',
+  'changes',
+  'code-of-conduct',
+  'code_of_conduct',
+  'contributing',
+  'contributors',
+  'history',
+  'readme',
+  'security',
+]
+const NON_RUNTIME_DOCUMENT_EXTENSIONS = new Set(['adoc', 'markdown', 'md', 'rst', 'txt'])
+const SOURCE_COMMENT_EXTENSIONS = new Set(['.cjs', '.css', '.js', '.mjs'])
+const DEPENDENCY_TEST_DIRECTORIES = new Set(['__tests__', 'spec', 'specs', 'test', 'tests'])
+const DEPENDENCY_TEST_FILE = /\.(?:spec|test)\.(?:cjs|js|mjs|ts|tsx)$/i
 
 export async function buildPreview(options) {
   const root = resolve(options.root)
@@ -349,7 +366,9 @@ export async function auditPackagedTree(root, options = {}) {
     }
     const text = decodeStrictText(entry.path, bytes)
     if (text === null) continue
-    if (GENERIC_POSIX_HOME_PATH.test(text) || GENERIC_WINDOWS_HOME_PATH.test(text)) {
+    if (GENERIC_POSIX_HOME_PATH.test(text)
+      || GENERIC_LOCAL_URI_HOME_PATH.test(text)
+      || GENERIC_WINDOWS_HOME_PATH.test(text)) {
       throw new Error(`packaged tree contains a generic user home path: ${entry.path}`)
     }
     if (POSIX_PACKAGE_STORE_PATH.test(text) || WINDOWS_PACKAGE_STORE_PATH.test(text)) {
@@ -726,18 +745,129 @@ export async function probeDeployedRuntime(deployed) {
   }
 }
 
-export async function removeRuntimeBuildMetadata(directory) {
+export async function removeRuntimeBuildMetadata(directory, options = {}) {
+  const dependencyTree = options.dependencyTree === true || basename(directory).toLowerCase() === 'node_modules'
   for (const name of await readdir(directory)) {
     const path = join(directory, name)
     const info = await lstat(path)
-    if (info.isDirectory() && !info.isSymbolicLink()) await removeRuntimeBuildMetadata(path)
-    else if (name.endsWith('.map')
+    if (info.isDirectory() && !info.isSymbolicLink()) {
+      if (dependencyTree && DEPENDENCY_TEST_DIRECTORIES.has(name.toLowerCase())) {
+        await rm(path, { force: true, recursive: true })
+      } else {
+        await removeRuntimeBuildMetadata(path, { dependencyTree })
+      }
+    } else if (name.endsWith('.map')
       || name.endsWith('.d.ts')
       || name.endsWith('.d.mts')
-      || name.endsWith('.d.cts')) {
+      || name.endsWith('.d.cts')
+      || (dependencyTree && DEPENDENCY_TEST_FILE.test(name))
+      || (dependencyTree && isNonRuntimeDocumentation(name))) {
       await rm(path, { force: true })
+    } else if (info.isFile() && SOURCE_COMMENT_EXTENSIONS.has(extensionOf(name))) {
+      await removeLocalSourceComments(path)
     }
   }
+}
+
+function isNonRuntimeDocumentation(name) {
+  const normalized = name.toLowerCase()
+  const dot = normalized.lastIndexOf('.')
+  const extension = dot < 0 ? null : normalized.slice(dot + 1)
+  if (extension !== null && !NON_RUNTIME_DOCUMENT_EXTENSIONS.has(extension)) return false
+  const stem = dot < 0 ? normalized : normalized.slice(0, dot)
+  return NON_RUNTIME_DOCUMENT_PREFIXES.some(prefix => stem === prefix
+    || stem.startsWith(`${prefix}-`)
+    || stem.startsWith(`${prefix}_`)
+    || stem.startsWith(`${prefix}.`))
+}
+
+async function removeLocalSourceComments(path) {
+  const bytes = await readFile(path)
+  if (bytes.includes(0)) return
+  let text
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    return
+  }
+  const ranges = sourceCommentRanges(text, { css: extensionOf(path) === '.css' })
+  const localRanges = ranges.filter(({ pos, end }) => containsGenericHome(text.slice(pos, end)))
+  if (localRanges.length === 0) return
+  let sanitized = ''
+  let cursor = 0
+  for (const { pos, end } of localRanges) {
+    sanitized += text.slice(cursor, pos)
+    sanitized += normalizeCommentHomePaths(text.slice(pos, end))
+    cursor = end
+  }
+  sanitized += text.slice(cursor)
+  await replaceFileAtomically(path, sanitized)
+}
+
+function sourceCommentRanges(text, options) {
+  const ranges = new Map()
+  const collect = range => {
+    for (const comment of range ?? []) ranges.set(`${comment.pos}:${comment.end}`, comment)
+  }
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, text)
+  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+    if (token === ts.SyntaxKind.MultiLineCommentTrivia
+      || (options.css !== true && token === ts.SyntaxKind.SingleLineCommentTrivia)) {
+      const comment = { pos: scanner.getTokenPos(), end: scanner.getTextPos() }
+      ranges.set(`${comment.pos}:${comment.end}`, comment)
+    }
+  }
+  if (options.css !== true) {
+    const source = ts.createSourceFile(
+      'runtime.js',
+      text,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.JS,
+    )
+    const visit = node => {
+      collect(ts.getLeadingCommentRanges(text, node.pos))
+      collect(ts.getTrailingCommentRanges(text, node.end))
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+  }
+  return [...ranges.values()].sort((left, right) => left.pos - right.pos)
+}
+
+function containsGenericHome(text) {
+  return GENERIC_POSIX_HOME_PATH.test(text)
+    || GENERIC_LOCAL_URI_HOME_PATH.test(text)
+    || GENERIC_WINDOWS_HOME_PATH.test(text)
+}
+
+function normalizeCommentHomePaths(comment) {
+  const posix = /(^|[\s"'`<>{}\[\](),;:=])(\/(?:Users|home)\/[^/\u0000\s"'<>:]+|\/root)(?=\/|$|[\s"'<>:,}\]])/gim
+  const localUri = /((?:file|webpack):\/{3,})(?:(?:Users|home)\/[^/\u0000\s"'<>:]+|root)(?=\/|$|[\s"'<>:,}\]])/gim
+  const windows = /(^|[^A-Za-z0-9])(?:[A-Za-z]:[\\/]+Users[\\/]+[^\\/\u0000\s"'<>:]+)(?=[\\/]+|$|[\s"'<>:,}\]])/gim
+  return comment
+    .replace(localUri, '$1<build-home>')
+    .replace(posix, '$1<build-home>')
+    .replace(windows, '$1<build-home>')
+}
+
+async function replaceFileAtomically(path, content) {
+  const info = await lstat(path)
+  const temporaryDirectory = await mkdtemp(join(dirname(path), '.creative-rsi-sanitize-'))
+  const temporaryFile = join(temporaryDirectory, basename(path))
+  try {
+    await writeFile(temporaryFile, content, { flag: 'wx', mode: info.mode & 0o7777 })
+    await chmod(temporaryFile, info.mode & 0o7777)
+    await rename(temporaryFile, path)
+  } finally {
+    await rm(temporaryDirectory, { force: true, recursive: true })
+  }
+}
+
+function extensionOf(name) {
+  const normalized = name.toLowerCase()
+  const dot = normalized.lastIndexOf('.')
+  return dot < 0 ? '' : normalized.slice(dot)
 }
 
 async function sourceIdentity(root, { observedPnpm }) {

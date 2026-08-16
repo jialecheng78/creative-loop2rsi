@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -120,13 +120,17 @@ describe('preview build inventory', () => {
       .toBe(false)
   })
 
-  it('strips declaration and source-map files across app and production dependencies only', async () => {
+  it('strips non-runtime build metadata and local source-origin comments across production dependencies', async () => {
     const root = await mkdtemp(join(tmpdir(), 'preview-runtime-metadata-'))
     temporary.push(root)
     const appDist = join(root, 'dist', 'main')
     const dependency = join(root, 'node_modules', 'synthetic-runtime', 'lib')
+    const dependencyRoot = dirname(dependency)
+    const dependencyTests = join(dependencyRoot, 'tests')
     await mkdir(appDist, { recursive: true })
     await mkdir(dependency, { recursive: true })
+    await mkdir(dependencyTests, { recursive: true })
+    const upstreamReadme = join(dependencyRoot, 'README.md')
     const removable = [
       join(appDist, 'index.d.ts'),
       join(appDist, 'index.d.mts'),
@@ -134,21 +138,63 @@ describe('preview build inventory', () => {
       join(appDist, 'index.js.map'),
       join(dependency, 'context.d.ts'),
       join(dependency, 'context.js.map'),
+      upstreamReadme,
+      join(dependencyRoot, 'CHANGELOG.md'),
+      join(dependencyTests, 'runtime.test.js'),
+      join(dependencyRoot, 'unit.spec.ts'),
     ]
+    const genericUserHome = ['', 'home', 'synthetic-runner'].join('/')
+    const genericUpstreamHome = `${genericUserHome}/work/runtime`
     await Promise.all(removable.map(path => writeFile(
       path,
-      path.endsWith('context.d.ts') ? 'export interface Context { registry: string }\n' : '{}\n',
+      path === upstreamReadme
+        ? `settings example: ${genericUpstreamHome}/settings.yaml\n`
+        : path.endsWith('context.d.ts') ? 'export interface Context { registry: string }\n' : '{}\n',
     )))
     const preserved = {
       [join(appDist, 'index.js')]: 'export {}\n',
-      [join(dependency, 'context.js')]: 'export const ready = true\n',
-      [join(dirname(dependency), 'package.json')]: '{"name":"synthetic-runtime"}\n',
+      [join(appDist, 'README.md')]: 'runtime-loaded app markdown\n',
+      [join(dependencyRoot, 'package.json')]: '{"name":"synthetic-runtime"}\n',
       [join(dependency, 'data.json')]: '{"ready":true}\n',
       [join(dependency, 'binding.node')]: 'synthetic-native',
+      [join(dependencyRoot, 'LICENSE')]: 'synthetic license\n',
+      [join(dependencyRoot, 'NOTICE.md')]: 'synthetic notice\n',
+      [join(dependency, 'runtime-guide.md')]: 'runtime-loaded markdown\n',
+      [join(dependency, 'runtime-test-helper.js')]: 'export const helper = true\n',
     }
     await Promise.all(Object.entries(preserved).map(([path, content]) => writeFile(path, content)))
+    const runtimeJavaScript = join(dependency, 'context.js')
+    const runtimeBeforeSanitizing = [
+      'export const before = true',
+      'const message = `before ${value} after`;',
+      `//#region \\0synthetic-css:${genericUpstreamHome}/source.css`,
+      '/**',
+      ` * Example workspace: ${genericUpstreamHome}/example.js`,
+      ' */',
+      `/*# source-origin=${genericUpstreamHome}/fixture.js */ globalThis.RUNTIME_SIDE_EFFECT = true; /* tail */`,
+      `export const inline = true // sourceURL=${genericUpstreamHome}/inline.js`,
+      `//# sourceURL=file://${genericUpstreamHome}/file-uri.js`,
+      `//# sourceMappingURL=webpack://${genericUpstreamHome}/webpack-uri.js`,
+      'export const after = true',
+      '',
+    ].join('\n')
+    const runtimeAfterSanitizing = runtimeBeforeSanitizing
+      .replaceAll(`file://${genericUserHome}`, 'file:///<build-home>')
+      .replaceAll(`webpack://${genericUserHome}`, 'webpack:///<build-home>')
+      .replaceAll(genericUserHome, '<build-home>')
+    await writeFile(runtimeJavaScript, runtimeBeforeSanitizing)
+    const runtimeCss = join(dependency, 'styles.css')
+    const cssBeforeSanitizing = `/*# sourceURL=${genericUpstreamHome}/styles.css */\n.root { color: black; }\n`
+    const cssAfterSanitizing = cssBeforeSanitizing.replaceAll(genericUserHome, '<build-home>')
+    await writeFile(runtimeCss, cssBeforeSanitizing)
+    if (process.platform !== 'win32') await chmod(runtimeJavaScript, 0o755)
+    const externalAliasRoot = await mkdtemp(join(tmpdir(), 'preview-runtime-hardlink-'))
+    temporary.push(externalAliasRoot)
+    const externalAlias = join(externalAliasRoot, 'context.js')
+    await link(runtimeJavaScript, externalAlias)
+    const originalMode = (await lstat(runtimeJavaScript)).mode & 0o7777
 
-    await expect(auditPackagedTree(root)).resolves.toBeDefined()
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
     await expect(removeRuntimeBuildMetadata(root)).resolves.toBeUndefined()
     for (const path of removable) {
       await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' })
@@ -156,6 +202,16 @@ describe('preview build inventory', () => {
     for (const [path, content] of Object.entries(preserved)) {
       await expect(readFile(path, 'utf8')).resolves.toBe(content)
     }
+    await expect(readFile(runtimeJavaScript, 'utf8')).resolves.toBe(runtimeAfterSanitizing)
+    await expect(readFile(runtimeCss, 'utf8')).resolves.toBe(cssAfterSanitizing)
+    await expect(readFile(externalAlias, 'utf8')).resolves.toBe(runtimeBeforeSanitizing)
+    expect((await lstat(runtimeJavaScript)).mode & 0o7777).toBe(originalMode)
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
+
+    await writeFile(runtimeJavaScript, `export const runtimePath = "${genericUpstreamHome}/runtime.js"\n`)
+    await expect(removeRuntimeBuildMetadata(root)).resolves.toBeUndefined()
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+    await writeFile(runtimeJavaScript, runtimeAfterSanitizing)
 
     const registryConfig = join(dependency, 'runtime-config.json')
     await writeFile(registryConfig, '{"registry":"https://packages.example.invalid/"}\n')
@@ -361,8 +417,29 @@ describe('preview build inventory', () => {
     await writeFile(metadata, `cache=${windowsHomeWithoutSlash}\n`)
     await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
 
-    await writeFile(metadata, 'cache=/' + 'root\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+    const absoluteRoot = '/' + 'root'
+    for (const content of [
+      `${absoluteRoot}\n`,
+      `cache="${absoluteRoot}"\n`,
+      `cache: ${absoluteRoot}\n`,
+      `cache=${absoluteRoot}\n`,
+    ]) {
+      await writeFile(metadata, content)
+      await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+    }
+
+    for (const localUri of [
+      `file:///${['home', 'synthetic-person', 'work'].join('/')}/source.js`,
+      `file:///${['Users', 'synthetic-person', 'work'].join('/')}/source.js`,
+      `file:///${['root', 'work'].join('/')}/source.js`,
+      `webpack:///${['home', 'synthetic-person', 'work'].join('/')}/source.js`,
+    ]) {
+      await writeFile(metadata, `source=${localUri}\n`)
+      await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+    }
+
+    await writeFile(metadata, 'relative=./root\nslot=single/root\n')
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
   })
 
   it('allows generic vendor paths in binaries but rejects exact build paths in raw bytes', async () => {
