@@ -20,6 +20,8 @@
 
 三类失败分别返回 `FIRST_EVENT_TIMEOUT`、`STREAM_IDLE_TIMEOUT` 和 `TOTAL_TIMEOUT`。调用方的 `AbortSignal` 始终优先表示取消，不得被改写成 timeout。
 
+上游 SSE 只有在解析器观察到唯一 `[DONE]`、继续读到正常 EOF 且没有尾随 event 后才算完整。桌面 Loopback 还必须在向 DSH 下发自己的 `[DONE]` 前先提交脱敏 request ledger；缺 DONE、DONE 后异常、EOF 前取消或超时都不得让 Runtime 看见成功终止帧。
+
 `timeoutMs` 仅作为旧调用方的临时兼容入口：单独传入时同时设置三层超时；与任一新字段混用时 fail closed。新代码不得继续使用它。
 
 ## 128k 输入边界

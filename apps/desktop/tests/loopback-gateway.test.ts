@@ -228,6 +228,236 @@ describe('LoopbackModelGateway', () => {
     await gateway.close()
   })
 
+  it('commits provenance before a DSH-style client closes after receiving [DONE]', async () => {
+    let pullsAfterDone = 0
+    const waitingForValidatedEof = deferred<void>()
+    const releaseValidatedEof = deferred<void>()
+    const stream = vi.fn(async function * (body: ChatCompletionRequest): AsyncGenerator<ChatStreamEvent> {
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-terminal-close',
+          model: body.model,
+          system_fingerprint: 'fingerprint-terminal-close',
+          choices: [{ delta: { content: '完整正文' }, finish_reason: 'stop' }],
+        },
+      }
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-terminal-close',
+          model: body.model,
+          system_fingerprint: 'fingerprint-terminal-close',
+          choices: [],
+          usage: { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 },
+        },
+      }
+      yield { type: 'done' }
+      pullsAfterDone += 1
+      waitingForValidatedEof.resolve()
+      await releaseValidatedEof.promise
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+
+    let clientSettled = false
+    const pendingClient = postAndDisconnectOnDone(lease.url, lease.token, requestBody())
+      .finally(() => { clientSettled = true })
+    await waitingForValidatedEof.promise
+
+    expect(clientSettled).toBe(false)
+    expect(pullsAfterDone).toBe(1)
+    expect(lease.provenance().requests[0]).toMatchObject({ status: 'STARTED' })
+
+    releaseValidatedEof.resolve()
+    const body = await pendingClient
+
+    expect(body).toContain('"finish_reason":"stop"')
+    expect(body.match(/data: \[DONE\]/gu)).toHaveLength(1)
+    expect(lease.provenance()).toMatchObject({
+      completedRequests: 1,
+      failedRequests: 0,
+      responseId: 'response-terminal-close',
+      returnedModels: ['deepseek-v4-pro'],
+      systemFingerprints: ['fingerprint-terminal-close'],
+      usage: { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 },
+    })
+    expect(lease.provenance().requests[0]).toMatchObject({
+      status: 'COMPLETED',
+      httpStatus: 200,
+    })
+    await gateway.close()
+  })
+
+  it.each([
+    ['a trailing chunk', 'STREAM_TRAILING_EVENT'],
+    ['an upstream exception', 'GATEWAY_ERROR'],
+  ] as const)('does not expose [DONE] when it is followed by %s', async (mode, expectedCode) => {
+    const stream = vi.fn(async function * (body: ChatCompletionRequest): AsyncGenerator<ChatStreamEvent> {
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-invalid-after-done',
+          model: body.model,
+          system_fingerprint: 'fingerprint-invalid-after-done',
+          choices: [{ delta: { content: '已输出内容' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+        },
+      }
+      yield { type: 'done' }
+      if (mode === 'an upstream exception') {
+        throw new GatewayError('INVALID_RESPONSE', 'private trailing SSE failure')
+      }
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'must-not-be-forwarded-after-done',
+          model: body.model,
+          system_fingerprint: 'must-not-be-forwarded-after-done',
+          choices: [{ delta: { content: '额外内容' }, finish_reason: null }],
+        },
+      }
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+
+    const result = await postUntilClosed(lease.url, lease.token, requestBody())
+
+    expect(result.ended).toBe(false)
+    expect(result.body).not.toContain('data: [DONE]')
+    expect(result.body).not.toContain('额外内容')
+    expect(lease.provenance()).toMatchObject({ completedRequests: 0, failedRequests: 1 })
+    expect(lease.provenance().requests[0]).toMatchObject({
+      status: 'FAILED',
+      errorCode: expectedCode,
+      responseId: 'response-invalid-after-done',
+    })
+    expect(JSON.stringify(lease.provenance())).not.toContain('must-not-be-forwarded-after-done')
+    await gateway.close()
+  })
+
+  it('revokes a lease after upstream [DONE] but before validated EOF without completing', async () => {
+    const waitingAfterDone = deferred<void>()
+    const upstreamAborted = deferred<AbortSignal>()
+    const stream = vi.fn(async function * (
+      body: ChatCompletionRequest,
+      options?: { readonly signal?: AbortSignal },
+    ): AsyncGenerator<ChatStreamEvent> {
+      const signal = requiredSignal(options?.signal)
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-revoked-after-done',
+          model: body.model,
+          system_fingerprint: 'fingerprint-revoked-after-done',
+          choices: [{ delta: { content: '尚未提交' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+        },
+      }
+      yield { type: 'done' }
+      waitingAfterDone.resolve()
+      await rejectWhenAborted(signal, upstreamAborted)
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+    const pending = postUntilClosed(lease.url, lease.token, requestBody())
+    await waitingAfterDone.promise
+
+    lease.revoke()
+
+    expect((await upstreamAborted.promise).aborted).toBe(true)
+    const result = await pending
+    expect(result.body).not.toContain('data: [DONE]')
+    expect(result.ended).toBe(false)
+    expect(lease.provenance()).toMatchObject({ completedRequests: 0, failedRequests: 1 })
+    expect(lease.provenance().requests[0]).toMatchObject({
+      status: 'FAILED',
+      errorCode: 'LEASE_REVOKED',
+      httpStatus: 503,
+      responseId: 'response-revoked-after-done',
+    })
+    await gateway.close()
+  })
+
+  it('keeps finish_reason length as a completed model request for runtime classification', async () => {
+    const stream = vi.fn(async function * (body: ChatCompletionRequest): AsyncGenerator<ChatStreamEvent> {
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-length',
+          model: body.model,
+          system_fingerprint: 'fingerprint-length',
+          choices: [{ delta: { content: '被截断的正文' }, finish_reason: 'length' }],
+          usage: { prompt_tokens: 2, completion_tokens: 32_768, total_tokens: 32_770 },
+        },
+      }
+      yield { type: 'done' }
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+
+    const result = await post(lease.url, lease.token, requestBody())
+
+    expect(result.status).toBe(200)
+    expect(result.body).toContain('"finish_reason":"length"')
+    expect(result.body).toContain('data: [DONE]')
+    expect(lease.provenance()).toMatchObject({ completedRequests: 1, failedRequests: 0 })
+    expect(lease.provenance().requests[0]).toMatchObject({ status: 'COMPLETED', httpStatus: 200 })
+    await gateway.close()
+  })
+
+  it('fails closed when upstream ends without a validated [DONE] event', async () => {
+    const stream = vi.fn(async function * (body: ChatCompletionRequest): AsyncGenerator<ChatStreamEvent> {
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-without-done',
+          model: body.model,
+          system_fingerprint: 'fingerprint-without-done',
+          choices: [{ delta: { content: '看似完整' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+        },
+      }
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+
+    const result = await post(lease.url, lease.token, requestBody()).then(
+      value => ({ kind: 'response' as const, value }),
+      () => ({ kind: 'disconnected' as const }),
+    )
+
+    expect(result).toMatchObject({ kind: 'disconnected' })
+    expect(lease.provenance()).toMatchObject({ completedRequests: 0, failedRequests: 1 })
+    expect(lease.provenance().requests[0]).toMatchObject({
+      status: 'FAILED',
+      httpStatus: 502,
+      errorCode: 'STREAM_INCOMPLETE',
+      responseId: 'response-without-done',
+    })
+    await gateway.close()
+  })
+
   it('aborts the upstream DeepSeek stream when its lease is revoked', async () => {
     const entered = deferred<void>()
     const upstreamAborted = deferred<AbortSignal>()
@@ -386,6 +616,112 @@ describe('LoopbackModelGateway', () => {
     })
     await gateway.close()
   })
+
+  it('still aborts when the client closes after upstream done but before validated EOF', async () => {
+    const waitingAfterDone = deferred<void>()
+    const upstreamAborted = deferred<AbortSignal>()
+    const stream = vi.fn(async function * (
+      body: ChatCompletionRequest,
+      options?: { readonly signal?: AbortSignal },
+    ): AsyncGenerator<ChatStreamEvent> {
+      const signal = requiredSignal(options?.signal)
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-close-before-eof',
+          model: body.model,
+          system_fingerprint: 'fingerprint-close-before-eof',
+          choices: [{ delta: { content: '正文' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 7, completion_tokens: 9, total_tokens: 16 },
+        },
+      }
+      yield { type: 'done' }
+      waitingAfterDone.resolve()
+      await rejectWhenAborted(signal, upstreamAborted)
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+    const client = startPost(lease.url, lease.token, requestBody())
+    await waitingAfterDone.promise
+
+    client.destroy()
+
+    expect((await upstreamAborted.promise).aborted).toBe(true)
+    await vi.waitFor(() => {
+      expect(lease.provenance().requests[0]).toMatchObject({
+        status: 'FAILED',
+        errorCode: 'CLIENT_DISCONNECTED',
+        httpStatus: 499,
+      })
+    })
+    expect(lease.provenance()).toMatchObject({ completedRequests: 0, failedRequests: 1 })
+    await gateway.close()
+  })
+
+  it('does not observe or write later chunks after a mid-stream client close', async () => {
+    const upstreamAborted = deferred<AbortSignal>()
+    const releaseIgnoringUpstream = deferred<void>()
+    const stream = vi.fn(async function * (
+      body: ChatCompletionRequest,
+      options?: { readonly signal?: AbortSignal },
+    ): AsyncGenerator<ChatStreamEvent> {
+      const signal = requiredSignal(options?.signal)
+      signal.addEventListener('abort', () => { upstreamAborted.resolve(signal) }, { once: true })
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'response-before-close',
+          model: body.model,
+          system_fingerprint: 'fingerprint-before-close',
+          choices: [{ delta: { content: '第一段' }, finish_reason: null }],
+          usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+        },
+      }
+      // Deliberately ignore the abort until the test releases this fake
+      // transport. The gateway must check its AbortSignal before observing or
+      // writing the next chunk.
+      await releaseIgnoringUpstream.promise
+      yield {
+        type: 'chunk',
+        chunk: {
+          id: 'must-not-be-observed-after-close',
+          model: body.model,
+          system_fingerprint: 'must-not-be-observed-after-close',
+          choices: [{ delta: { content: '不应写入' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 999, completion_tokens: 999, total_tokens: 1_998 },
+        },
+      }
+      yield { type: 'done' }
+    })
+    const gateway = new LoopbackModelGateway({
+      keyStore,
+      gatewayFactory: () => ({ streamChatCompletion: stream }),
+    })
+    await gateway.start()
+    const lease = gateway.issueLease('production', 'deepseek-v4-pro')
+    const firstData = startPostAndDestroyAfterFirstData(lease.url, lease.token, requestBody())
+
+    expect(await firstData).toContain('第一段')
+    expect((await upstreamAborted.promise).aborted).toBe(true)
+    releaseIgnoringUpstream.resolve()
+
+    await vi.waitFor(() => {
+      expect(lease.provenance().requests[0]).toMatchObject({
+        status: 'FAILED',
+        errorCode: 'CLIENT_DISCONNECTED',
+        responseId: 'response-before-close',
+        returnedModel: 'deepseek-v4-pro',
+        systemFingerprint: 'fingerprint-before-close',
+        usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+      })
+    })
+    expect(JSON.stringify(lease.provenance())).not.toContain('must-not-be-observed-after-close')
+    await gateway.close()
+  })
 })
 
 function requestBody(): unknown {
@@ -491,4 +827,111 @@ function startPost(base: string, token: string, body: unknown) {
   request.on('error', () => undefined)
   request.end(JSON.stringify(body))
   return request
+}
+
+async function postAndDisconnectOnDone(base: string, token: string, body: unknown): Promise<string> {
+  const url = new URL(base)
+  return await new Promise((resolve, reject) => {
+    let responseBody = ''
+    let requestedDisconnect = false
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: Number(url.port),
+      path: '/chat/completions',
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+    }, response => {
+      response.setEncoding('utf8')
+      response.on('data', chunk => {
+        responseBody += chunk
+        if (!requestedDisconnect && responseBody.includes('data: [DONE]')) {
+          requestedDisconnect = true
+          response.destroy()
+          request.destroy()
+        }
+      })
+      response.once('close', () => {
+        if (requestedDisconnect) resolve(responseBody)
+      })
+      response.once('error', error => {
+        if (!requestedDisconnect) reject(error)
+      })
+      response.once('end', () => resolve(responseBody))
+    })
+    request.once('error', error => {
+      if (!requestedDisconnect) reject(error)
+    })
+    request.end(JSON.stringify(body))
+  })
+}
+
+async function postUntilClosed(
+  base: string,
+  token: string,
+  body: unknown,
+): Promise<{ readonly body: string; readonly ended: boolean }> {
+  const url = new URL(base)
+  return await new Promise(resolve => {
+    let responseBody = ''
+    let settled = false
+    const settle = (ended: boolean): void => {
+      if (settled) return
+      settled = true
+      resolve({ body: responseBody, ended })
+    }
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: Number(url.port),
+      path: '/chat/completions',
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+    }, response => {
+      response.setEncoding('utf8')
+      response.on('data', chunk => { responseBody += chunk })
+      response.once('end', () => settle(true))
+      response.once('aborted', () => settle(false))
+      response.once('close', () => settle(false))
+      response.once('error', () => settle(false))
+    })
+    request.once('error', () => settle(false))
+    request.end(JSON.stringify(body))
+  })
+}
+
+function startPostAndDestroyAfterFirstData(base: string, token: string, body: unknown): Promise<string> {
+  const url = new URL(base)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: Number(url.port),
+      path: '/chat/completions',
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+    }, response => {
+      response.setEncoding('utf8')
+      response.once('data', chunk => {
+        settled = true
+        resolve(String(chunk))
+        response.destroy()
+        request.destroy()
+      })
+      response.once('error', error => {
+        if (!settled) reject(error)
+      })
+    })
+    request.once('error', error => {
+      if (!settled) reject(error)
+    })
+    request.end(JSON.stringify(body))
+  })
 }

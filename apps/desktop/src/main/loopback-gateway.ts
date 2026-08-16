@@ -312,24 +312,38 @@ export class LoopbackModelGateway {
         'content-type': 'text/event-stream; charset=utf-8',
         'x-content-type-options': 'nosniff',
       })
-      writeStreamEvent(response, first.value, requestObservation)
+      writeStreamChunk(response, first.value.chunk, requestObservation)
+      let sawDoneSentinel = false
       for (;;) {
         const next = await iterator.next()
         if (abortScope.controller.signal.aborted) throw abortScope.error()
-        if (next.done) break
-        writeStreamEvent(response, next.value, requestObservation)
+        if (next.done) {
+          if (!sawDoneSentinel) {
+            throw new GatewayRequestError(502, 'STREAM_INCOMPLETE', '模型流未完整结束，本次不会保存为成功结果。')
+          }
+          if (requestRecord.status !== 'STARTED') throw abortScope.error()
+          if (response.destroyed || response.writableEnded) {
+            throw new GatewayRequestError(499, 'CLIENT_DISCONNECTED', '客户端已断开，本次模型调用已停止。')
+          }
+          assertCompleteProvenance(requestObservation)
+          completeRequestRecord(requestRecord, requestObservation)
+          commitObservation(lease.observation, requestObservation)
+          response.end('data: [DONE]\n\n')
+          return
+        }
+        if (sawDoneSentinel) {
+          throw new GatewayRequestError(502, 'STREAM_TRAILING_EVENT', '模型流在结束标记后返回了额外内容，本次不会保存。')
+        }
+        if (next.value.type === 'done') {
+          // Do not expose [DONE] to DSH yet. The upstream parser must be
+          // resumed once more so it can validate EOF and reject trailing SSE
+          // events. DSH therefore cannot close its local response until the
+          // evidence below has already been committed.
+          sawDoneSentinel = true
+          continue
+        }
+        writeStreamChunk(response, next.value.chunk, requestObservation)
       }
-      if (abortScope.controller.signal.aborted || requestRecord.status !== 'STARTED') {
-        throw abortScope.error()
-      }
-      if (requestObservation.responseId === undefined
-        || requestObservation.returnedModels.size !== 1
-        || requestObservation.systemFingerprints.size !== 1) {
-        throw new GatewayRequestError(502, 'PROVENANCE_INCOMPLETE', '模型来源证据不完整，本次不会保存为成功结果。')
-      }
-      completeRequestRecord(requestRecord, requestObservation)
-      commitObservation(lease.observation, requestObservation)
-      response.end()
     } catch (error) {
       const safe = abortScope?.controller.signal.aborted === true
         ? abortScope.error()
@@ -519,17 +533,24 @@ function publicGatewayError(error: unknown): GatewayRequestError {
   return new GatewayRequestError(502, 'GATEWAY_ERROR', 'DeepSeek 调用失败，请稍后重试。')
 }
 
-function writeStreamEvent(
+function writeStreamChunk(
   response: ServerResponse,
-  event: ChatStreamEvent,
+  chunk: ChatStreamChunk,
   observation: MutableLeaseObservation,
 ): void {
-  if (event.type === 'chunk') {
-    observeChunk(observation, event.chunk)
-    response.write(`data: ${JSON.stringify(event.chunk)}\n\n`)
-    return
+  if (response.destroyed || response.writableEnded) {
+    throw new GatewayRequestError(499, 'CLIENT_DISCONNECTED', '客户端已断开，本次模型调用已停止。')
   }
-  response.write('data: [DONE]\n\n')
+  observeChunk(observation, chunk)
+  response.write(`data: ${JSON.stringify(chunk)}\n\n`)
+}
+
+function assertCompleteProvenance(observation: MutableLeaseObservation): void {
+  if (observation.responseId === undefined
+    || observation.returnedModels.size !== 1
+    || observation.systemFingerprints.size !== 1) {
+    throw new GatewayRequestError(502, 'PROVENANCE_INCOMPLETE', '模型来源证据不完整，本次不会保存为成功结果。')
+  }
 }
 
 function writeJson(response: ServerResponse, status: number, body: unknown): void {

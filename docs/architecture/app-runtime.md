@@ -49,6 +49,8 @@ v1 的受信 Profile 只保留进程内 Session，不挂载 DSH JSONL persistenc
 - `reasoning_content` 只在需要的工具回合内存中保留；
 - 所有出入站日志先脱敏，再进入 Evidence Sink。
 
+Loopback 不得把上游 `[DONE]` 一到达就直接交给 DSH。它必须继续读取到正常 EOF，拒绝 `[DONE]` 后额外事件或尾部异常，验证模型、fingerprint、response ID 与 usage，并先把 request ledger 提交为 `COMPLETED`；随后才用一次 `response.end("data: [DONE]\n\n")` 原子结束下游流。这样固定 rc.6 不可能先宣布 runtime completed，再让 Main 读到仍为 `STARTED` 的来源证据。EOF 前的客户端关闭、lease revoke 或 timeout 仍按失败处理，绝不能下发本地 `[DONE]`。
+
 流式创作不得用一个短的固定倒计时同时代表“模型尚未开始”“返回途中停滞”和“任务总体过长”。Production Worker 固定使用三条相互独立的时限：
 
 - `firstEventTimeoutMs=120000`：从请求开始到首个合法 SSE event；响应头、裸字节和 keep-alive 注释都不算模型已经开始返回；
