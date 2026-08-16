@@ -70,6 +70,60 @@ export interface AdoptedPrincipleSnapshot {
 export type MethodComparisonPhase = 'targeted' | 'regression' | 'heldout'
 export type MethodComparisonChoice = 'A' | 'B' | 'TIE'
 
+export const METHOD_PREPARATION_FAILURE_KINDS = [
+  'ACCOUNT_BALANCE',
+  'BUILDER_RESULT_UNKNOWN',
+  'CREDENTIAL_REJECTED',
+  'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+  'DEEPSEEK_STREAM_IDLE_TIMEOUT',
+  'DEEPSEEK_TIMEOUT',
+  'DEEPSEEK_TOTAL_TIMEOUT',
+  'DEEPSEEK_UNAVAILABLE',
+  'EMPTY_OUTPUT',
+  'GENERATION_RESULT_UNKNOWN',
+  'METHOD_EPOCH_CHANGED',
+  'METHOD_EPOCH_UNVERIFIABLE',
+  'OUTPUT_TRUNCATED',
+  'PREPARATION_EVIDENCE_INVALID',
+  'RATE_LIMITED',
+  'RUNTIME_FAILED',
+] as const
+export type MethodPreparationFailureKind = typeof METHOD_PREPARATION_FAILURE_KINDS[number]
+
+export const CANDIDATE_IPC_ERROR_CODES = [
+  'ACCOUNT_BALANCE',
+  'APPLICATION_CLOSED',
+  'CANDIDATE_OPERATION_FAILED',
+  'CANDIDATE_PREPARATION_BLOCKED',
+  'CANDIDATE_REQUEST_INVALID',
+  'CREDENTIAL_REJECTED',
+  'CREDENTIAL_REQUIRED',
+  'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+  'DEEPSEEK_STREAM_IDLE_TIMEOUT',
+  'DEEPSEEK_TIMEOUT',
+  'DEEPSEEK_TOTAL_TIMEOUT',
+  'DEEPSEEK_UNAVAILABLE',
+  'EMPTY_OUTPUT',
+  'EVIDENCE_INSUFFICIENT',
+  'METHOD_ACTIVE',
+  'METHOD_EPOCH_CHANGED',
+  'METHOD_EPOCH_UNVERIFIABLE',
+  'OUTPUT_TRUNCATED',
+  'RATE_LIMITED',
+  'RUNTIME_FAILED',
+] as const
+export type CandidateIpcErrorCode = typeof CANDIDATE_IPC_ERROR_CODES[number]
+
+export type CandidateIpcResult<T> =
+  | { readonly ok: true; readonly value: T }
+  | {
+      readonly ok: false
+      readonly error: {
+        readonly code: CandidateIpcErrorCode
+        readonly message: string
+      }
+    }
+
 export interface MethodComparisonSnapshot {
   readonly phase: MethodComparisonPhase
   readonly left: string
@@ -97,6 +151,8 @@ export interface MethodCandidateSnapshot {
   readonly resumable: boolean
   /** Actionable reason when the only safe operation is immutable rejection. */
   readonly preparationBlockedReason: string | null
+  /** Stable public category; never contains a raw runtime or Controller error. */
+  readonly preparationFailureKind: MethodPreparationFailureKind | null
   readonly comparisons: readonly MethodComparisonSnapshot[]
 }
 
@@ -256,10 +312,10 @@ export interface CreativeRsiApi {
     onEvent(listener: (event: StudioEvent) => void): () => void
   }
   candidates: {
-    prepare(input: PrepareCandidateInput): Promise<SystemSnapshot>
-    compare(input: CompareCandidateInput): Promise<SystemSnapshot>
-    adopt(input: CandidateDecisionInput): Promise<SystemSnapshot>
-    reject(input: CandidateDecisionInput): Promise<SystemSnapshot>
+    prepare(input: PrepareCandidateInput): Promise<CandidateIpcResult<SystemSnapshot>>
+    compare(input: CompareCandidateInput): Promise<CandidateIpcResult<SystemSnapshot>>
+    adopt(input: CandidateDecisionInput): Promise<CandidateIpcResult<SystemSnapshot>>
+    reject(input: CandidateDecisionInput): Promise<CandidateIpcResult<SystemSnapshot>>
   }
   releases: {
     rollback(input: RollbackMethodInput): Promise<SystemSnapshot>

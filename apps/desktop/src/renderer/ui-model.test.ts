@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   actionableError,
+  candidatePreparationError,
   canSubmitEdit,
   creationInputIssue,
   feedbackSubmissionMessage,
@@ -73,6 +74,22 @@ describe('renderer user-facing decisions', () => {
     expect(message).not.toContain('/private/path')
     expect(message).not.toContain('abc')
     expect(message).toContain('没有改动')
+  })
+
+  it('uses candidate-only failure guidance without claiming a work was not saved', () => {
+    const explicit = candidatePreparationError({
+      code: 'OUTPUT_TRUNCATED',
+      message: 'DSH failed at /private/path with token abc',
+    })
+    const unresolved = candidatePreparationError(new Error(
+      'record_method_generation response lost at /private/path with token abc',
+    ))
+
+    expect(explicit).toContain('放弃本次准备')
+    expect(explicit).not.toMatch(/作品没有|安全保存|检查磁盘|DSH|private\/path|abc/u)
+    expect(unresolved).toContain('最终状态还没有确认')
+    expect(unresolved).toContain('显示“继续准备”可继续')
+    expect(unresolved).not.toMatch(/作品没有|安全保存|检查磁盘|DSH|private\/path|abc/u)
   })
 
   it('requires an actual edit or written feedback before submitting an edit', () => {

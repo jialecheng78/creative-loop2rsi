@@ -307,7 +307,7 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
     })
     await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(5))
     const mismatchedGeneration = fixture.runtime.handles[4]!
-    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'CONTROLLER_BLOCK' })
+    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'METHOD_EPOCH_CHANGED' })
     await firstService.acceptRuntimeEvent({
       type: 'output', runId: mismatchedGeneration.runId, text: '这段付费正文不得进入 failure marker。',
     })
@@ -322,8 +322,9 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
       status: 'CANDIDATE',
       resumable: false,
       completedGenerationCount: 0,
+      preparationFailureKind: 'METHOD_EPOCH_CHANGED',
     })
-    expect(candidate?.preparationBlockedReason).toContain('重复付费')
+    expect(candidate?.preparationBlockedReason).toContain('固定生成基线已变化')
     const handlesBeforeRestart = fixture.runtime.handles.length
     await firstService.shutdown()
 
@@ -333,7 +334,8 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
     })
     expect(fixture.runtime.handles).toHaveLength(handlesBeforeRestart)
     expect(operationCount(fixture.traces, 'method_candidate_context')).toBe(2)
-    expect(operationCount(fixture.traces, 'record_method_generation')).toBe(1)
+    expect(operationCount(fixture.traces, 'record_method_generation')).toBe(0)
+    expect(operationCount(fixture.traces, 'record_method_generation_failure')).toBe(1)
 
     const rejected = await restartedService.rejectMethodCandidate(candidate!.id)
     expect(rejected.methodCandidates[0]).toMatchObject({
@@ -378,7 +380,7 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
 
     fixture.loopback.systemFingerprint = 'integration-builder-fingerprint-v2'
     const preparing = firstService.prepareMethodCandidate(observation!.id)
-    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'CONTROLLER_BLOCK' })
+    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'METHOD_EPOCH_CHANGED' })
     await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(4))
     const builder = fixture.runtime.handles[3]!
     await firstService.acceptRuntimeEvent({
@@ -395,7 +397,9 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
       status: 'CANDIDATE',
       resumable: false,
       completedGenerationCount: 0,
+      preparationFailureKind: 'METHOD_EPOCH_CHANGED',
     })
+    expect(operationCount(fixture.traces, 'record_method_builder_failure')).toBe(1)
     const handlesBeforeRestart = fixture.runtime.handles.length
     await firstService.shutdown()
 

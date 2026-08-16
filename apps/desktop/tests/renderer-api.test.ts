@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CreativeRsiApi, StudioStatus } from '../src/shared/ipc.js'
 import {
   adoptNewMethod,
+  CandidateOperationError,
   compareNewMethod,
   configureCredential,
   prepareNewMethod,
@@ -72,6 +73,7 @@ const STATUS: StudioStatus = {
       generationTotal: 4,
       resumable: false,
       preparationBlockedReason: null,
+      preparationFailureKind: null,
       comparisons: [{ phase: 'targeted', left: 'A', right: 'B', choice: 'A' }],
     }],
   },
@@ -100,10 +102,10 @@ describe('renderer business adapter', () => {
 
   it('uses exact narrow candidate and rollback API shapes and refreshes status after each action', async () => {
     const candidates = {
-      prepare: vi.fn(async () => STATUS.activeSystem!),
-      compare: vi.fn(async () => STATUS.activeSystem!),
-      adopt: vi.fn(async () => STATUS.activeSystem!),
-      reject: vi.fn(async () => STATUS.activeSystem!),
+      prepare: vi.fn(async () => ({ ok: true as const, value: STATUS.activeSystem! })),
+      compare: vi.fn(async () => ({ ok: true as const, value: STATUS.activeSystem! })),
+      adopt: vi.fn(async () => ({ ok: true as const, value: STATUS.activeSystem! })),
+      reject: vi.fn(async () => ({ ok: true as const, value: STATUS.activeSystem! })),
     }
     const rollback = vi.fn(async () => STATUS.activeSystem!)
     const fakeApi = {
@@ -130,6 +132,31 @@ describe('renderer business adapter', () => {
     expect(candidates.reject).toHaveBeenCalledWith({ candidateId: 'method-two' })
     expect(rollback).toHaveBeenCalledWith({ version: 'baseline-v1' })
     expect(fakeApi.getStatus).toHaveBeenCalledTimes(5)
+  })
+
+  it('preserves only the structured candidate code and safe IPC message', async () => {
+    const prepare = vi.fn(async () => ({
+      ok: false as const,
+      error: {
+        code: 'OUTPUT_TRUNCATED' as const,
+        message: '候选生成达到输出上限，截断内容不会进入比较。请放弃本次准备。',
+      },
+    }))
+    const fakeApi = {
+      getStatus: vi.fn(async () => STATUS),
+      candidates: { prepare },
+    } as unknown as CreativeRsiApi
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      value: { creativeRsi: fakeApi },
+    })
+
+    await expect(prepareNewMethod('app-feedback-one')).rejects.toMatchObject({
+      name: 'CandidateOperationError',
+      code: 'OUTPUT_TRUNCATED',
+      message: '候选生成达到输出上限，截断内容不会进入比较。请放弃本次准备。',
+    } satisfies Partial<CandidateOperationError>)
+    expect(fakeApi.getStatus).not.toHaveBeenCalled()
   })
 
   it('forwards an explicit session-only decision without exposing the key in status', async () => {

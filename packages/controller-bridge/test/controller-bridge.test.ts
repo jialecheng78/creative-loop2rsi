@@ -273,8 +273,37 @@ describe("buildControllerWireRequest", () => {
         expected_epoch_sha256: sha,
         observed_evidence_sha256: sha,
         error_code: "METHOD_EPOCH_UNVERIFIABLE",
+        failure_kind: "METHOD_EPOCH_UNVERIFIABLE",
       },
     })).toMatchObject({ operation: "record_method_builder_failure" });
+    expect(buildControllerWireRequest({
+      request_id: "request-generation-failure",
+      operation: "record_method_generation_failure",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        label: "heldout_candidate",
+        context_sha256: sha,
+        expected_epoch_sha256: sha,
+        observed_evidence_sha256: "b".repeat(64),
+        error_code: "RUNTIME_FAILED",
+        failure_kind: "RUNTIME_FAILED",
+      },
+    })).toMatchObject({ operation: "record_method_generation_failure" });
+    expect(() => buildControllerWireRequest({
+      request_id: "request-invalid-changed-failure",
+      operation: "record_method_generation_failure",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        label: "targeted_candidate",
+        context_sha256: sha,
+        expected_epoch_sha256: sha,
+        observed_evidence_sha256: "b".repeat(64),
+        error_code: "METHOD_EPOCH_CHANGED",
+        failure_kind: "METHOD_EPOCH_CHANGED",
+      },
+    })).toThrowError(/observed_epoch_sha256/u);
     expect(() => buildControllerWireRequest({
       request_id: "request-invalid-generation-intent",
       operation: "begin_method_generation",

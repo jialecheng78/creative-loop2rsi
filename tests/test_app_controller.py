@@ -2124,6 +2124,7 @@ class AppControllerTests(unittest.TestCase):
         )
         failure = self.read_json(failure_path)
         self.assertEqual(failure["error_code"], "METHOD_EPOCH_CHANGED")
+        self.assertEqual(failure["failure_kind"], "METHOD_EPOCH_CHANGED")
         self.assertEqual(failure["label"], "targeted_candidate")
         self.assertNotEqual(
             failure["expected_epoch_sha256"], failure["observed_epoch_sha256"]
@@ -2139,7 +2140,11 @@ class AppControllerTests(unittest.TestCase):
             if item["id"] == candidate_id
         )
         self.assertFalse(blocked_candidate["preparation_resumable"])
-        self.assertIn("重复付费", blocked_candidate["preparation_blocked_reason"])
+        self.assertEqual(
+            blocked_candidate["preparation_failure_kind"],
+            "METHOD_EPOCH_CHANGED",
+        )
+        self.assertIn("固定生成基线已变化", blocked_candidate["preparation_blocked_reason"])
         with self.assertRaisesRegex(AppRequestError, "永久停止"):
             self.request(
                 "method_candidate_context",
@@ -2227,8 +2232,10 @@ class AppControllerTests(unittest.TestCase):
                 "expected_epoch_sha256": context["method_epoch_sha256"],
                 "observed_evidence_sha256": "9" * 64,
                 "error_code": "METHOD_EPOCH_UNVERIFIABLE",
+                "failure_kind": "METHOD_EPOCH_UNVERIFIABLE",
             },
         )
+        self.assertEqual(failure["failure_kind"], "METHOD_EPOCH_UNVERIFIABLE")
         self.assertRegex(failure["failure_marker_sha256"], r"^[0-9a-f]{64}$")
         failure_text = (
             project
@@ -2695,6 +2702,121 @@ class AppControllerTests(unittest.TestCase):
             },
         )
         self.assertTrue(replacement["builder_required"])
+
+    def test_builder_runtime_failure_marker_is_hash_only_and_publicly_stable(self):
+        candidate_id = "method-builder-runtime-failed-v1"
+        project, observation, context = self.create_ready_method_context(
+            project_name="method-builder-runtime-failed-project",
+            candidate_id=candidate_id,
+        )
+        self.begin_builder_preparation(
+            project, candidate_id, observation["id"], context
+        )
+        recorded = self.request(
+            "record_method_builder_failure",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": observation["id"],
+                "builder_context_sha256": context["builder_context_sha256"],
+                "expected_epoch_sha256": context["method_epoch_sha256"],
+                "observed_evidence_sha256": "8" * 64,
+                "error_code": "RUNTIME_FAILED",
+                "failure_kind": "RUNTIME_FAILED",
+            },
+        )
+        self.assertEqual(recorded["failure_kind"], "RUNTIME_FAILED")
+        marker_path = (
+            project
+            / "creative-system/app-methods/builder-failures"
+            / f"{candidate_id}.json"
+        )
+        marker = self.read_json(marker_path)
+        self.assertEqual(marker["failure_kind"], "RUNTIME_FAILED")
+        self.assertIsNone(marker["observed_epoch_sha256"])
+        self.assertEqual(marker["source_refs"], [])
+        serialized = json.dumps(marker, ensure_ascii=False)
+        for forbidden in ("message", "output", "reasoning", "provenance", "/private/"):
+            self.assertNotIn(forbidden, serialized)
+
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        candidate = next(
+            item
+            for item in snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(candidate["preparation_completed"], 0)
+        self.assertFalse(candidate["preparation_resumable"])
+        self.assertEqual(candidate["preparation_failure_kind"], "RUNTIME_FAILED")
+        self.assertIn("明确失败", candidate["preparation_blocked_reason"])
+
+    def test_heldout_runtime_failure_preserves_exact_progress_and_only_hashes(self):
+        project, observation, _, _, created = self.create_ready_method_candidate(
+            project_name="method-heldout-runtime-failed-project",
+            candidate_id="method-heldout-runtime-failed-v1",
+        )
+        candidate_id = created["candidate_id"]
+        for label in (
+            "targeted_candidate",
+            "regression_candidate",
+            "heldout_baseline",
+        ):
+            self.seal_method_generation(project, created, label)
+        plan = created["evaluation_plan"]
+        self.begin_method_generation(
+            project,
+            candidate_id,
+            "heldout_candidate",
+            plan,
+            created["source_epoch_sha256"],
+        )
+        recorded = self.request(
+            "record_method_generation_failure",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "label": "heldout_candidate",
+                "context_sha256": plan["heldout"]["candidate_context_sha256"],
+                "expected_epoch_sha256": created["source_epoch_sha256"],
+                "observed_evidence_sha256": "7" * 64,
+                "error_code": "RUNTIME_FAILED",
+                "failure_kind": "RUNTIME_FAILED",
+            },
+        )
+        self.assertEqual(recorded["failure_kind"], "RUNTIME_FAILED")
+        marker_path = (
+            project
+            / "creative-system/app-methods/candidates"
+            / candidate_id
+            / "preparation/failures/heldout_candidate.json"
+        )
+        marker = self.read_json(marker_path)
+        self.assertEqual(marker["failure_kind"], "RUNTIME_FAILED")
+        self.assertIsNone(marker["observed_epoch_sha256"])
+        self.assertEqual(marker["source_refs"], [])
+        serialized = json.dumps(marker, ensure_ascii=False)
+        for forbidden in ("message", "output", "reasoning", "provenance", "/private/"):
+            self.assertNotIn(forbidden, serialized)
+
+        restarted = self.request("system_snapshot", {"project": str(project)})
+        candidate = next(
+            item
+            for item in restarted["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(candidate["preparation_completed"], 3)
+        self.assertFalse(candidate["preparation_resumable"])
+        self.assertEqual(candidate["preparation_failure_kind"], "RUNTIME_FAILED")
+        self.assertIn("明确失败", candidate["preparation_blocked_reason"])
+        with self.assertRaisesRegex(AppRequestError, "永久停止"):
+            self.request(
+                "method_candidate_context",
+                {
+                    "project": str(project),
+                    "candidate_id": "must-not-rebill-v2",
+                    "observation_id": observation["id"],
+                },
+            )
 
     def test_minimum_app_method_loop_requires_three_works_and_binds_next_work(self):
         project, _ = self.bootstrap()

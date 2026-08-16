@@ -25,6 +25,7 @@ import {
 } from './renderer-api.js'
 import {
   actionableError,
+  candidatePreparationError,
   canSubmitEdit,
   creationInputIssue,
   feedbackSubmissionMessage,
@@ -716,7 +717,7 @@ export function LearningPage(props: {
       } catch {
         // Keep the original actionable error when status refresh also fails.
       }
-      setNotice(actionableError(caught))
+      setNotice(candidatePreparationError(caught))
     } finally {
       setBusyId(undefined)
     }
@@ -876,7 +877,7 @@ export function NewMethodsPage(props: {
       } catch {
         // Keep the original actionable error when status refresh also fails.
       }
-      setNotice(actionableError(caught))
+      setNotice(candidatePreparationError(caught))
     } finally {
       setBusy(false)
     }
@@ -940,7 +941,11 @@ export function NewMethodsPage(props: {
                         <p>本次准备的不可变证据已经保留；系统不会自动重做可能已经发起或付费的调用。</p>
                         {method.resumable
                           ? <p>候选指导和已完成结果已封存；只会补安全缺项。已完成 {method.completedGenerationCount}/{method.generationTotal} 项生成，全部完成后才显示三组盲比。</p>
-                          : <p>{method.preparationBlockedReason ?? '冻结的生成基线已无法安全继续。'}</p>}
+                          : <>
+                              <p>已封存 {method.completedGenerationCount}/{method.generationTotal} 项候选生成。</p>
+                              <p>失败类型：<code>{method.preparationFailureKind ?? 'PREPARATION_EVIDENCE_INVALID'}</code></p>
+                              <p>{method.preparationBlockedReason ?? '候选准备证据无法通过完整性校验。'}</p>
+                            </>}
                         <div>
                           {method.resumable
                             ? <button className="primary-button" disabled={busy} onClick={() => void resumePreparation(method.observationId)} type="button">继续准备</button>

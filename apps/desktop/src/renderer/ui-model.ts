@@ -93,6 +93,40 @@ export function actionableError(error: unknown, code?: string): string {
   return '操作没有完成，也没有改动已保存内容。请重试；若仍失败，请重启应用。'
 }
 
+export function candidatePreparationError(error: unknown): string {
+  const code = candidateErrorCode(error)
+  if (code === 'OUTPUT_TRUNCATED') {
+    return '候选生成达到输出上限，截断内容不会进入盲比。请到“新方式”放弃本次准备。'
+  }
+  if (code === 'DEEPSEEK_FIRST_EVENT_TIMEOUT'
+    || code === 'DEEPSEEK_STREAM_IDLE_TIMEOUT'
+    || code === 'DEEPSEEK_TOTAL_TIMEOUT'
+    || code === 'DEEPSEEK_TIMEOUT') {
+    return '候选生成已明确超时。已封存进度仍保留，请到“新方式”放弃本次准备。'
+  }
+  if (code === 'METHOD_EPOCH_CHANGED' || code === 'METHOD_EPOCH_UNVERIFIABLE') {
+    return '候选的固定生成基线无法安全复用。请到“新方式”放弃本次准备。'
+  }
+  if (code === 'RUNTIME_FAILED' || code === 'EMPTY_OUTPUT') {
+    return '候选生成已明确失败。已封存进度仍保留，请到“新方式”放弃本次准备。'
+  }
+  if (code === 'CREDENTIAL_REQUIRED') {
+    return '请先重新连接 DeepSeek API Key，再回到“新方式”处理本次准备。'
+  }
+  if (code === 'EVIDENCE_INSUFFICIENT') {
+    return '这条观察还没有三项独立创作证据，不会提出候选。'
+  }
+  if (code === 'APPLICATION_CLOSED') {
+    return '应用正在关闭，没有开始下一项候选生成。'
+  }
+  return '新方式的最终状态还没有确认。请到“新方式”查看已封存状态；若显示“继续准备”可继续，若显示“准备已阻止”再放弃。'
+}
+
+function candidateErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined
+  return typeof error.code === 'string' ? error.code : undefined
+}
+
 export function isConfirmedLaunchCancellation(error: unknown): boolean {
   const raw = error instanceof Error ? error.message : String(error)
   return raw === '本次创作已停止。' || /:\s*本次创作已停止。$/u.test(raw)

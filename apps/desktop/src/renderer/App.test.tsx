@@ -163,15 +163,37 @@ describe('App shell', () => {
       ready: false,
       completedGenerationCount: 0,
       resumable: false,
-      preparationBlockedReason: '冻结的模型 epoch 已变化。',
+      preparationBlockedReason: '固定生成基线已变化；为避免重复调用，本次准备只能放弃。',
+      preparationFailureKind: 'METHOD_EPOCH_CHANGED',
       comparisons: [],
     })
     expect(html).toContain('准备已阻止')
     expect(html).toContain('本次准备的不可变证据已经保留')
-    expect(html).toContain('冻结的模型 epoch 已变化。')
+    expect(html).toContain('已封存 0/4')
+    expect(html).toContain('失败类型：<code>METHOD_EPOCH_CHANGED</code>')
+    expect(html).toContain('固定生成基线已变化')
+    expect(html).not.toMatch(/fingerprint|Profile|DSH/u)
     expect(html).toContain('>放弃本次准备</button>')
     expect(html).not.toContain('>继续准备</button>')
     expect(html).not.toContain('候选指导和已完成结果已封存')
+  })
+
+  it('shows an exact heldout failure count and only the abandonment action', () => {
+    const html = renderCandidate({
+      status: 'CANDIDATE',
+      ready: false,
+      completedGenerationCount: 3,
+      resumable: false,
+      preparationBlockedReason: '候选生成已明确失败；已封存进度仍保留，本次准备只能放弃。',
+      preparationFailureKind: 'RUNTIME_FAILED',
+      comparisons: [],
+    })
+
+    expect(html).toContain('已封存 3/4')
+    expect(html).toContain('失败类型：<code>RUNTIME_FAILED</code>')
+    expect(html).toContain('>放弃本次准备</button>')
+    expect(html).not.toContain('>继续准备</button>')
+    expect(html).not.toMatch(/作品没有|安全保存|检查磁盘/u)
   })
 
   it('never turns zero comparisons or a blocked decision into blind comparison 4/3', () => {
@@ -216,6 +238,7 @@ function candidateSnapshot(overrides: Partial<MethodCandidateSnapshot>): MethodC
     generationTotal: 4,
     resumable: false,
     preparationBlockedReason: null,
+    preparationFailureKind: null,
     comparisons: [],
     adoptionPending: false,
     rolledBack: false,

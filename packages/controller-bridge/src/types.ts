@@ -194,6 +194,21 @@ export type MethodGenerationLabel =
   | "heldout_baseline"
   | "heldout_candidate";
 
+export type MethodPreparationDurableFailureKind =
+  | "ACCOUNT_BALANCE"
+  | "CREDENTIAL_REJECTED"
+  | "DEEPSEEK_FIRST_EVENT_TIMEOUT"
+  | "DEEPSEEK_STREAM_IDLE_TIMEOUT"
+  | "DEEPSEEK_TIMEOUT"
+  | "DEEPSEEK_TOTAL_TIMEOUT"
+  | "DEEPSEEK_UNAVAILABLE"
+  | "EMPTY_OUTPUT"
+  | "METHOD_EPOCH_CHANGED"
+  | "METHOD_EPOCH_UNVERIFIABLE"
+  | "OUTPUT_TRUNCATED"
+  | "RATE_LIMITED"
+  | "RUNTIME_FAILED";
+
 export interface RecordMethodGenerationPayload {
   readonly project: string;
   readonly candidate_id: string;
@@ -216,7 +231,9 @@ export interface RecordMethodGenerationFailurePayload {
   readonly context_sha256: string;
   readonly expected_epoch_sha256: string;
   readonly observed_evidence_sha256: string;
-  readonly error_code: "METHOD_EPOCH_UNVERIFIABLE";
+  readonly observed_epoch_sha256?: string;
+  readonly error_code: MethodPreparationDurableFailureKind;
+  readonly failure_kind: MethodPreparationDurableFailureKind;
 }
 
 export interface RecordMethodBuilderFailurePayload {
@@ -226,7 +243,9 @@ export interface RecordMethodBuilderFailurePayload {
   readonly builder_context_sha256: string;
   readonly expected_epoch_sha256: string;
   readonly observed_evidence_sha256: string;
-  readonly error_code: "METHOD_EPOCH_UNVERIFIABLE";
+  readonly observed_epoch_sha256?: string;
+  readonly error_code: MethodPreparationDurableFailureKind;
+  readonly failure_kind: MethodPreparationDurableFailureKind;
 }
 
 export interface StageMethodComparisonsPayload {

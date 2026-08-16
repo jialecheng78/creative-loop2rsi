@@ -7,6 +7,8 @@ import type {
 import type { CreativeRsiApi, StudioStatus } from '../shared/ipc.js'
 import type {
   AdoptedPrincipleSnapshot,
+  CandidateIpcErrorCode,
+  CandidateIpcResult,
   MethodCandidateSnapshot,
   MethodComparisonChoice,
   MethodComparisonPhase,
@@ -62,6 +64,13 @@ export class PreviewCapabilityError extends Error {
   }
 }
 
+export class CandidateOperationError extends Error {
+  constructor(readonly code: CandidateIpcErrorCode, message: string) {
+    super(message)
+    this.name = 'CandidateOperationError'
+  }
+}
+
 function api(): CreativeRsiApi {
   return window.creativeRsi
 }
@@ -111,7 +120,7 @@ export function subscribeToWorkEvents(listener: (event: RuntimeEvent) => void): 
 }
 
 export async function prepareNewMethod(observationId: string): Promise<StudioViewStatus> {
-  await api().candidates.prepare({ observationId })
+  candidateIpcValue(await api().candidates.prepare({ observationId }))
   return await getStudioStatus()
 }
 
@@ -120,18 +129,23 @@ export async function compareNewMethod(
   phase: MethodComparisonPhase,
   choice: MethodComparisonChoice,
 ): Promise<StudioViewStatus> {
-  await api().candidates.compare({ candidateId, phase, choice })
+  candidateIpcValue(await api().candidates.compare({ candidateId, phase, choice }))
   return await getStudioStatus()
 }
 
 export async function adoptNewMethod(candidateId: string): Promise<StudioViewStatus> {
-  await api().candidates.adopt({ candidateId })
+  candidateIpcValue(await api().candidates.adopt({ candidateId }))
   return await getStudioStatus()
 }
 
 export async function rejectNewMethod(candidateId: string): Promise<StudioViewStatus> {
-  await api().candidates.reject({ candidateId })
+  candidateIpcValue(await api().candidates.reject({ candidateId }))
   return await getStudioStatus()
+}
+
+function candidateIpcValue<T>(result: CandidateIpcResult<T>): T {
+  if (result.ok) return result.value
+  throw new CandidateOperationError(result.error.code, result.error.message)
 }
 
 export async function rollbackMethod(version: string): Promise<StudioViewStatus> {

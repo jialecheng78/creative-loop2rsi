@@ -35,6 +35,10 @@ import type {
   WorkRunHandle,
   WorkSnapshot,
 } from '../shared/ipc.js'
+import {
+  METHOD_PREPARATION_FAILURE_KINDS,
+  type MethodPreparationFailureKind,
+} from '../shared/ipc.js'
 import type { CredentialStatus, EncryptedCredentialStore } from './credential-store.js'
 import type {
   LoopbackGatewayLease,
@@ -182,6 +186,7 @@ interface InternalModelRun {
   output: string | undefined
   errorCode: RuntimeErrorCode | undefined
   errorMessage: string | undefined
+  terminalState: 'failed' | 'cancelled' | undefined
   readonly completion: Promise<void>
   resolve(): void
   reject(error: Error): void
@@ -193,6 +198,11 @@ interface InternalGenerationResult {
   readonly provenanceError: StudioServiceError | null
   readonly provenanceEvidenceSha256: string | null
 }
+
+type DurableMethodFailureKind = Exclude<
+  MethodPreparationFailureKind,
+  'BUILDER_RESULT_UNKNOWN' | 'GENERATION_RESULT_UNKNOWN' | 'PREPARATION_EVIDENCE_INVALID'
+>
 
 interface InternalGenerationInput {
   readonly project: string
@@ -803,52 +813,48 @@ export class StudioService {
           }
         }
         if (!builderIntentRecorded) throw invalidControllerResponse()
-        const builder = await this.executeInternalGeneration({
-          project,
-          model,
-          role: 'candidate',
-          contextSha256: builderContextSha256,
-          instruction: methodBuilderInstruction(
-            requiredString(context.initial_intent, true),
-            requiredString(context.feedback, true),
-            nullableString(context.current_guidance),
-            sourceWorks,
-          ),
-          expectedEpoch,
-        })
+        let builder: InternalGenerationResult
+        try {
+          builder = await this.executeInternalGeneration({
+            project,
+            model,
+            role: 'candidate',
+            contextSha256: builderContextSha256,
+            instruction: methodBuilderInstruction(
+              requiredString(context.initial_intent, true),
+              requiredString(context.feedback, true),
+              nullableString(context.current_guidance),
+              sourceWorks,
+            ),
+            expectedEpoch,
+          })
+        } catch (error) {
+          if (!(error instanceof MethodPreparationMarkerError)) throw error
+          await this.persistMethodBuilderFailure({
+            project,
+            candidateId,
+            observationId,
+            builderContextSha256,
+            expectedEpochSha256: expectedEpoch.sha256,
+          }, error)
+          throw error
+        }
         if (builder.runtimeProvenance === null) {
           const evidenceSha256 = builder.provenanceEvidenceSha256
-          if (evidenceSha256 !== null) {
-            const failurePayload = {
-              project,
-              candidate_id: candidateId,
-              observation_id: observationId,
-              builder_context_sha256: builderContextSha256,
-              expected_epoch_sha256: expectedEpoch.sha256,
-              observed_evidence_sha256: evidenceSha256,
-              error_code: 'METHOD_EPOCH_UNVERIFIABLE',
-            } as const
-            let failureRecorded = false
-            for (let attempt = 0; attempt < 2 && !failureRecorded; attempt += 1) {
-              try {
-                const receipt = await this.callController(
-                  'record_method_builder_failure',
-                  failurePayload,
-                )
-                if (receipt.candidate_id !== candidateId
-                  || receipt.observation_id !== observationId
-                  || receipt.error_code !== 'METHOD_EPOCH_UNVERIFIABLE'
-                  || typeof receipt.idempotent !== 'boolean') {
-                  throw invalidControllerResponse()
-                }
-                requiredSha256(receipt.failure_marker_sha256)
-                failureRecorded = true
-              } catch (error) {
-                if (attempt === 1) throw error
-              }
-            }
-          }
-          throw builder.provenanceError ?? invalidControllerResponse()
+          if (evidenceSha256 === null) throw builder.provenanceError ?? invalidControllerResponse()
+          const failure = new MethodPreparationMarkerError(
+            'METHOD_EPOCH_UNVERIFIABLE',
+            methodPreparationFailureMessage('METHOD_EPOCH_UNVERIFIABLE'),
+            evidenceSha256,
+          )
+          await this.persistMethodBuilderFailure({
+            project,
+            candidateId,
+            observationId,
+            builderContextSha256,
+            expectedEpochSha256: expectedEpoch.sha256,
+          }, failure)
+          throw failure
         }
         guidance = normalizedGuidance(builder.output)
         const createPayload = {
@@ -954,36 +960,36 @@ export class StudioService {
           }
         }
         if (!generationIntentRecorded) throw invalidControllerResponse()
-        const generated = await this.executeInternalGeneration(generation.input)
+        let generated: InternalGenerationResult
+        try {
+          generated = await this.executeInternalGeneration(generation.input)
+        } catch (error) {
+          if (!(error instanceof MethodPreparationMarkerError)) throw error
+          await this.persistMethodGenerationFailure({
+            project,
+            candidateId,
+            label: generation.label,
+            contextSha256: generation.input.contextSha256,
+            expectedEpochSha256: generation.input.expectedEpoch.sha256,
+          }, error)
+          throw error
+        }
         if (generated.runtimeProvenance === null) {
           const evidenceSha256 = generated.provenanceEvidenceSha256
           if (evidenceSha256 === null) throw generated.provenanceError ?? invalidControllerResponse()
-          const failurePayload = {
+          const failure = new MethodPreparationMarkerError(
+            'METHOD_EPOCH_UNVERIFIABLE',
+            methodPreparationFailureMessage('METHOD_EPOCH_UNVERIFIABLE'),
+            evidenceSha256,
+          )
+          await this.persistMethodGenerationFailure({
             project,
-            candidate_id: candidateId,
+            candidateId,
             label: generation.label,
-            context_sha256: generation.input.contextSha256,
-            expected_epoch_sha256: generation.input.expectedEpoch.sha256,
-            observed_evidence_sha256: evidenceSha256,
-            error_code: 'METHOD_EPOCH_UNVERIFIABLE',
-          } as const
-          let failureRecorded = false
-          for (let attempt = 0; attempt < 2 && !failureRecorded; attempt += 1) {
-            try {
-              const receipt = await this.callController('record_method_generation_failure', failurePayload)
-              if (receipt.candidate_id !== candidateId
-                || receipt.label !== generation.label
-                || receipt.error_code !== 'METHOD_EPOCH_UNVERIFIABLE'
-                || typeof receipt.failure_marker_sha256 !== 'string') {
-                throw invalidControllerResponse()
-              }
-              requiredSha256(receipt.failure_marker_sha256)
-              failureRecorded = true
-            } catch (error) {
-              if (attempt === 1) throw error
-            }
-          }
-          throw generated.provenanceError ?? invalidControllerResponse()
+            contextSha256: generation.input.contextSha256,
+            expectedEpochSha256: generation.input.expectedEpoch.sha256,
+          }, failure)
+          throw failure
         }
         const recorded = await this.callController('record_method_generation', {
           project,
@@ -1158,6 +1164,91 @@ export class StudioService {
     }
   }
 
+  private async persistMethodBuilderFailure(
+    input: {
+      readonly project: string
+      readonly candidateId: string
+      readonly observationId: string
+      readonly builderContextSha256: string
+      readonly expectedEpochSha256: string
+    },
+    failure: MethodPreparationMarkerError,
+  ): Promise<void> {
+    const payload = {
+      project: input.project,
+      candidate_id: input.candidateId,
+      observation_id: input.observationId,
+      builder_context_sha256: input.builderContextSha256,
+      expected_epoch_sha256: input.expectedEpochSha256,
+      observed_evidence_sha256: failure.observedEvidenceSha256,
+      ...(failure.observedEpochSha256 === null
+        ? {}
+        : { observed_epoch_sha256: failure.observedEpochSha256 }),
+      error_code: failure.failureKind,
+      failure_kind: failure.failureKind,
+    } as const
+    let recorded = false
+    for (let attempt = 0; attempt < 2 && !recorded; attempt += 1) {
+      try {
+        const receipt = await this.callController('record_method_builder_failure', payload)
+        if (receipt.candidate_id !== input.candidateId
+          || receipt.observation_id !== input.observationId
+          || receipt.error_code !== failure.failureKind
+          || receipt.failure_kind !== failure.failureKind
+          || typeof receipt.idempotent !== 'boolean') {
+          throw invalidControllerResponse()
+        }
+        requiredSha256(receipt.failure_marker_sha256)
+        recorded = true
+      } catch (error) {
+        if (attempt === 1) throw error
+      }
+    }
+    if (!recorded) throw invalidControllerResponse()
+  }
+
+  private async persistMethodGenerationFailure(
+    input: {
+      readonly project: string
+      readonly candidateId: string
+      readonly label: MethodGenerationLabel
+      readonly contextSha256: string
+      readonly expectedEpochSha256: string
+    },
+    failure: MethodPreparationMarkerError,
+  ): Promise<void> {
+    const payload = {
+      project: input.project,
+      candidate_id: input.candidateId,
+      label: input.label,
+      context_sha256: input.contextSha256,
+      expected_epoch_sha256: input.expectedEpochSha256,
+      observed_evidence_sha256: failure.observedEvidenceSha256,
+      ...(failure.observedEpochSha256 === null
+        ? {}
+        : { observed_epoch_sha256: failure.observedEpochSha256 }),
+      error_code: failure.failureKind,
+      failure_kind: failure.failureKind,
+    } as const
+    let recorded = false
+    for (let attempt = 0; attempt < 2 && !recorded; attempt += 1) {
+      try {
+        const receipt = await this.callController('record_method_generation_failure', payload)
+        if (receipt.candidate_id !== input.candidateId
+          || receipt.label !== input.label
+          || receipt.error_code !== failure.failureKind
+          || receipt.failure_kind !== failure.failureKind) {
+          throw invalidControllerResponse()
+        }
+        requiredSha256(receipt.failure_marker_sha256)
+        recorded = true
+      } catch (error) {
+        if (attempt === 1) throw error
+      }
+    }
+    if (!recorded) throw invalidControllerResponse()
+  }
+
   private async executeInternalGeneration(input: InternalGenerationInput): Promise<InternalGenerationResult> {
     this.throwIfMethodCancelled()
     assertMethodSourceEpochRuntime(input.expectedEpoch, input.model)
@@ -1184,10 +1275,18 @@ export class StudioService {
         maxTokens: MAX_DEEPSEEK_OUTPUT_TOKENS,
       })
       profileSha256 = await this.profileDigest(spec)
+      this.throwIfMethodCancelled()
       if (profileSha256 !== input.expectedEpoch.profileSha256) {
-        throw new StudioServiceError(
+        const observedEpochSha256 = observedMethodEpochSha256(input.expectedEpoch, {
+          profileSha256,
+          returnedModel: input.expectedEpoch.returnedModel,
+          systemFingerprint: input.expectedEpoch.systemFingerprint,
+        })
+        throw new MethodPreparationMarkerError(
           'METHOD_EPOCH_CHANGED',
-          '内置运行配置已变化；为避免混用模型基线，本次候选没有继续调用模型。请放弃本次准备后重新建立候选。',
+          methodPreparationFailureMessage('METHOD_EPOCH_CHANGED'),
+          methodProfileMismatchEvidenceSha256(input, profileSha256, observedEpochSha256),
+          observedEpochSha256,
         )
       }
       this.throwIfMethodCancelled()
@@ -1204,13 +1303,42 @@ export class StudioService {
       const queued = this.internalLaunchEvents
       this.internalLaunchEvents = undefined
       for (const event of queued ?? []) await this.processInternalRuntimeEvent(event)
-      await withTimeout(completion.completion, 900_000, '新方式生成超过十五分钟，本轮没有记为成功。')
+      try {
+        await withTimeout(completion.completion, 900_000, '新方式生成超过十五分钟，本轮没有记为成功。')
+      } catch (error) {
+        if (this.methodCancellationRequested) throw error
+        if (completion.terminalState !== 'failed') throw error
+        const failureKind = terminalMethodFailureKind(completion.errorCode)
+        if (failureKind === null) throw error
+        throw new MethodPreparationMarkerError(
+          failureKind,
+          methodPreparationFailureMessage(failureKind),
+          methodProvenanceEvidenceSha256(input, profileSha256, lease.provenance()),
+        )
+      }
       if (completion.output === undefined || completion.output.trim() === '') {
-        throw new StudioServiceError('EMPTY_OUTPUT', '模型没有返回可比较的内容。')
+        throw new MethodPreparationMarkerError(
+          'EMPTY_OUTPUT',
+          methodPreparationFailureMessage('EMPTY_OUTPUT'),
+          methodProvenanceEvidenceSha256(input, profileSha256, lease.provenance()),
+        )
       }
       const observedProvenance = lease.provenance()
       try {
         const provenance = validatedProvenance(observedProvenance)
+        const observedEpochSha256 = observedMethodEpochSha256(input.expectedEpoch, {
+          profileSha256,
+          returnedModel: provenance.returnedModels[0],
+          systemFingerprint: provenance.systemFingerprints[0],
+        })
+        if (observedEpochSha256 !== input.expectedEpoch.sha256) {
+          throw new MethodPreparationMarkerError(
+            'METHOD_EPOCH_CHANGED',
+            methodPreparationFailureMessage('METHOD_EPOCH_CHANGED'),
+            methodProvenanceEvidenceSha256(input, profileSha256, observedProvenance),
+            observedEpochSha256,
+          )
+        }
         return {
           output: completion.output,
           runtimeProvenance: runtimeProvenancePayload(
@@ -1222,6 +1350,7 @@ export class StudioService {
           provenanceEvidenceSha256: null,
         }
       } catch (error) {
+        if (error instanceof MethodPreparationMarkerError) throw error
         if (!(error instanceof StudioServiceError) || error.code !== 'PROVENANCE_INCOMPLETE') throw error
         return {
           output: completion.output,
@@ -1259,6 +1388,7 @@ export class StudioService {
     }
     if (event.type === 'state' && event.state === 'completed') internal.resolve()
     if (event.type === 'state' && (event.state === 'failed' || event.state === 'cancelled')) {
+      internal.terminalState = event.state
       internal.reject(new StudioServiceError(
         internal.errorCode ?? 'RUNTIME_FAILED',
         internal.errorMessage ?? '新方式生成没有完成。',
@@ -1785,6 +1915,18 @@ export class StudioServiceError extends Error {
   }
 }
 
+class MethodPreparationMarkerError extends StudioServiceError {
+  constructor(
+    readonly failureKind: DurableMethodFailureKind,
+    message: string,
+    readonly observedEvidenceSha256: string,
+    readonly observedEpochSha256: string | null = null,
+  ) {
+    super(failureKind, message)
+    this.name = 'MethodPreparationMarkerError'
+  }
+}
+
 async function validateOfficialCredential(apiKey: string): Promise<readonly ModelChoice[]> {
   let candidate = apiKey
   const keyStore: ApiKeyStore = {
@@ -2159,13 +2301,29 @@ function parseMethodCandidate(value: JsonRecord): SystemSnapshot['methodCandidat
   const generationTotal = requiredNonNegativeNumber(value.preparation_total)
   const resumable = requiredBoolean(value.preparation_resumable)
   const preparationBlockedReason = nullableString(value.preparation_blocked_reason)
+  const preparationFailureKindValue = nullableString(value.preparation_failure_kind)
+  const preparationFailureKind = preparationFailureKindValue === null
+    ? null
+    : METHOD_PREPARATION_FAILURE_KINDS.includes(
+        preparationFailureKindValue as MethodPreparationFailureKind,
+      )
+      ? preparationFailureKindValue as MethodPreparationFailureKind
+      : invalidMethodPreparationFailureKind()
   if (adoptionPending && rolledBack) throw invalidControllerResponse()
   if ((adoptionPending || rolledBack) && status !== 'PROMOTED') throw invalidControllerResponse()
   if (generationTotal !== 4 || completedGenerationCount > generationTotal) throw invalidControllerResponse()
-  if (resumable && (status !== 'CANDIDATE' || preparationBlockedReason !== null)) {
+  if (resumable && (status !== 'CANDIDATE'
+    || preparationBlockedReason !== null
+    || preparationFailureKind !== null)) {
     throw invalidControllerResponse()
   }
-  if (status === 'CANDIDATE' && !resumable && preparationBlockedReason === null) {
+  if (status === 'CANDIDATE'
+    && !resumable
+    && (preparationBlockedReason === null || preparationFailureKind === null)) {
+    throw invalidControllerResponse()
+  }
+  if (status !== 'CANDIDATE'
+    && (preparationBlockedReason !== null || preparationFailureKind !== null)) {
     throw invalidControllerResponse()
   }
   const comparisons = requiredRecordArray(value.comparisons).map(item => {
@@ -2215,8 +2373,13 @@ function parseMethodCandidate(value: JsonRecord): SystemSnapshot['methodCandidat
     generationTotal,
     resumable,
     preparationBlockedReason,
+    preparationFailureKind,
     comparisons,
   }
+}
+
+function invalidMethodPreparationFailureKind(): never {
+  throw invalidControllerResponse()
 }
 
 function parseInterruptedRun(value: unknown): SystemSnapshot['interruptedRun'] {
@@ -2387,6 +2550,97 @@ function methodProvenanceEvidenceSha256(
   return createHash('sha256').update(`${JSON.stringify(evidence)}\n`, 'utf8').digest('hex')
 }
 
+function methodProfileMismatchEvidenceSha256(
+  input: InternalGenerationInput,
+  observedProfileSha256: string,
+  observedEpochSha256: string,
+): string {
+  const evidence = {
+    context_sha256: input.contextSha256,
+    expected_epoch_sha256: input.expectedEpoch.sha256,
+    expected_profile_sha256: input.expectedEpoch.profileSha256,
+    observed_epoch_sha256: observedEpochSha256,
+    observed_profile_sha256: observedProfileSha256,
+    stage: 'pre-call-profile-check',
+  }
+  return createHash('sha256').update(`${JSON.stringify(evidence)}\n`, 'utf8').digest('hex')
+}
+
+function methodEpochSha256(input: {
+  readonly methodVersion: string
+  readonly requestedModel: string
+  readonly returnedModel: string
+  readonly systemFingerprint: string
+  readonly profileSha256: string
+  readonly maxTokens: number
+}): string {
+  const canonical = {
+    method_version: input.methodVersion,
+    parameters: {
+      max_tokens: input.maxTokens,
+      reasoning_effort: 'high',
+      thinking: 'enabled',
+    },
+    profile_sha256: input.profileSha256,
+    requested_model: input.requestedModel,
+    returned_model: input.returnedModel,
+    system_fingerprint: input.systemFingerprint,
+  }
+  return createHash('sha256').update(`${JSON.stringify(canonical)}\n`, 'utf8').digest('hex')
+}
+
+function observedMethodEpochSha256(
+  expected: MethodSourceEpoch,
+  input: {
+    readonly profileSha256: string
+    readonly returnedModel: string
+    readonly systemFingerprint: string
+  },
+): string {
+  return methodEpochSha256({
+    methodVersion: expected.methodVersion,
+    requestedModel: expected.requestedModel,
+    returnedModel: input.returnedModel,
+    systemFingerprint: input.systemFingerprint,
+    profileSha256: input.profileSha256,
+    maxTokens: expected.parameters.maxTokens,
+  })
+}
+
+function terminalMethodFailureKind(code: string | undefined): DurableMethodFailureKind | null {
+  const durable = new Set<DurableMethodFailureKind>([
+    'ACCOUNT_BALANCE',
+    'CREDENTIAL_REJECTED',
+    'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+    'DEEPSEEK_STREAM_IDLE_TIMEOUT',
+    'DEEPSEEK_TIMEOUT',
+    'DEEPSEEK_TOTAL_TIMEOUT',
+    'DEEPSEEK_UNAVAILABLE',
+    'OUTPUT_TRUNCATED',
+    'RATE_LIMITED',
+    'RUNTIME_FAILED',
+  ])
+  return durable.has(code as DurableMethodFailureKind)
+    ? code as DurableMethodFailureKind
+    : null
+}
+
+function methodPreparationFailureMessage(kind: DurableMethodFailureKind): string {
+  if (kind === 'OUTPUT_TRUNCATED') {
+    return '候选生成达到输出上限；截断内容不会进入比较。请放弃本次准备。'
+  }
+  if (kind === 'EMPTY_OUTPUT') {
+    return '候选生成已结束但没有可比较内容。请放弃本次准备。'
+  }
+  if (kind === 'METHOD_EPOCH_CHANGED' || kind === 'METHOD_EPOCH_UNVERIFIABLE') {
+    return '候选的固定生成基线无法安全复用。请放弃本次准备。'
+  }
+  if (kind.includes('TIMEOUT')) {
+    return '候选生成已明确超时。已封存进度仍保留，请放弃本次准备。'
+  }
+  return '候选生成已明确失败。已封存进度仍保留，请放弃本次准备。'
+}
+
 function methodGenerationLabels(value: unknown, totalValue: unknown): Set<MethodGenerationLabel> {
   if (requiredNonNegativeNumber(totalValue) !== METHOD_GENERATION_LABELS.length || !Array.isArray(value)) {
     throw invalidControllerResponse()
@@ -2436,19 +2690,14 @@ function parseMethodSourceEpoch(
       maxTokens: requiredNonNegativeNumber(parameters.max_tokens),
     },
   }
-  const canonical = {
-    method_version: sourceEpoch.methodVersion,
-    parameters: {
-      max_tokens: sourceEpoch.parameters.maxTokens,
-      reasoning_effort: sourceEpoch.parameters.reasoningEffort,
-      thinking: sourceEpoch.parameters.thinking,
-    },
-    profile_sha256: sourceEpoch.profileSha256,
-    requested_model: sourceEpoch.requestedModel,
-    returned_model: sourceEpoch.returnedModel,
-    system_fingerprint: sourceEpoch.systemFingerprint,
-  }
-  const actualSha256 = createHash('sha256').update(`${JSON.stringify(canonical)}\n`, 'utf8').digest('hex')
+  const actualSha256 = methodEpochSha256({
+    methodVersion: sourceEpoch.methodVersion,
+    requestedModel: sourceEpoch.requestedModel,
+    returnedModel: sourceEpoch.returnedModel,
+    systemFingerprint: sourceEpoch.systemFingerprint,
+    profileSha256: sourceEpoch.profileSha256,
+    maxTokens: sourceEpoch.parameters.maxTokens,
+  })
   if (actualSha256 !== sourceEpoch.sha256
     || sourceEpoch.methodVersion !== activeMethodVersion
     || sourceEpoch.requestedModel !== selectedModel
@@ -2504,6 +2753,7 @@ function createInternalCompletion(runId: string): InternalModelRun {
     output: undefined,
     errorCode: undefined,
     errorMessage: undefined,
+    terminalState: undefined,
     completion,
     resolve: resolvePromise,
     reject: rejectPromise,

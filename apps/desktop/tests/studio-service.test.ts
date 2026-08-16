@@ -422,6 +422,9 @@ describe('StudioService governed alpha loop', () => {
     await preparationStopped
     await shuttingDown
     expect(fixture.controller.requests.some(item => item.operation === 'begin_method_generation')).toBe(false)
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_builder_failure'
+      || item.operation === 'record_method_generation_failure')).toBe(false)
   })
 
   it('does not open the next generation intent when shutdown wins after a slot receipt commits', async () => {
@@ -452,6 +455,8 @@ describe('StudioService governed alpha loop', () => {
     await shuttingDown
     expect(fixture.controller.requests.filter(item => item.operation === 'begin_method_generation')
       .map(item => item.payload.label)).toEqual(['targeted_candidate'])
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_generation_failure')).toBe(false)
   })
 
   it('blocks restart after Builder returns but create never commits instead of rebilling Builder', async () => {
@@ -525,6 +530,184 @@ describe('StudioService governed alpha loop', () => {
     })
   })
 
+  it('seals an explicit Builder RUNTIME_FAILED marker and never rebills after restart', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const failed = expect(preparing).rejects.toMatchObject({ code: 'RUNTIME_FAILED' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const builder = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error',
+      runId: builder.runId,
+      code: 'RUNTIME_FAILED',
+      message: 'sensitive Builder body /private/userData token secret-value',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: builder.runId, state: 'failed' })
+    await failed
+
+    const failure = fixture.controller.requests.find(item =>
+      item.operation === 'record_method_builder_failure')
+    expect(failure?.payload).toMatchObject({
+      error_code: 'RUNTIME_FAILED',
+      failure_kind: 'RUNTIME_FAILED',
+    })
+    expect(failure?.payload.observed_evidence_sha256).toMatch(/^[0-9a-f]{64}$/u)
+    expect(JSON.stringify(failure?.payload)).not.toMatch(/sensitive Builder body|private\/userData|secret-value/u)
+    const snapshot = await fixture.service.systemSnapshot()
+    expect(snapshot?.methodCandidates[0]).toMatchObject({
+      status: 'CANDIDATE',
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'RUNTIME_FAILED',
+    })
+
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(1)
+  })
+
+  it('keeps 3/4 sealed when heldout candidate fails and restart starts zero new runs', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const failed = expect(preparing).rejects.toMatchObject({ code: 'RUNTIME_FAILED' })
+    for (let index = 0; index < 4; index += 1) {
+      await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(index + 1))
+      const handle = fixture.runtime.handles[index]!
+      await fixture.service.acceptRuntimeEvent({
+        type: 'output',
+        runId: handle.runId,
+        text: index === 0 ? '用动作推进情节。' : `已封存生成 ${index}`,
+      })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(5))
+    const heldout = fixture.runtime.handles[4]!
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error',
+      runId: heldout.runId,
+      code: 'RUNTIME_FAILED',
+      message: 'sensitive heldout body /private/userData token secret-value',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: heldout.runId, state: 'failed' })
+    await failed
+
+    const failure = fixture.controller.requests.find(item =>
+      item.operation === 'record_method_generation_failure')
+    expect(failure?.payload).toMatchObject({
+      label: 'heldout_candidate',
+      error_code: 'RUNTIME_FAILED',
+      failure_kind: 'RUNTIME_FAILED',
+    })
+    expect(JSON.stringify(failure?.payload)).not.toMatch(/sensitive heldout body|private\/userData|secret-value|已封存生成/u)
+    const snapshot = await fixture.service.systemSnapshot()
+    const candidate = snapshot?.methodCandidates[0]
+    expect(candidate).toMatchObject({
+      status: 'CANDIDATE',
+      completedGenerationCount: 3,
+      generationTotal: 4,
+      resumable: false,
+      preparationFailureKind: 'RUNTIME_FAILED',
+    })
+    expect(candidate?.preparationBlockedReason).not.toMatch(/sensitive|private\/userData|secret-value/u)
+
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(5)
+    await expect(restarted.rejectMethodCandidate(candidate!.id)).resolves.toMatchObject({
+      methodCandidates: [{ status: 'REJECTED' }],
+    })
+  })
+
+  it.each([
+    'OUTPUT_TRUNCATED',
+    'DEEPSEEK_FIRST_EVENT_TIMEOUT',
+  ] as const)('preserves %s as the stable terminal failure kind', async failureKind => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const failed = expect(preparing).rejects.toMatchObject({ code: failureKind })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const builder = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: builder.runId, text: '用动作推进。' })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: builder.runId, state: 'completed' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(2))
+    const targeted = fixture.runtime.handles[1]!
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error', runId: targeted.runId, code: failureKind, message: 'raw terminal body',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: targeted.runId, state: 'failed' })
+    await failed
+
+    const failure = fixture.controller.requests.find(item =>
+      item.operation === 'record_method_generation_failure')
+    expect(failure?.payload).toMatchObject({
+      label: 'targeted_candidate',
+      error_code: failureKind,
+      failure_kind: failureKind,
+    })
+    expect(JSON.stringify(failure?.payload)).not.toContain('raw terminal body')
+  })
+
+  it('seals EMPTY_OUTPUT when a completed Builder produces no candidate guidance', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const failed = expect(preparing).rejects.toMatchObject({ code: 'EMPTY_OUTPUT' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    await fixture.service.acceptRuntimeEvent({
+      type: 'state', runId: fixture.runtime.handles[0]!.runId, state: 'completed',
+    })
+    await failed
+
+    expect(fixture.controller.requests.find(item =>
+      item.operation === 'record_method_builder_failure')?.payload).toMatchObject({
+      error_code: 'EMPTY_OUTPUT',
+      failure_kind: 'EMPTY_OUTPUT',
+    })
+    expect(fixture.runtime.handles).toHaveLength(1)
+  })
+
+  it('rolls a committed 4/4 response loss forward without a failure marker or another run', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+    fixture.controller.loseMethodGenerationResponseLabel = 'heldout_candidate'
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const responseLost = expect(preparing).rejects.toThrow(/response lost after commit/u)
+    for (let index = 0; index < 5; index += 1) {
+      await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(index + 1))
+      const handle = fixture.runtime.handles[index]!
+      await fixture.service.acceptRuntimeEvent({
+        type: 'output', runId: handle.runId, text: index === 0 ? '用动作推进。' : `成功生成 ${index}`,
+      })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    await responseLost
+
+    const refreshed = await fixture.service.systemSnapshot()
+    expect(refreshed?.methodCandidates[0]).toMatchObject({
+      status: 'CANDIDATE', completedGenerationCount: 4, resumable: true,
+    })
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_generation_failure')).toBe(false)
+
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).resolves.toMatchObject({
+      methodCandidates: [{ status: 'EVALUATING', completedGenerationCount: 4 }],
+    })
+    expect(fixture.runtime.handles).toHaveLength(5)
+    expect(fixture.controller.requests.filter(item => item.operation === 'record_method_generation'
+      && item.payload.label === 'heldout_candidate')).toHaveLength(1)
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_generation_failure')).toBe(false)
+  })
+
   it.each([
     ['returned model mismatch', { returnedModels: ['deepseek-v4-flash'] }],
     ['multiple fingerprints', { systemFingerprints: ['fingerprint-one', 'fingerprint-two'] }],
@@ -533,24 +716,79 @@ describe('StudioService governed alpha loop', () => {
     fixture.controller.primeMethodObservation()
 
     const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
-    const rejected = expect(preparing).rejects.toMatchObject({ code: 'PROVENANCE_INCOMPLETE' })
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'METHOD_EPOCH_UNVERIFIABLE' })
     await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
     const handle = fixture.runtime.handles[0]!
     await fixture.service.acceptRuntimeEvent({ type: 'output', runId: handle.runId, text: '不应持久的 Builder 指导' })
     await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
     await rejected
 
-    expect(fixture.controller.requests.some(item => item.operation === 'record_method_builder_failure')).toBe(true)
+    const failure = fixture.controller.requests.find(item =>
+      item.operation === 'record_method_builder_failure')
+    expect(failure?.payload).toMatchObject({
+      error_code: 'METHOD_EPOCH_UNVERIFIABLE',
+      failure_kind: 'METHOD_EPOCH_UNVERIFIABLE',
+      observed_evidence_sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    })
+    expect(JSON.stringify(failure?.payload)).not.toMatch(/不应持久|response-one|fingerprint-one/u)
     expect(fixture.controller.requests.some(item => item.operation === 'create_method_candidate')).toBe(false)
     const snapshot = await fixture.service.systemSnapshot()
     if (snapshot === null) throw new Error('synthetic Builder failure snapshot missing')
     const candidate = snapshot.methodCandidates[0]
     if (candidate === undefined) throw new Error('synthetic Builder failure candidate missing')
-    expect(candidate).toMatchObject({ status: 'CANDIDATE', resumable: false })
+    expect(candidate).toMatchObject({
+      status: 'CANDIDATE',
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'METHOD_EPOCH_UNVERIFIABLE',
+    })
     const restartedService = fixture.makeService()
     await expect(restartedService.prepareMethodCandidate('app-feedback-synthetic'))
       .rejects.toThrow(/重复付费/u)
     expect(fixture.runtime.handles).toHaveLength(1)
+  })
+
+  it.each([
+    ['returned model mismatch', { returnedModels: ['deepseek-v4-flash'] }],
+    ['multiple fingerprints', { systemFingerprints: ['fingerprint-one', 'fingerprint-two'] }],
+  ] as const)('persists a hash-only generation stop for %s and starts no retry', async (_name, provenance) => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'METHOD_EPOCH_UNVERIFIABLE' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const builder = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: builder.runId, text: '用动作推进。' })
+    fixture.loopback.setProvenanceOverrides(provenance)
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: builder.runId, state: 'completed' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(2))
+    const targeted = fixture.runtime.handles[1]!
+    await fixture.service.acceptRuntimeEvent({
+      type: 'output', runId: targeted.runId, text: '不得写入 failure marker 的 slot 正文',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: targeted.runId, state: 'completed' })
+    await rejected
+
+    const failure = fixture.controller.requests.find(item =>
+      item.operation === 'record_method_generation_failure')
+    expect(failure?.payload).toMatchObject({
+      label: 'targeted_candidate',
+      error_code: 'METHOD_EPOCH_UNVERIFIABLE',
+      failure_kind: 'METHOD_EPOCH_UNVERIFIABLE',
+      observed_evidence_sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    })
+    expect(JSON.stringify(failure?.payload)).not.toMatch(/slot 正文|response-one|fingerprint-one/u)
+    const snapshot = await fixture.service.systemSnapshot()
+    expect(snapshot?.methodCandidates[0]).toMatchObject({
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'METHOD_EPOCH_UNVERIFIABLE',
+    })
+
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(2)
   })
 
   it('blocks a method epoch Profile mismatch before configuring or starting the runtime', async () => {
@@ -565,8 +803,125 @@ describe('StudioService governed alpha loop', () => {
     expect(fixture.runtime.spec).toBeUndefined()
     expect(fixture.timeline).not.toContain('runtime:stop')
     expect(fixture.loopback.lastLease?.revoked).toBe(true)
+    const failure = fixture.controller.requests.find(item =>
+      item.operation === 'record_method_builder_failure')
+    expect(failure?.payload).toMatchObject({
+      error_code: 'METHOD_EPOCH_CHANGED',
+      failure_kind: 'METHOD_EPOCH_CHANGED',
+      expected_epoch_sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      observed_epoch_sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      observed_evidence_sha256: expect.stringMatching(/^[0-9a-f]{64}$/u),
+    })
+    expect(failure?.payload.observed_epoch_sha256).not.toBe(failure?.payload.expected_epoch_sha256)
+    expect(JSON.stringify(failure?.payload)).not.toMatch(/Profile|workspace|instruction|写克制/u)
     expect(fixture.controller.requests.some(item => item.operation === 'create_method_candidate')).toBe(false)
     expect(fixture.controller.requests.some(item => item.operation === 'record_method_generation')).toBe(false)
+    const snapshot = await fixture.service.systemSnapshot()
+    expect(snapshot?.methodCandidates[0]).toMatchObject({
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'METHOD_EPOCH_CHANGED',
+    })
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(0)
+  })
+
+  it('lets shutdown win after Profile digest returns before writing a mismatch marker', async () => {
+    const profileEntered = deferred<void>()
+    const releaseProfile = deferred<string>()
+    const fixture = await readyFixture({
+      profileDigest: async () => {
+        profileEntered.resolve(undefined)
+        return await releaseProfile.promise
+      },
+    })
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'APPLICATION_CLOSED' })
+    await profileEntered.promise
+    let shutdownResolved = false
+    const shuttingDown = fixture.service.shutdown().then(() => { shutdownResolved = true })
+    await Promise.resolve()
+    expect(shutdownResolved).toBe(false)
+    releaseProfile.resolve('b'.repeat(64))
+
+    await rejected
+    await shuttingDown
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_builder_failure'
+      || item.operation === 'record_method_generation_failure')).toBe(false)
+    expect(fixture.runtime.handles).toHaveLength(0)
+    const snapshot = await fixture.service.systemSnapshot()
+    expect(snapshot?.methodCandidates[0]).toMatchObject({
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'BUILDER_RESULT_UNKNOWN',
+    })
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(0)
+  })
+
+  it('keeps a Builder TRANSPORT_CLOSED failure unresolved without rebilling', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'TRANSPORT_CLOSED' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const builder = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error', runId: builder.runId, code: 'TRANSPORT_CLOSED', message: 'transport closed',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: builder.runId, state: 'failed' })
+    await rejected
+
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_builder_failure'
+      || item.operation === 'record_method_generation_failure')).toBe(false)
+    const snapshot = await fixture.service.systemSnapshot()
+    expect(snapshot?.methodCandidates[0]).toMatchObject({
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'BUILDER_RESULT_UNKNOWN',
+    })
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(1)
+  })
+
+  it('keeps a slot TRANSPORT_CLOSED failure unresolved without rebilling', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'TRANSPORT_CLOSED' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const builder = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: builder.runId, text: '用动作推进。' })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: builder.runId, state: 'completed' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(2))
+    const targeted = fixture.runtime.handles[1]!
+    await fixture.service.acceptRuntimeEvent({
+      type: 'error', runId: targeted.runId, code: 'TRANSPORT_CLOSED', message: 'transport closed',
+    })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: targeted.runId, state: 'failed' })
+    await rejected
+
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_builder_failure'
+      || item.operation === 'record_method_generation_failure')).toBe(false)
+    const snapshot = await fixture.service.systemSnapshot()
+    expect(snapshot?.methodCandidates[0]).toMatchObject({
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'GENERATION_RESULT_UNKNOWN',
+    })
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(2)
   })
 
   it('requires explicit and mutually exclusive method adoption projection flags', async () => {
@@ -622,6 +977,40 @@ describe('StudioService governed alpha loop', () => {
     expect(fixture.controller.requests.some(item => item.operation === 'stage_method_comparisons')).toBe(false)
     expect(fixture.runtime.status()).toEqual({ state: 'unconfigured' })
     expect(internalRun.runId).toBe('runtime-one')
+  })
+
+  it('keeps shutdown unresolved when cancel concurrently reports a failed runtime', async () => {
+    let serviceUnderRace: StudioService | undefined
+    const fixture = await readyFixture({
+      runtimeCancel: async runId => {
+        if (serviceUnderRace === undefined) throw new Error('synthetic race service unavailable')
+        await serviceUnderRace.acceptRuntimeEvent({
+          type: 'error', runId, code: 'RUNTIME_FAILED', message: 'failed while shutdown cancellation won',
+        })
+        await serviceUnderRace.acceptRuntimeEvent({ type: 'state', runId, state: 'failed' })
+      },
+    })
+    serviceUnderRace = fixture.service
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'APPLICATION_CLOSED' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    await fixture.service.shutdown()
+    await rejected
+
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_builder_failure'
+      || item.operation === 'record_method_generation_failure')).toBe(false)
+    const snapshot = await fixture.service.systemSnapshot()
+    expect(snapshot?.methodCandidates[0]).toMatchObject({
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationFailureKind: 'BUILDER_RESULT_UNKNOWN',
+    })
+    const restarted = fixture.makeService()
+    await expect(restarted.prepareMethodCandidate('app-feedback-synthetic')).rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(1)
   })
 
   it('does not claim success when gateway provenance is incomplete', async () => {
@@ -1605,6 +1994,7 @@ class FakeController implements ControllerPort {
   failMethodCreateBeforeCommit = false
   failBeginMethodGenerationLabel: string | null = null
   failRecordMethodGenerationLabel: string | null = null
+  loseMethodGenerationResponseLabel: string | null = null
   methodCreateResponseGate: Promise<void> | null = null
   methodGenerationRecordResponseGate: { readonly label: string; readonly promise: Promise<void> } | null = null
   uniqueBeginOpenCount = 0
@@ -1690,6 +2080,7 @@ class FakeController implements ControllerPort {
       preparation_total: 4,
       preparation_resumable: resumable,
       preparation_blocked_reason: null,
+      preparation_failure_kind: null,
       ...value,
     }]
   }
@@ -1810,6 +2201,7 @@ class FakeController implements ControllerPort {
               preparation_total: 4,
               preparation_resumable: false,
               preparation_blocked_reason: 'Candidate Builder 正在调用或已在付费后中断。',
+              preparation_failure_kind: 'BUILDER_RESULT_UNKNOWN',
               comparisons: [],
             }]
           }
@@ -1858,6 +2250,7 @@ class FakeController implements ControllerPort {
           preparation_total: 4,
           preparation_resumable: true,
           preparation_blocked_reason: null,
+          preparation_failure_kind: null,
           comparisons: [],
         }]
         result = {
@@ -1908,6 +2301,7 @@ class FakeController implements ControllerPort {
             ...candidate,
             preparation_resumable: false,
             preparation_blocked_reason: `${label} 正在调用或已在付费后中断。`,
+            preparation_failure_kind: 'GENERATION_RESULT_UNKNOWN',
           }))
         }
         break
@@ -1930,6 +2324,7 @@ class FakeController implements ControllerPort {
           preparation_completed: this.completedMethodGenerations.size,
           preparation_resumable: true,
           preparation_blocked_reason: null,
+          preparation_failure_kind: null,
         }))
         result = {
           candidate_id: payload.candidate_id,
@@ -1941,17 +2336,23 @@ class FakeController implements ControllerPort {
         if (this.methodGenerationRecordResponseGate?.label === String(payload.label)) {
           await this.methodGenerationRecordResponseGate.promise
         }
+        if (this.loseMethodGenerationResponseLabel === String(payload.label)) {
+          this.loseMethodGenerationResponseLabel = null
+          throw new Error('synthetic generation response lost after commit')
+        }
         break
       case 'record_method_generation_failure':
         this.methodCandidates = this.methodCandidates.map(candidate => ({
           ...candidate,
           preparation_resumable: false,
-          preparation_blocked_reason: '模型来源无法形成唯一 epoch；为避免重复付费，只能放弃。',
+          preparation_blocked_reason: syntheticPreparationBlockedReason(String(payload.failure_kind)),
+          preparation_failure_kind: payload.failure_kind,
         }))
         result = {
           candidate_id: payload.candidate_id,
           label: payload.label,
           error_code: payload.error_code,
+          failure_kind: payload.failure_kind,
           failure_marker_sha256: '6'.repeat(64),
         }
         break
@@ -1972,13 +2373,15 @@ class FakeController implements ControllerPort {
           preparation_completed: 0,
           preparation_total: 4,
           preparation_resumable: false,
-          preparation_blocked_reason: '模型来源无法形成唯一 epoch；为避免重复付费，只能放弃。',
+          preparation_blocked_reason: syntheticPreparationBlockedReason(String(payload.failure_kind)),
+          preparation_failure_kind: payload.failure_kind,
           comparisons: [],
         }]
         result = {
           candidate_id: payload.candidate_id,
           observation_id: payload.observation_id,
           error_code: payload.error_code,
+          failure_kind: payload.failure_kind,
           failure_marker_sha256: '3'.repeat(64),
           idempotent: false,
         }
@@ -1998,6 +2401,7 @@ class FakeController implements ControllerPort {
           preparation_total: 4,
           preparation_resumable: false,
           preparation_blocked_reason: null,
+          preparation_failure_kind: null,
           comparisons: [
             { phase: 'targeted', left: '目标 A', right: '目标 B', choice: null },
             { phase: 'regression', left: '回归 A', right: '回归 B', choice: null },
@@ -2037,6 +2441,7 @@ class FakeController implements ControllerPort {
           ready: false,
           preparation_resumable: false,
           preparation_blocked_reason: null,
+          preparation_failure_kind: null,
         }))
         this.methodCandidateId = null
         this.methodCandidateObservationId = null
@@ -2297,6 +2702,22 @@ function syntheticMethodEpoch(profileSha256: string): Record<string, unknown> {
       max_tokens: 32_768,
     },
   }
+}
+
+function syntheticPreparationBlockedReason(failureKind: string): string {
+  if (failureKind === 'RUNTIME_FAILED') {
+    return '候选生成已明确失败；已封存进度仍保留，本次准备只能放弃。'
+  }
+  if (failureKind === 'OUTPUT_TRUNCATED') {
+    return '候选生成达到输出上限；截断内容不会进入比较，本次准备只能放弃。'
+  }
+  if (failureKind === 'EMPTY_OUTPUT') {
+    return '候选生成已结束但没有可比较内容；本次准备只能放弃。'
+  }
+  if (failureKind === 'METHOD_EPOCH_CHANGED') {
+    return '固定生成基线已变化；为避免混用不同基线，本次准备只能放弃。'
+  }
+  return '模型来源无法形成唯一可验基线；为避免重复调用，本次准备只能放弃。'
 }
 
 function sha256CanonicalJson(value: Record<string, unknown>): string {

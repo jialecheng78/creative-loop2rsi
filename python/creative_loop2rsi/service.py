@@ -79,6 +79,26 @@ METHOD_GENERATION_LABELS = (
     "heldout_baseline",
     "heldout_candidate",
 )
+METHOD_DURABLE_FAILURE_KINDS = {
+    "ACCOUNT_BALANCE",
+    "CREDENTIAL_REJECTED",
+    "DEEPSEEK_FIRST_EVENT_TIMEOUT",
+    "DEEPSEEK_STREAM_IDLE_TIMEOUT",
+    "DEEPSEEK_TIMEOUT",
+    "DEEPSEEK_TOTAL_TIMEOUT",
+    "DEEPSEEK_UNAVAILABLE",
+    "EMPTY_OUTPUT",
+    "METHOD_EPOCH_CHANGED",
+    "METHOD_EPOCH_UNVERIFIABLE",
+    "OUTPUT_TRUNCATED",
+    "RATE_LIMITED",
+    "RUNTIME_FAILED",
+}
+METHOD_PUBLIC_FAILURE_KINDS = METHOD_DURABLE_FAILURE_KINDS | {
+    "BUILDER_RESULT_UNKNOWN",
+    "GENERATION_RESULT_UNKNOWN",
+    "PREPARATION_EVIDENCE_INVALID",
+}
 METHOD_REGISTRY_RELATIVE = "creative-system/app-methods/registry.json"
 TERMINATION_OUTCOMES = {"FAILED", "CANCELLED"}
 LEGACY_APP_TERMINATION_REASONS = {
@@ -2430,6 +2450,30 @@ def _method_builder_rejection_path(project: Path, candidate_id: str) -> Path:
     )
 
 
+def _method_preparation_blocked_reason(failure_kind: str) -> str:
+    if failure_kind not in METHOD_PUBLIC_FAILURE_KINDS:
+        raise AppRequestError("候选准备 failure_kind 不在公开白名单")
+    messages = {
+        "ACCOUNT_BALANCE": "DeepSeek 账户余额不足；本次准备已停止，为避免重复调用只能放弃",
+        "BUILDER_RESULT_UNKNOWN": "Candidate Builder 的执行或封存结果无法判定；不会自动重做，本次准备只能放弃",
+        "CREDENTIAL_REJECTED": "DeepSeek 未接受当前连接信息；本次准备已停止，只能放弃",
+        "DEEPSEEK_FIRST_EVENT_TIMEOUT": "DeepSeek 在开始返回前超时；本次准备已停止，为避免重复调用只能放弃",
+        "DEEPSEEK_STREAM_IDLE_TIMEOUT": "DeepSeek 返回中长时间无新进展；本次准备已停止，只能放弃",
+        "DEEPSEEK_TIMEOUT": "DeepSeek 明确返回超时；本次准备已停止，只能放弃",
+        "DEEPSEEK_TOTAL_TIMEOUT": "DeepSeek 生成达到总时限；本次准备已停止，只能放弃",
+        "DEEPSEEK_UNAVAILABLE": "DeepSeek 服务明确返回不可用；本次准备已停止，只能放弃",
+        "EMPTY_OUTPUT": "候选生成已结束但没有可比较内容；本次准备只能放弃",
+        "GENERATION_RESULT_UNKNOWN": "一项候选生成的执行或封存结果无法判定；不会自动重做，本次准备只能放弃",
+        "METHOD_EPOCH_CHANGED": "固定生成基线已变化；为避免混用不同基线，本次准备只能放弃",
+        "METHOD_EPOCH_UNVERIFIABLE": "模型来源无法形成唯一可验基线；为避免重复调用，本次准备只能放弃",
+        "OUTPUT_TRUNCATED": "候选生成达到输出上限；截断内容不会进入比较，本次准备只能放弃",
+        "PREPARATION_EVIDENCE_INVALID": "候选准备证据无法通过完整性校验；不会自动重做，本次准备只能放弃",
+        "RATE_LIMITED": "DeepSeek 明确返回请求过于频繁；本次准备已停止，只能放弃",
+        "RUNTIME_FAILED": "候选生成已明确失败；已封存进度仍保留，本次准备只能放弃",
+    }
+    return messages[failure_kind]
+
+
 def _validated_method_builder_intent(
     core: Any,
     project: Path,
@@ -2510,28 +2554,58 @@ def _validated_method_builder_failure(
         "error_code",
         "expected_context_sha256",
         "expected_epoch_sha256",
+        "failure_kind",
         "id",
         "kind",
         "observed_evidence_sha256",
+        "observed_epoch_sha256",
         "observation_id",
         "schema_version",
         "source_refs",
     }
+    legacy_keys = expected_keys - {"failure_kind", "observed_epoch_sha256"}
+    failure_kind = (
+        failure.get("failure_kind")
+        if isinstance(failure, dict) and "failure_kind" in failure
+        else failure.get("error_code") if isinstance(failure, dict) else None
+    )
+    observed_epoch_sha256 = (
+        failure.get("observed_epoch_sha256")
+        if isinstance(failure, dict) and "observed_epoch_sha256" in failure
+        else (
+            failure.get("observed_evidence_sha256")
+            if isinstance(failure, dict)
+            and failure.get("error_code") == "METHOD_EPOCH_CHANGED"
+            else None
+        )
+    )
     if (
         not isinstance(failure, dict)
-        or set(failure) != expected_keys
+        or set(failure) not in (expected_keys, legacy_keys)
         or failure.get("kind") != "AppMethodBuilderFailure"
         or failure.get("id") != f"builder-failure-{candidate_id}"
         or failure.get("candidate_id") != candidate_id
         or failure.get("observation_id") != intent.get("observation_id")
-        or failure.get("error_code")
-        not in {"METHOD_EPOCH_CHANGED", "METHOD_EPOCH_UNVERIFIABLE"}
+        or failure_kind not in METHOD_DURABLE_FAILURE_KINDS
+        or failure.get("error_code") != failure_kind
         or failure.get("expected_context_sha256")
         != intent.get("builder_context_sha256")
         or failure.get("expected_epoch_sha256")
         != intent.get("expected_epoch_sha256")
         or not re.fullmatch(
             r"[0-9a-f]{64}", str(failure.get("observed_evidence_sha256", ""))
+        )
+        or (
+            failure_kind == "METHOD_EPOCH_CHANGED"
+            and (
+                not isinstance(observed_epoch_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", observed_epoch_sha256)
+                or observed_epoch_sha256 == intent.get("expected_epoch_sha256")
+            )
+        )
+        or (
+            failure_kind != "METHOD_EPOCH_CHANGED"
+            and observed_epoch_sha256 is not None
         )
         or failure.get("source_refs") != []
         or failure.get("content_hash") != core.app_record_content_hash(failure)
@@ -2548,9 +2622,22 @@ def _write_method_builder_failure_marker_locked(
     *,
     error_code: str,
     observed_evidence_sha256: str,
+    observed_epoch_sha256: Optional[str] = None,
 ) -> tuple[bool, Path, Dict[str, Any]]:
-    if error_code not in {"METHOD_EPOCH_CHANGED", "METHOD_EPOCH_UNVERIFIABLE"}:
+    if error_code not in METHOD_DURABLE_FAILURE_KINDS:
         raise AppRequestError("Candidate Builder failure error_code 无效")
+    if (
+        error_code == "METHOD_EPOCH_CHANGED"
+        and (
+            not isinstance(observed_epoch_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", observed_epoch_sha256)
+            or observed_epoch_sha256 == intent.get("expected_epoch_sha256")
+        )
+    ) or (
+        error_code != "METHOD_EPOCH_CHANGED"
+        and observed_epoch_sha256 is not None
+    ):
+        raise AppRequestError("Candidate Builder failure observed epoch 无效")
     existing = _validated_method_builder_failure(
         core, project, candidate_id, intent
     )
@@ -2560,6 +2647,16 @@ def _write_method_builder_failure_marker_locked(
             failure.get("error_code") != error_code
             or failure.get("observed_evidence_sha256")
             != observed_evidence_sha256
+            or (
+                failure.get("observed_epoch_sha256")
+                if "observed_epoch_sha256" in failure
+                else (
+                    failure.get("observed_evidence_sha256")
+                    if failure.get("error_code") == "METHOD_EPOCH_CHANGED"
+                    else None
+                )
+            )
+            != observed_epoch_sha256
         ):
             raise AppRequestError("Candidate Builder 已绑定不同 failure 证据")
         return True, failure_path, failure
@@ -2571,8 +2668,10 @@ def _write_method_builder_failure_marker_locked(
             "candidate_id": candidate_id,
             "observation_id": intent.get("observation_id"),
             "error_code": error_code,
+            "failure_kind": error_code,
             "expected_context_sha256": intent.get("builder_context_sha256"),
             "expected_epoch_sha256": intent.get("expected_epoch_sha256"),
+            "observed_epoch_sha256": observed_epoch_sha256,
             "observed_evidence_sha256": observed_evidence_sha256,
         },
     )
@@ -3342,13 +3441,17 @@ def _method_builder_preparation_public_snapshots(
         if os.path.lexists(str(_candidate_root(project, candidate_id))):
             continue
         rejected = rejection is not None
-        blocked_reason = None if rejected else (
-            "Candidate Builder 的模型基线无法验真；"
-            "未保存指导正文，为避免重复付费，本次准备只能放弃"
-            if failure is not None
-            else
-            "Candidate Builder 可能正在调用或已在封存前中断；"
-            "本记录不会触发重复付费，重启后只能放弃"
+        failure_kind = None
+        if not rejected:
+            failure_kind = (
+                str(failure[1].get("failure_kind", failure[1].get("error_code")))
+                if failure is not None
+                else "BUILDER_RESULT_UNKNOWN"
+            )
+        blocked_reason = (
+            None
+            if failure_kind is None
+            else _method_preparation_blocked_reason(failure_kind)
         )
         snapshots.append(
             {
@@ -3365,6 +3468,7 @@ def _method_builder_preparation_public_snapshots(
                 "preparation_total": len(METHOD_GENERATION_LABELS),
                 "preparation_resumable": False,
                 "preparation_blocked_reason": blocked_reason,
+                "preparation_failure_kind": failure_kind,
                 "comparisons": [],
                 "evaluation_summary": None,
             }
@@ -3411,6 +3515,7 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
             elif rejection is not None:
                 projected_lifecycle = "REJECTED"
             preparation_valid = True
+            preparation_failure_kind: Optional[str] = None
             if status.get("lifecycle") == "CANDIDATE" and rejection is None:
                 preparation_completed = 0
                 try:
@@ -3489,27 +3594,33 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
                         and unresolved_generation is None
                         and status.get("lifecycle") == "CANDIDATE"
                     )
+                    if preparation_failure is not None:
+                        preparation_failure_kind = str(
+                            preparation_failure.get(
+                                "failure_kind",
+                                preparation_failure.get("error_code"),
+                            )
+                        )
+                    elif unresolved_generation is not None:
+                        preparation_failure_kind = "GENERATION_RESULT_UNKNOWN"
                     preparation_blocked_reason = (
                         None
-                        if preparation_failure is None
-                        and unresolved_generation is None
-                        else (
-                            "模型、fingerprint、Profile 或固定参数已变化；"
-                            "为避免重复付费，本次准备只能放弃"
-                            if preparation_failure is not None
-                            else
-                            f"{unresolved_generation} 可能正在调用或已在付费后中断；"
-                            "为避免重复付费，重启后只能放弃"
+                        if preparation_failure_kind is None
+                        else _method_preparation_blocked_reason(
+                            preparation_failure_kind
                         )
                     )
-                except AppRequestError as exc:
+                except AppRequestError:
                     # A frozen candidate may become non-resumable after a method
                     # epoch change or durable-receipt damage.  Keep it visible so
                     # the renderer can offer the immutable rejection path instead
                     # of making the entire system snapshot unavailable.
                     preparation_valid = False
                     preparation_resumable = False
-                    preparation_blocked_reason = str(exc)
+                    preparation_failure_kind = "PREPARATION_EVIDENCE_INVALID"
+                    preparation_blocked_reason = _method_preparation_blocked_reason(
+                        preparation_failure_kind
+                    )
             else:
                 preparation_completed = (
                     len(METHOD_GENERATION_LABELS)
@@ -3519,6 +3630,7 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
                 )
                 preparation_resumable = False
                 preparation_blocked_reason = None
+                preparation_failure_kind = None
             comparisons = []
             comparison_phases = (
                 METHOD_PHASES
@@ -3561,6 +3673,7 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
                     "preparation_total": len(METHOD_GENERATION_LABELS),
                     "preparation_resumable": preparation_resumable,
                     "preparation_blocked_reason": preparation_blocked_reason,
+                    "preparation_failure_kind": preparation_failure_kind,
                     "comparisons": comparisons,
                     "evaluation_summary": projected_summary,
                 }
@@ -5140,7 +5253,9 @@ def _record_method_builder_failure(payload: Mapping[str, Any]) -> Dict[str, Any]
             "candidate_id",
             "error_code",
             "expected_epoch_sha256",
+            "failure_kind",
             "observed_evidence_sha256",
+            "observed_epoch_sha256",
             "observation_id",
             "project",
         },
@@ -5167,12 +5282,36 @@ def _record_method_builder_failure(payload: Mapping[str, Any]) -> Dict[str, Any]
         maximum=64,
     )
     error_code = _text(payload.get("error_code"), "error_code", maximum=80)
-    if error_code != "METHOD_EPOCH_UNVERIFIABLE" or any(
+    failure_kind = _text(
+        payload.get("failure_kind"), "failure_kind", maximum=80
+    )
+    observed_epoch_sha256 = payload.get("observed_epoch_sha256")
+    if observed_epoch_sha256 is not None:
+        observed_epoch_sha256 = _text(
+            observed_epoch_sha256, "observed_epoch_sha256", maximum=64
+        )
+    if (
+        error_code not in METHOD_DURABLE_FAILURE_KINDS
+        or failure_kind != error_code
+        or any(
         re.fullmatch(r"[0-9a-f]{64}", value) is None
         for value in (
             builder_context_sha256,
             expected_epoch_sha256,
             observed_evidence_sha256,
+        )
+        )
+        or (
+            error_code == "METHOD_EPOCH_CHANGED"
+            and (
+                not isinstance(observed_epoch_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", observed_epoch_sha256) is None
+                or observed_epoch_sha256 == expected_epoch_sha256
+            )
+        )
+        or (
+            error_code != "METHOD_EPOCH_CHANGED"
+            and observed_epoch_sha256 is not None
         )
     ):
         raise AppRequestError("Candidate Builder failure 合同无效")
@@ -5205,6 +5344,7 @@ def _record_method_builder_failure(payload: Mapping[str, Any]) -> Dict[str, Any]
                 intent,
                 error_code=error_code,
                 observed_evidence_sha256=observed_evidence_sha256,
+                observed_epoch_sha256=observed_epoch_sha256,
             )
         )
     return {
@@ -5212,6 +5352,7 @@ def _record_method_builder_failure(payload: Mapping[str, Any]) -> Dict[str, Any]
         "candidate_id": candidate_id,
         "observation_id": observation_id,
         "error_code": error_code,
+        "failure_kind": failure.get("failure_kind", failure.get("error_code")),
         "failure_marker_sha256": core.sha256_file(failure_path),
         "idempotent": idempotent,
     }
@@ -5696,6 +5837,7 @@ def _create_method_candidate_locked(
                 builder_intent,
                 error_code="METHOD_EPOCH_CHANGED",
                 observed_evidence_sha256=str(builder_epoch["sha256"]),
+                observed_epoch_sha256=str(builder_epoch["sha256"]),
             )
         raise AppRequestError("Candidate Builder 与三项来源不属于同一模型基线")
     builder_role_id = _id(payload.get("builder_role_id"), "builder_role_id")
@@ -6044,6 +6186,7 @@ def _validated_method_generation_failure(
         "created_at",
         "error_code",
         "expected_epoch_sha256",
+        "failure_kind",
         "id",
         "kind",
         "label",
@@ -6052,6 +6195,7 @@ def _validated_method_generation_failure(
         "schema_version",
         "source_refs",
     }
+    legacy_keys = expected_keys - {"failure_kind"}
     observed_epoch_sha256 = (
         marker.get("observed_epoch_sha256") if isinstance(marker, dict) else None
     )
@@ -6059,16 +6203,22 @@ def _validated_method_generation_failure(
         marker.get("observed_evidence_sha256") if isinstance(marker, dict) else None
     )
     error_code = marker.get("error_code") if isinstance(marker, dict) else None
+    failure_kind = (
+        marker.get("failure_kind")
+        if isinstance(marker, dict) and "failure_kind" in marker
+        else error_code
+    )
     if (
         not isinstance(marker, dict)
-        or set(marker) != expected_keys
+        or set(marker) not in (expected_keys, legacy_keys)
         or label not in METHOD_GENERATION_LABELS
         or path.name != f"{label}.json"
         or marker.get("kind") != "AppMethodGenerationFailure"
         or marker.get("id")
         != f"generation-failure-{proposal.get('id')}-{str(label).replace('_', '-')}"
         or marker.get("candidate_id") != proposal.get("id")
-        or error_code not in {"METHOD_EPOCH_CHANGED", "METHOD_EPOCH_UNVERIFIABLE"}
+        or failure_kind not in METHOD_DURABLE_FAILURE_KINDS
+        or error_code != failure_kind
         or marker.get("context_sha256")
         != _method_generation_expected_context(plan, str(label))
         or marker.get("expected_epoch_sha256")
@@ -6076,7 +6226,7 @@ def _validated_method_generation_failure(
         or not isinstance(observed_evidence_sha256, str)
         or not re.fullmatch(r"[0-9a-f]{64}", observed_evidence_sha256)
         or (
-            error_code == "METHOD_EPOCH_CHANGED"
+            failure_kind == "METHOD_EPOCH_CHANGED"
             and (
                 not isinstance(observed_epoch_sha256, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", observed_epoch_sha256)
@@ -6084,7 +6234,7 @@ def _validated_method_generation_failure(
             )
         )
         or (
-            error_code == "METHOD_EPOCH_UNVERIFIABLE"
+            failure_kind != "METHOD_EPOCH_CHANGED"
             and observed_epoch_sha256 is not None
         )
         or marker.get("source_refs") != []
@@ -6106,6 +6256,22 @@ def _write_method_generation_failure_marker(
     observed_epoch_sha256: Optional[str],
     observed_evidence_sha256: str,
 ) -> Dict[str, Any]:
+    if error_code not in METHOD_DURABLE_FAILURE_KINDS:
+        raise AppRequestError("候选准备 failure_kind 无效")
+    if (
+        error_code == "METHOD_EPOCH_CHANGED"
+        and (
+            not isinstance(observed_epoch_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", observed_epoch_sha256)
+            or observed_epoch_sha256 == proposal.get("source_epoch_sha256")
+        )
+    ) or (
+        error_code != "METHOD_EPOCH_CHANGED"
+        and observed_epoch_sha256 is not None
+    ):
+        raise AppRequestError("候选准备 observed epoch 无效")
+    if not re.fullmatch(r"[0-9a-f]{64}", observed_evidence_sha256):
+        raise AppRequestError("候选准备 observed evidence 无效")
     existing = _validated_method_generation_failure(
         core, project, root, proposal, plan
     )
@@ -6131,6 +6297,7 @@ def _write_method_generation_failure_marker(
             "candidate_id": proposal.get("id"),
             "label": label,
             "error_code": error_code,
+            "failure_kind": error_code,
             "context_sha256": _method_generation_expected_context(plan, label),
             "expected_epoch_sha256": proposal.get("source_epoch_sha256"),
             "observed_epoch_sha256": observed_epoch_sha256,
@@ -6585,8 +6752,10 @@ def _record_method_generation_failure(payload: Mapping[str, Any]) -> Dict[str, A
             "context_sha256",
             "error_code",
             "expected_epoch_sha256",
+            "failure_kind",
             "label",
             "observed_evidence_sha256",
+            "observed_epoch_sha256",
             "project",
         },
     )
@@ -6597,7 +6766,10 @@ def _record_method_generation_failure(payload: Mapping[str, Any]) -> Dict[str, A
     if label not in METHOD_GENERATION_LABELS:
         raise AppRequestError("候选准备 generation label 无效")
     error_code = _text(payload.get("error_code"), "error_code", maximum=80)
-    if error_code != "METHOD_EPOCH_UNVERIFIABLE":
+    failure_kind = _text(
+        payload.get("failure_kind"), "failure_kind", maximum=80
+    )
+    if error_code not in METHOD_DURABLE_FAILURE_KINDS or failure_kind != error_code:
         raise AppRequestError("generation failure error_code 无效")
     context_sha256 = _text(
         payload.get("context_sha256"), "context_sha256", maximum=64
@@ -6612,6 +6784,11 @@ def _record_method_generation_failure(payload: Mapping[str, Any]) -> Dict[str, A
         "observed_evidence_sha256",
         maximum=64,
     )
+    observed_epoch_sha256 = payload.get("observed_epoch_sha256")
+    if observed_epoch_sha256 is not None:
+        observed_epoch_sha256 = _text(
+            observed_epoch_sha256, "observed_epoch_sha256", maximum=64
+        )
     if any(
         re.fullmatch(r"[0-9a-f]{64}", value) is None
         for value in (
@@ -6619,6 +6796,16 @@ def _record_method_generation_failure(payload: Mapping[str, Any]) -> Dict[str, A
             expected_epoch_sha256,
             observed_evidence_sha256,
         )
+    ) or (
+        error_code == "METHOD_EPOCH_CHANGED"
+        and (
+            not isinstance(observed_epoch_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", observed_epoch_sha256) is None
+            or observed_epoch_sha256 == expected_epoch_sha256
+        )
+    ) or (
+        error_code != "METHOD_EPOCH_CHANGED"
+        and observed_epoch_sha256 is not None
     ):
         raise AppRequestError("generation failure SHA256 无效")
     with core.exclusive_controller_lock(project):
@@ -6659,7 +6846,7 @@ def _record_method_generation_failure(payload: Mapping[str, Any]) -> Dict[str, A
             plan,
             label,
             error_code=error_code,
-            observed_epoch_sha256=None,
+            observed_epoch_sha256=observed_epoch_sha256,
             observed_evidence_sha256=observed_evidence_sha256,
         )
     return {
@@ -6667,6 +6854,7 @@ def _record_method_generation_failure(payload: Mapping[str, Any]) -> Dict[str, A
         "candidate_id": candidate_id,
         "label": label,
         "error_code": marker.get("error_code"),
+        "failure_kind": marker.get("failure_kind", marker.get("error_code")),
         "failure_marker_sha256": core.sha256_file(
             _method_generation_failures_root(root) / f"{label}.json"
         ),

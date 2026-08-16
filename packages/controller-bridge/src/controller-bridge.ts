@@ -25,6 +25,21 @@ const MAX_FIXED_ARGUMENT_BYTES = 65_536;
 const ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CREDENTIAL_FIELD = /^(?:api[-_]?key|apikey|authorization|bearer|credentials?|key|password|secret|token)$|(?:[-_]api[-_]key|[-_]access[-_]token)$/i;
 const OPERATIONS = new Set<ControllerOperation>(CONTROLLER_OPERATIONS);
+const METHOD_PREPARATION_FAILURE_KINDS = [
+  "ACCOUNT_BALANCE",
+  "CREDENTIAL_REJECTED",
+  "DEEPSEEK_FIRST_EVENT_TIMEOUT",
+  "DEEPSEEK_STREAM_IDLE_TIMEOUT",
+  "DEEPSEEK_TIMEOUT",
+  "DEEPSEEK_TOTAL_TIMEOUT",
+  "DEEPSEEK_UNAVAILABLE",
+  "EMPTY_OUTPUT",
+  "METHOD_EPOCH_CHANGED",
+  "METHOD_EPOCH_UNVERIFIABLE",
+  "OUTPUT_TRUNCATED",
+  "RATE_LIMITED",
+  "RUNTIME_FAILED",
+] as const;
 const RESPONSE_STATUSES = new Set(["BLOCK", "CANDIDATE", "NEEDS_TASTE", "PASS", "WARN"]);
 
 type UnknownRecord = Record<string, unknown>;
@@ -495,7 +510,9 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
         "label",
         "context_sha256",
         "expected_epoch_sha256",
+        "failure_kind",
         "observed_evidence_sha256",
+        "observed_epoch_sha256",
         "error_code",
       ]);
       projectPath(payload);
@@ -506,7 +523,11 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
         "heldout_baseline",
         "heldout_candidate",
       ]);
-      requiredEnum(payload, "error_code", ["METHOD_EPOCH_UNVERIFIABLE"]);
+      requiredEnum(payload, "error_code", METHOD_PREPARATION_FAILURE_KINDS);
+      requiredEnum(payload, "failure_kind", METHOD_PREPARATION_FAILURE_KINDS);
+      if (payload.error_code !== payload.failure_kind) {
+        requestError("generation failure error_code 与 failure_kind 必须一致");
+      }
       for (const key of [
         "context_sha256",
         "expected_epoch_sha256",
@@ -516,6 +537,14 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
           requestError(`${key} 必须是 SHA256`);
         }
       }
+      if (payload.observed_epoch_sha256 !== undefined
+        && !/^[0-9a-f]{64}$/u.test(requiredText(payload, "observed_epoch_sha256", 64))) {
+        requestError("observed_epoch_sha256 必须是 SHA256");
+      }
+      if ((payload.error_code === "METHOD_EPOCH_CHANGED")
+        !== (payload.observed_epoch_sha256 !== undefined)) {
+        requestError("只有 METHOD_EPOCH_CHANGED 必须提供 observed_epoch_sha256");
+      }
       return;
     case "record_method_builder_failure":
       exactKeys(payload, "payload", [
@@ -524,13 +553,19 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
         "observation_id",
         "builder_context_sha256",
         "expected_epoch_sha256",
+        "failure_kind",
         "observed_evidence_sha256",
+        "observed_epoch_sha256",
         "error_code",
       ]);
       projectPath(payload);
       requiredId(payload, "candidate_id");
       requiredText(payload, "observation_id", 100);
-      requiredEnum(payload, "error_code", ["METHOD_EPOCH_UNVERIFIABLE"]);
+      requiredEnum(payload, "error_code", METHOD_PREPARATION_FAILURE_KINDS);
+      requiredEnum(payload, "failure_kind", METHOD_PREPARATION_FAILURE_KINDS);
+      if (payload.error_code !== payload.failure_kind) {
+        requestError("Builder failure error_code 与 failure_kind 必须一致");
+      }
       for (const key of [
         "builder_context_sha256",
         "expected_epoch_sha256",
@@ -539,6 +574,14 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
         if (!/^[0-9a-f]{64}$/u.test(requiredText(payload, key, 64))) {
           requestError(`${key} 必须是 SHA256`);
         }
+      }
+      if (payload.observed_epoch_sha256 !== undefined
+        && !/^[0-9a-f]{64}$/u.test(requiredText(payload, "observed_epoch_sha256", 64))) {
+        requestError("observed_epoch_sha256 必须是 SHA256");
+      }
+      if ((payload.error_code === "METHOD_EPOCH_CHANGED")
+        !== (payload.observed_epoch_sha256 !== undefined)) {
+        requestError("只有 METHOD_EPOCH_CHANGED 必须提供 observed_epoch_sha256");
       }
       return;
     case "stage_method_comparisons": {
