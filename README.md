@@ -279,6 +279,8 @@ python3 tools/check_dco.py . --range HEAD
 python3 tools/audit_release_archive.py . --treeish HEAD
 ```
 
+Electron 预览包的 deploy 收口、敏感构建元数据审计与 mode-aware manifest 要求见 [预览包发布树合同](docs/product/260816-预览包发布树合同.md)。
+
 `--mode full` 适合提交前查看整个工作目录；`--mode tracked` 以 Git index 取得版本化路径，但读取当前工作树字节，因此只用于本地预检。真正的发布门使用 `audit_release_archive.py`：它从指定 commit 生成 `git archive`，比较 Git tree 与压缩包清单，审计压缩包内的实际字节，并绑定 commit、tree、逐文件哈希和 archive SHA256。可通过 `--denylist /private/path/denylist.txt` 加载不入库的私有敏感词表。
 
 CI 提供五类 required-check 候选：9 格 Python 测试矩阵、`DCO`、`policy`、`gitleaks-history` 和 `archive-audit`。Gitleaks 固定版本、官方规则集和下载 SHA256，不接受仓库内 `.gitleaks.toml`、`.gitleaksignore` 或 `gitleaks:allow` 弱化门禁；它会先用合成泄漏验证扫描器确实失败，再扫描完整 Git 历史。`policy` 使用固定 OpenAI Codex commit 和文件哈希下载官方 `quick_validate.py`，同时校验 Builder Skill 与一次现场生成的领域 Skill。所有 GitHub Action 都固定到完整 commit SHA；工作流只使用 `contents: read`，不使用 `pull_request_target`、仓库密钥或持久化 checkout 凭据。

@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,77 @@ def tracked_sidecar_inputs(root: Path) -> list[str]:
     if not values:
         raise RuntimeError("no tracked controller sidecar inputs")
     return sorted(values)
+
+
+def target_file_mode(path: Path, system: str) -> Optional[str]:
+    """Return the v2 manifest mode for a regular file on the target platform."""
+    if system == "Windows":
+        return None
+    return f"{stat.S_IMODE(path.lstat().st_mode):04o}"
+
+
+def inventory_sidecar_tree(output: Path, system: str) -> Dict[str, Dict[str, object]]:
+    if output.is_symlink() or not output.is_dir():
+        raise RuntimeError("sidecar inventory root must be a regular directory")
+    files: Dict[str, Dict[str, object]] = {
+        ".": {"type": "directory", "mode": target_file_mode(output, system)}
+    }
+    resolved_output = output.resolve(strict=True)
+    for path in sorted(output.rglob("*")):
+        relative = path.relative_to(output).as_posix()
+        if path.is_symlink():
+            target = os.readlink(path)
+            if os.path.isabs(target):
+                raise RuntimeError(
+                    f"sidecar symlink target must be relative: {relative}"
+                )
+            try:
+                path.resolve(strict=True).relative_to(resolved_output)
+            except (FileNotFoundError, ValueError) as error:
+                raise RuntimeError(
+                    f"sidecar symlink escapes or is broken: {relative}"
+                ) from error
+            files[relative] = {
+                "type": "symlink",
+                "target": target,
+                "mode": target_file_mode(path, system),
+            }
+        elif path.is_dir():
+            files[relative] = {
+                "type": "directory",
+                "mode": target_file_mode(path, system),
+            }
+        elif path.is_file():
+            files[relative] = {
+                "type": "file",
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "mode": target_file_mode(path, system),
+            }
+        else:
+            raise RuntimeError(f"unsupported sidecar output entry: {relative}")
+    return files
+
+
+def validate_sidecar_executable(
+    output: Path,
+    system: str,
+    files: Dict[str, Dict[str, object]],
+) -> None:
+    executable_name = f"{SIDECAR_NAME}.exe" if system == "Windows" else SIDECAR_NAME
+    executable = output / executable_name
+    declared = files.get(executable_name)
+    if executable.is_symlink() or not executable.is_file() or declared is None:
+        raise RuntimeError("sidecar executable is missing or is not a regular file")
+    if declared.get("type") != "file":
+        raise RuntimeError("sidecar executable inventory entry is invalid")
+    if system == "Windows":
+        if declared.get("mode") is not None:
+            raise RuntimeError("Windows sidecar executable mode must be null")
+        return
+    mode = declared.get("mode")
+    if mode != "0755":
+        raise RuntimeError("POSIX sidecar executable mode must be 0755")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -174,31 +246,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("PyInstaller did not produce the expected onedir tree", file=sys.stderr)
             return 2
         os.replace(built, output)
-        files: Dict[str, Dict[str, object]] = {}
-        for path in sorted(output.rglob("*")):
-            relative = path.relative_to(output).as_posix()
-            if path.is_symlink():
-                try:
-                    path.resolve(strict=True).relative_to(output)
-                except (FileNotFoundError, ValueError) as error:
-                    raise RuntimeError(
-                        f"sidecar symlink escapes or is broken: {relative}"
-                    ) from error
-                files[relative] = {"type": "symlink", "target": os.readlink(path)}
-            elif path.is_dir():
-                continue
-            elif path.is_file():
-                files[relative] = {
-                    "type": "file",
-                    "bytes": path.stat().st_size,
-                    "sha256": sha256_file(path),
-                }
-            else:
-                raise RuntimeError(f"unsupported sidecar output entry: {relative}")
+        files = inventory_sidecar_tree(output, system)
+        validate_sidecar_executable(output, system, files)
         atomic_write_json(
             manifest_path,
             {
-                "schema_version": "1",
+                "schema_version": "2",
                 "kind": "ControllerSidecarBuildManifest",
                 "platform": {"system": system, "machine": machine},
                 "python": platform.python_version(),

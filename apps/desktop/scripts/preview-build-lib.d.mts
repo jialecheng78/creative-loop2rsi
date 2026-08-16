@@ -3,15 +3,26 @@ export interface PreviewInventoryFile {
   readonly type: 'file'
   readonly bytes: number
   readonly sha256: string
+  readonly mode: string | null
 }
 
 export interface PreviewInventorySymlink {
   readonly path: string
   readonly type: 'symlink'
   readonly target: string
+  readonly mode: string | null
 }
 
-export type PreviewInventoryEntry = PreviewInventoryFile | PreviewInventorySymlink
+export interface PreviewInventoryDirectory {
+  readonly path: string
+  readonly type: 'directory'
+  readonly mode: string | null
+}
+
+export type PreviewInventoryEntry =
+  | PreviewInventoryDirectory
+  | PreviewInventoryFile
+  | PreviewInventorySymlink
 
 export interface PreviewBuildOptions {
   readonly root: string
@@ -31,7 +42,19 @@ export interface PreviewBuildResult {
 
 export function buildPreview(options: PreviewBuildOptions): Promise<PreviewBuildResult>
 export function previewOutputPath(root: string, platform: string, arch: string): string
-export function inventoryTree(root: string): Promise<readonly PreviewInventoryEntry[]>
+export function inventoryTree(
+  root: string,
+  options?: { readonly platform?: NodeJS.Platform },
+): Promise<readonly PreviewInventoryEntry[]>
+export function removePackageManagerMetadata(root: string): Promise<void>
+export function auditPackagedTree(
+  root: string,
+  options?: {
+    readonly platform?: NodeJS.Platform
+    readonly packageStorePaths?: readonly string[]
+  },
+): Promise<readonly PreviewInventoryEntry[]>
+export function assertPreviewEntrypoints(root: string, platform: NodeJS.Platform): Promise<void>
 export function removePnpmWorkspaceSelfReference(root: string): Promise<boolean>
 export function restoreLegacyWorkspaceRuntimeDependencies(deployed: string, workspace: string): Promise<void>
 export function verifyDeployedRuntimeResolution(deployed: string): Promise<void>

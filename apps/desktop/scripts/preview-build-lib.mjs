@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawn } from 'node:child_process'
 
@@ -9,6 +9,49 @@ const EXPECTED_NODE = 'v24.19.0'
 const EXPECTED_PNPM = '11.7.0'
 const PRODUCT_NAME = 'Creative RSI Studio'
 const APP_ID = 'org.creativeloop2rsi.studio'
+const CONTROLLER_SIDECAR_NAME = 'creative-rsi-controller'
+const PACKAGE_MANAGER_METADATA_NAMES = new Set([
+  '.modules.yaml',
+  '.npmrc',
+  '.package-lock.json',
+  '.package-map.json',
+  '.pnp.cjs',
+  '.pnp.data.json',
+  '.pnp.loader.mjs',
+  '.pnpm-debug.log',
+  '.pnpmfile.cjs',
+  '.pnpm-workspace-state-v1.json',
+  '.yarnrc',
+  '.yarnrc.yml',
+  '.yarn-integrity',
+  'npm-debug.log',
+  'npm-shrinkwrap.json',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'pnpm-debug.log',
+  'pnpm-workspace.yaml',
+  'yarn-error.log',
+  'yarn-debug.log',
+  'yarn.lock',
+])
+const PUBLIC_REGISTRY_URLS = new Set([
+  'npm.pkg.github.com',
+  'registry.npmjs.org',
+  'registry.npmmirror.com',
+  'registry.yarnpkg.com',
+].map(host => `https://${host}/`))
+const REGISTRY_ASSIGNMENT = /(?:^|[\s"'[{,])(?:@[^:\s"'=]+:)?(?:registry|registry-url|registryUrl|registries\.default)\s*["']?\s*[:=]\s*["']?([^\s"'`,}\]]+)/gim
+const REGISTRY_INLINE_DEFAULT = /(?:^|[\s"'[{,])registries\s*["']?\s*[:=]\s*\{\s*["']?default["']?\s*[:=]\s*["']?([^\s"'`,}\]]+)/gim
+const GENERIC_POSIX_HOME_PATH = /(?:\/(?:Users|home)\/[^/\u0000\s"'<>:]+|\/root(?:\/[^/\u0000\s"'<>:]+)?)(?:\/|(?=$|[\s"'<>:,}\]]))/
+const GENERIC_WINDOWS_HOME_PATH = /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]+Users[\\/]+[^\\/\u0000\s"'<>:]+(?:[\\/]+|(?=$|[\s"'<>:,}\]]))/i
+const POSIX_PACKAGE_STORE_PATH = /\/(?:[^/\u0000\s"'<>:]+\/)*(?:\.pnpm-store|pnpm\/store|npm-cache|npm\/cache|yarn-cache|yarn\/cache)\//i
+const WINDOWS_PACKAGE_STORE_PATH = /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]+(?:[^\\/\u0000\s"'<>:]+[\\/]+)*(?:\.pnpm-store|pnpm[\\/]+store|npm-cache|npm[\\/]+cache|yarn-cache|yarn[\\/]+cache)[\\/]+/i
+const TEXT_EXTENSIONS = new Set([
+  '.bat', '.cfg', '.cjs', '.cmd', '.conf', '.css', '.html', '.ini', '.js', '.json', '.lock',
+  '.md', '.mjs', '.plist', '.properties', '.ps1', '.py', '.sh', '.toml', '.ts', '.tsx', '.txt', '.xml',
+  '.yaml', '.yml',
+])
+const TEXT_BASENAMES = new Set(['license', 'notice', 'readme'])
 
 export async function buildPreview(options) {
   const root = resolve(options.root)
@@ -29,6 +72,8 @@ export async function buildPreview(options) {
   if (observedPnpm !== EXPECTED_PNPM) {
     throw new Error(`preview build requires pnpm ${EXPECTED_PNPM}; observed ${observedPnpm}`)
   }
+  const packageStorePath = (await run(process.execPath, [pnpmCli, 'store', 'path'], { cwd: root })).stdout.trim()
+  if (!isAbsolute(packageStorePath)) throw new Error('pnpm store path must be absolute')
 
   const source = await sourceIdentity(root, { observedPnpm })
   const sidecarDirectory = resolve(options.sidecarDirectory ?? defaultSidecar(root, platform, arch))
@@ -91,21 +136,23 @@ export async function buildPreview(options) {
       deployed,
     ], { cwd: workspace, timeoutMs: 300_000, env: { ...process.env, CI: 'true' } })
     await restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace)
+    await reduceDeployedApp(deployed)
+    await auditPackagedTree(deployed, { platform, packageStorePaths: [packageStorePath] })
     await verifyDeployedRuntimeResolution(deployed)
     await probeDeployedRuntime(deployed)
-    await reduceDeployedApp(deployed)
 
     const electronDist = join(electronPackage, 'dist')
     await assertRegularDirectory(electronDist, 'Electron distribution')
     const bundle = platform === 'darwin'
       ? await stageMacBundle(electronDist, stagingRoot, deployed, sidecarDirectory, source, root)
       : await stageWindowsBundle(electronDist, stagingRoot, deployed, sidecarDirectory, source, root)
-    const inventory = await inventoryTree(bundle)
+    const inventory = await auditPackagedTree(bundle, { platform, packageStorePaths: [packageStorePath] })
+    await assertPreviewEntrypoints(bundle, platform)
     const treeSha256 = sha256(Buffer.from(JSON.stringify(inventory), 'utf8'))
     await rename(bundle, outputRoot)
     const manifestPath = `${outputRoot}.manifest.json`
     await writeJson(manifestPath, {
-      schema_version: '1',
+      schema_version: '2',
       kind: 'StudioPreviewBuildManifest',
       product: PRODUCT_NAME,
       app_id: APP_ID,
@@ -131,11 +178,13 @@ export function previewOutputPath(root, platform, arch) {
   return join(resolve(root), 'dist', 'studio-preview', `${platform}-${arch}`, target)
 }
 
-export async function inventoryTree(root) {
+export async function inventoryTree(root, options = {}) {
   const resolvedRoot = resolve(root)
+  const realRoot = await realpath(resolvedRoot)
+  const platform = options.platform ?? process.platform
   const rootInfo = await lstat(resolvedRoot)
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error('inventory root must be a regular directory')
-  const result = []
+  const result = [{ path: '.', type: 'directory', mode: targetMode(rootInfo.mode, platform) }]
   async function visit(directory) {
     for (const name of (await readdir(directory)).sort()) {
       const path = join(directory, name)
@@ -143,20 +192,33 @@ export async function inventoryTree(root) {
       const relativePath = relative(resolvedRoot, path).split(sep).join('/')
       if (info.isSymbolicLink()) {
         const target = await readlink(path)
-        const resolvedTarget = resolve(dirname(path), target)
-        if (!inside(resolvedRoot, resolvedTarget)) throw new Error(`symlink escapes preview root: ${relativePath}`)
-        result.push({ path: relativePath, type: 'symlink', target })
+        if (isAbsolute(target)) throw new Error(`symlink target must be relative: ${relativePath}`)
+        let resolvedTarget
+        try {
+          resolvedTarget = await realpath(path)
+        } catch {
+          throw new Error(`symlink is broken: ${relativePath}`)
+        }
+        if (!inside(realRoot, resolvedTarget)) throw new Error(`symlink escapes preview root: ${relativePath}`)
+        result.push({ path: relativePath, type: 'symlink', target, mode: targetMode(info.mode, platform) })
       } else if (info.isDirectory()) {
+        result.push({ path: relativePath, type: 'directory', mode: targetMode(info.mode, platform) })
         await visit(path)
       } else if (info.isFile()) {
-        result.push({ path: relativePath, type: 'file', bytes: info.size, sha256: sha256(await readFile(path)) })
+        result.push({
+          path: relativePath,
+          type: 'file',
+          bytes: info.size,
+          sha256: sha256(await readFile(path)),
+          mode: targetMode(info.mode, platform),
+        })
       } else {
         throw new Error(`unsupported preview entry: ${relativePath}`)
       }
     }
   }
   await visit(resolvedRoot)
-  return result
+  return result.sort((left, right) => left.path === right.path ? 0 : left.path < right.path ? -1 : 1)
 }
 
 export async function validateSidecarEvidence(directory, evidence, options) {
@@ -164,12 +226,14 @@ export async function validateSidecarEvidence(directory, evidence, options) {
     ? { system: 'Darwin', machine: 'arm64' }
     : { system: 'Windows', machine: 'AMD64' }
   const acceptedMachines = options.platform === 'darwin' ? ['arm64'] : ['AMD64', 'x86_64']
-  if (evidence?.kind !== 'ControllerSidecarBuildManifest'
+  if (evidence?.schema_version !== '2'
+    || evidence?.kind !== 'ControllerSidecarBuildManifest'
     || evidence?.platform?.system !== expectedPlatform.system
     || !acceptedMachines.includes(evidence?.platform?.machine)
     || typeof evidence?.python !== 'string'
     || !evidence.python.startsWith('3.11.')
     || evidence?.pyinstaller !== '6.22.0'
+    || evidence?.sidecar_name !== CONTROLLER_SIDECAR_NAME
     || evidence?.source?.git_commit !== options.source.git_commit
     || evidence?.source?.git_tree !== options.source.git_tree) {
     throw new Error('controller sidecar source or platform identity is invalid')
@@ -195,17 +259,131 @@ export async function validateSidecarEvidence(directory, evidence, options) {
       throw new Error(`controller sidecar source hash differs: ${relativePath}`)
     }
   }
-  const actual = await inventoryTree(directory)
+  const actual = await inventoryTree(directory, { platform: options.platform })
   const declaredFiles = evidence.files
   if (declaredFiles === null || typeof declaredFiles !== 'object' || Array.isArray(declaredFiles)) {
     throw new Error('controller sidecar file inventory is invalid')
   }
-  const declared = Object.entries(declaredFiles).map(([path, value]) => value?.type === 'file'
-    ? { path, type: 'file', bytes: value.bytes, sha256: value.sha256 }
-    : { path, type: 'symlink', target: value?.target })
-    .sort((left, right) => left.path === right.path ? 0 : left.path < right.path ? -1 : 1)
+  const declared = Object.entries(declaredFiles).map(([path, value]) => {
+    if (value?.type === 'file') {
+      const validMode = options.platform === 'win32'
+        ? value.mode === null
+        : typeof value.mode === 'string' && /^[0-7]{4}$/.test(value.mode)
+      if (Object.keys(value).sort().join(',') !== 'bytes,mode,sha256,type'
+        || !Number.isSafeInteger(value.bytes)
+        || value.bytes < 0
+        || typeof value.sha256 !== 'string'
+        || !/^[0-9a-f]{64}$/.test(value.sha256)
+        || !validMode) {
+        throw new Error(`controller sidecar file declaration is invalid: ${path}`)
+      }
+      return { path, type: 'file', bytes: value.bytes, sha256: value.sha256, mode: value.mode }
+    }
+    if (value?.type === 'directory') {
+      const validMode = options.platform === 'win32'
+        ? value.mode === null
+        : typeof value.mode === 'string' && /^[0-7]{4}$/.test(value.mode)
+      if (Object.keys(value).sort().join(',') !== 'mode,type' || !validMode) {
+        throw new Error(`controller sidecar file declaration is invalid: ${path}`)
+      }
+      return { path, type: 'directory', mode: value.mode }
+    }
+    const validMode = options.platform === 'win32'
+      ? value?.mode === null
+      : typeof value?.mode === 'string' && /^[0-7]{4}$/.test(value.mode)
+    if (value?.type !== 'symlink'
+      || Object.keys(value).sort().join(',') !== 'mode,target,type'
+      || typeof value.target !== 'string'
+      || !validMode) {
+      throw new Error(`controller sidecar file declaration is invalid: ${path}`)
+    }
+    return { path, type: 'symlink', target: value.target, mode: value.mode }
+  }).sort((left, right) => left.path === right.path ? 0 : left.path < right.path ? -1 : 1)
+  const executableName = options.platform === 'win32'
+    ? `${CONTROLLER_SIDECAR_NAME}.exe`
+    : CONTROLLER_SIDECAR_NAME
+  const executable = declared.find(entry => entry.path === executableName)
+  if (executable?.type !== 'file'
+    || (options.platform !== 'win32' && executable.mode !== '0755')) {
+    throw new Error('controller sidecar executable declaration is invalid')
+  }
   if (JSON.stringify(declared) !== JSON.stringify(actual)) {
-    throw new Error('controller sidecar bytes differ from its manifest')
+    throw new Error('controller sidecar bytes or modes differ from its manifest')
+  }
+}
+
+export async function removePackageManagerMetadata(root) {
+  const resolvedRoot = resolve(root)
+  const rootInfo = await lstat(resolvedRoot)
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    throw new Error('packaged tree root must be a regular directory')
+  }
+  async function visit(directory) {
+    for (const name of (await readdir(directory)).sort()) {
+      const path = join(directory, name)
+      const info = await lstat(path)
+      const relativePath = relative(resolvedRoot, path).split(sep).join('/')
+      if (isPackageManagerMetadata(relativePath)) {
+        await rm(path, { force: true, recursive: info.isDirectory() && !info.isSymbolicLink() })
+      } else if (info.isDirectory() && !info.isSymbolicLink()) {
+        await visit(path)
+      }
+    }
+  }
+  await visit(resolvedRoot)
+}
+
+export async function auditPackagedTree(root, options = {}) {
+  const inventory = await inventoryTree(root, options)
+  const rawLocalPathNeedles = [
+    ...buildHomeNeedles(homedir()),
+    ...buildAbsolutePathNeedles(options.packageStorePaths ?? []),
+  ]
+  for (const entry of inventory) {
+    if (isPackageManagerMetadata(entry.path)) {
+      throw new Error(`packaged tree contains forbidden package-manager metadata: ${entry.path}`)
+    }
+    if (entry.type !== 'file') continue
+    const bytes = await readFile(join(resolve(root), ...entry.path.split('/')))
+    if (rawLocalPathNeedles.some(needle => bytes.includes(needle))) {
+      throw new Error(`packaged tree contains a local build path: ${entry.path}`)
+    }
+    const text = decodeStrictText(entry.path, bytes)
+    if (text === null) continue
+    if (GENERIC_POSIX_HOME_PATH.test(text) || GENERIC_WINDOWS_HOME_PATH.test(text)) {
+      throw new Error(`packaged tree contains a generic user home path: ${entry.path}`)
+    }
+    if (POSIX_PACKAGE_STORE_PATH.test(text) || WINDOWS_PACKAGE_STORE_PATH.test(text)) {
+      throw new Error(`packaged tree contains an absolute package-store path: ${entry.path}`)
+    }
+    for (const registry of registryAssignments(text)) {
+      if (!PUBLIC_REGISTRY_URLS.has(registry)) {
+        throw new Error(`packaged tree contains unapproved registry metadata: ${entry.path}`)
+      }
+    }
+  }
+  return inventory
+}
+
+export async function assertPreviewEntrypoints(root, platform) {
+  const relativePaths = platform === 'darwin'
+    ? [
+        join('Contents', 'MacOS', PRODUCT_NAME),
+        join('Contents', 'Resources', 'controller', CONTROLLER_SIDECAR_NAME),
+      ]
+    : [
+        `${PRODUCT_NAME}.exe`,
+        join('resources', 'controller', `${CONTROLLER_SIDECAR_NAME}.exe`),
+      ]
+  for (const relativePath of relativePaths) {
+    const path = join(resolve(root), relativePath)
+    const info = await lstat(path)
+    if (!info.isFile() || info.isSymbolicLink()) {
+      throw new Error(`preview executable must be a regular file: ${relativePath}`)
+    }
+    if (platform === 'darwin' && posixMode(info.mode) !== '0755') {
+      throw new Error(`preview executable mode must be 0755: ${relativePath}`)
+    }
   }
 }
 
@@ -264,6 +442,7 @@ async function reduceDeployedApp(directory) {
     }
   }
   await removeBuildMetadata(join(directory, 'dist'))
+  await removePackageManagerMetadata(directory)
   const raw = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
   await writeJson(join(directory, 'package.json'), {
     name: raw.name,
@@ -637,6 +816,130 @@ async function writeJson(path, value) {
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function posixMode(mode) {
+  return (mode & 0o7777).toString(8).padStart(4, '0')
+}
+
+function targetMode(mode, platform) {
+  return platform === 'win32' ? null : posixMode(mode)
+}
+
+function isPackageManagerMetadata(relativePath) {
+  const segments = relativePath.split('/')
+  const name = segments.at(-1)
+  return PACKAGE_MANAGER_METADATA_NAMES.has(name)
+    || /^\.pnpm-(?:workspace-)?(?:install-)?state(?:-v\d+)?\.json$/i.test(name)
+    || /^(?:npm|pnpm|yarn)(?:-[\w.-]+)?-(?:debug|error)\.log(?:\.\d+)?$/i.test(name)
+    || (name === 'lock.yaml' && segments.includes('.pnpm'))
+}
+
+function buildHomeNeedles(home) {
+  if (!isAbsolute(home)) return []
+  const normalized = home.replace(/[\\/]+$/, '')
+  const slash = normalized.replace(/\\/g, '/')
+  const backslash = normalized.replace(/\//g, '\\')
+  return [...new Set([
+    `${slash}/`,
+    slash,
+    `${backslash}\\`,
+    backslash,
+    `${backslash.replace(/\\/g, '\\\\')}\\\\`,
+    backslash.replace(/\\/g, '\\\\'),
+  ])].filter(value => value.length > 1).map(value => Buffer.from(value, 'utf8'))
+}
+
+function buildAbsolutePathNeedles(paths) {
+  const values = []
+  for (const path of paths) {
+    if (typeof path !== 'string' || !isAbsolute(path)) continue
+    const normalized = path.replace(/[\\/]+$/, '')
+    const slash = normalized.replace(/\\/g, '/')
+    const backslash = normalized.replace(/\//g, '\\')
+    values.push(`${slash}/`, slash, `${backslash}\\`, backslash)
+    values.push(`${backslash.replace(/\\/g, '\\\\')}\\\\`, backslash.replace(/\\/g, '\\\\'))
+  }
+  return [...new Set(values)].filter(value => value.length > 1).map(value => Buffer.from(value, 'utf8'))
+}
+
+function decodeStrictText(relativePath, bytes) {
+  const name = basename(relativePath).toLowerCase()
+  const extension = name.includes('.') ? name.slice(name.lastIndexOf('.')) : ''
+  if (!TEXT_EXTENSIONS.has(extension) && !TEXT_BASENAMES.has(name)) return null
+  if (bytes.includes(0)) return null
+  let text
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    return null
+  }
+  return /[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? null : text
+}
+
+function registryAssignments(text) {
+  const normalized = text.replaceAll('\\/', '/').replace(/\\u002f/gi, '/')
+  const values = []
+  for (const match of normalized.matchAll(REGISTRY_ASSIGNMENT)) values.push(match[1])
+  for (const match of normalized.matchAll(REGISTRY_INLINE_DEFAULT)) values.push(match[1])
+
+  try {
+    collectJsonRegistryAssignments(JSON.parse(normalized), values)
+  } catch {
+    // Non-JSON text is handled by direct assignments and the indentation-aware block below.
+  }
+
+  let registriesIndent = null
+  let registriesSection = false
+  for (const line of normalized.split(/\r?\n/)) {
+    if (/^\s*$/.test(line)) continue
+    const indent = line.match(/^\s*/)[0].length
+    if (/^\s*\[registries\]\s*$/.test(line)) {
+      registriesSection = true
+      registriesIndent = null
+      continue
+    }
+    if (registriesSection && /^\s*\[[^\]]+\]\s*$/.test(line)) {
+      registriesSection = false
+      continue
+    }
+    if (/^\s*["']?registries["']?\s*:\s*(?:\{\s*)?$/.test(line)) {
+      registriesIndent = indent
+      registriesSection = false
+      continue
+    }
+    if (registriesSection) {
+      const match = line.match(/^\s*default\s*=\s*["']?([^\s"'`,}\]]+)/)
+      if (match !== null) values.push(match[1])
+      continue
+    }
+    if (registriesIndent === null) continue
+    if (indent <= registriesIndent) {
+      registriesIndent = null
+      continue
+    }
+    const match = line.match(/^\s*["']?default["']?\s*:\s*["']?([^\s"'`,}\]]+)/)
+    if (match !== null) values.push(match[1])
+  }
+  return values
+}
+
+function collectJsonRegistryAssignments(value, values) {
+  if (value === null || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    for (const item of value) collectJsonRegistryAssignments(item, values)
+    return
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase()
+    if (['registry', 'registry-url', 'registryurl'].includes(normalizedKey)) {
+      values.push(typeof nested === 'string' ? nested : '')
+    } else if (normalizedKey === 'registries' && nested !== null && typeof nested === 'object') {
+      const defaultValue = nested.default
+      if (defaultValue !== undefined) values.push(typeof defaultValue === 'string' ? defaultValue : '')
+    }
+    collectJsonRegistryAssignments(nested, values)
+  }
 }
 
 async function run(command, args, options = {}) {

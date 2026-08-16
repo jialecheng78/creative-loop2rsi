@@ -1,15 +1,18 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { chmod, lstat, mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  auditPackagedTree,
+  assertPreviewEntrypoints,
   inventoryTree,
   previewOutputPath,
+  removePackageManagerMetadata,
   removePnpmWorkspaceSelfReference,
   restoreLegacyWorkspaceRuntimeDependencies,
   validateSidecarEvidence,
@@ -40,9 +43,222 @@ describe('preview build inventory', () => {
     await symlink('real/file.txt', join(root, 'link.txt'))
     const result = await inventoryTree(root)
     expect(result).toEqual([
-      { path: 'link.txt', type: 'symlink', target: 'real/file.txt' },
-      expect.objectContaining({ path: 'real/file.txt', type: 'file', bytes: 5 }),
+      expect.objectContaining({ path: '.', type: 'directory', mode: expect.stringMatching(/^[0-7]{4}$/) }),
+      expect.objectContaining({
+        path: 'link.txt', type: 'symlink', target: 'real/file.txt', mode: expect.stringMatching(/^[0-7]{4}$/),
+      }),
+      expect.objectContaining({ path: 'real', type: 'directory', mode: expect.stringMatching(/^[0-7]{4}$/) }),
+      expect.objectContaining({
+        path: 'real/file.txt', type: 'file', bytes: 5, mode: expect.stringMatching(/^[0-7]{4}$/),
+      }),
     ])
+    await expect(inventoryTree(root, { platform: 'win32' })).resolves.toEqual([
+      { path: '.', type: 'directory', mode: null },
+      { path: 'link.txt', type: 'symlink', target: 'real/file.txt', mode: null },
+      { path: 'real', type: 'directory', mode: null },
+      expect.objectContaining({ path: 'real/file.txt', type: 'file', bytes: 5, mode: null }),
+    ])
+  })
+
+  it.runIf(process.platform !== 'win32')('changes the tree identity when root, directory, or file mode changes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-mode-tree-'))
+    temporary.push(root)
+    const directory = join(root, 'payload')
+    const file = join(directory, 'runtime.js')
+    await mkdir(directory)
+    await writeFile(file, 'export {}\n')
+    const identity = async () => sha256(Buffer.from(JSON.stringify(
+      await inventoryTree(root, { platform: 'darwin' }),
+    )))
+
+    const initial = await identity()
+    await chmod(root, 0o750)
+    const rootChanged = await identity()
+    expect(rootChanged).not.toBe(initial)
+    await chmod(directory, 0o700)
+    const directoryChanged = await identity()
+    expect(directoryChanged).not.toBe(rootChanged)
+    await chmod(file, 0o600)
+    await expect(identity()).resolves.not.toBe(directoryChanged)
+  })
+
+  it('removes package-manager state and fails closed if any survives', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-package-metadata-'))
+    temporary.push(root)
+    const modules = join(root, 'node_modules', '.modules.yaml')
+    const lock = join(root, 'node_modules', '.pnpm', 'lock.yaml')
+    const workspaceState = join(root, 'node_modules', '.pnpm-workspace-state-v1.json')
+    const packageMap = join(root, 'node_modules', '.package-map.json')
+    const extraMetadata = [
+      'pnpm-debug.log', 'yarn-debug.log', '.yarn-integrity', '.pnp.cjs',
+      '.pnp.loader.mjs', '.pnp.data.json', 'pnpm-synthetic-debug.log',
+    ].map(name => join(root, 'node_modules', name))
+    await mkdir(dirname(lock), { recursive: true })
+    await writeFile(modules, 'storeDir: /synthetic/package-store\n')
+    await writeFile(lock, 'lockfileVersion: 9\n')
+    await writeFile(workspaceState, '{}\n')
+    await writeFile(packageMap, '{}\n')
+    await Promise.all(extraMetadata.map(path => writeFile(path, 'synthetic metadata\n')))
+    await writeFile(join(root, 'runtime.js'), 'export const ready = true\n')
+
+    await expect(auditPackagedTree(root)).rejects.toThrow('package-manager metadata')
+    await expect(removePackageManagerMetadata(root)).resolves.toBeUndefined()
+    await expect(readFile(modules)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(lock)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(workspaceState)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(packageMap)).rejects.toMatchObject({ code: 'ENOENT' })
+    for (const path of extraMetadata) {
+      await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+    const inventory = await auditPackagedTree(root)
+    expect(inventory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: '.', type: 'directory' }),
+      expect.objectContaining({ path: 'runtime.js', type: 'file' }),
+    ]))
+    expect(inventory.some(entry => entry.path.endsWith('lock.yaml') || entry.path.endsWith('.modules.yaml')))
+      .toBe(false)
+  })
+
+  it('rejects local build-home paths and unapproved registry configuration', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-private-provenance-'))
+    temporary.push(root)
+    const metadata = join(root, 'runtime-config.json')
+    await writeFile(metadata, JSON.stringify({ cache: join(homedir(), 'synthetic-cache') }))
+    await expect(auditPackagedTree(root)).rejects.toThrow('local build path')
+
+    await writeFile(metadata, homedir())
+    await expect(auditPackagedTree(root)).rejects.toThrow('local build path')
+
+    await writeFile(metadata, JSON.stringify({ registry: 'https://packages.example.invalid/' }))
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    await writeFile(metadata, JSON.stringify({ registry: 'https://registry.npmjs.org/' }))
+    await expect(auditPackagedTree(root)).resolves.toHaveLength(2)
+  })
+
+  it('rejects nested, escaped, or non-canonical registry metadata', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-registry-policy-'))
+    temporary.push(root)
+    const metadata = join(root, 'runtime-config.json')
+    await writeFile(metadata, 'registries:\n  default: http://registry.npmjs.org/\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    await writeFile(metadata, '{"registry":"https:\\/\\/packages.example.invalid\\/"}\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    await writeFile(metadata, '{"registry":"https:\\u002f\\u002fpackages.example.invalid\\u002f"}\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    await writeFile(metadata, 'registry=ssh://packages.example.invalid/repository\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    await writeFile(metadata, 'registry=packages.example.invalid\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    await writeFile(metadata, `registries:\n  note: ${'x'.repeat(400)}\n  default: http://registry.npmjs.org/\n`)
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    await writeFile(metadata, 'registries: { default: http://registry.npmjs.org/ }\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+
+    const tomlMetadata = join(root, 'runtime-config.toml')
+    await writeFile(metadata, '{}\n')
+    await writeFile(tomlMetadata, '[registries]\ndefault = "http://registry.npmjs.org/"\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+    await (await import('node:fs/promises')).rm(tomlMetadata)
+
+    for (const registry of [
+      'https://registry.npmjs.org/?token=synthetic',
+      'https://registry.npmjs.org/#synthetic',
+      'https://synthetic-user@registry.npmjs.org/',
+      'https://registry.npmjs.org/private',
+    ]) {
+      await writeFile(metadata, JSON.stringify({ registry }))
+      await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+    }
+
+    await writeFile(metadata, '{}\n')
+    for (const extension of ['py', 'sh', 'ps1', 'bat', 'cmd']) {
+      const scriptMetadata = join(root, `runtime_config.${extension}`)
+      await writeFile(scriptMetadata, 'registry = "https://packages.example.invalid/"\n')
+      await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+      await (await import('node:fs/promises')).rm(scriptMetadata)
+    }
+  })
+
+  it('rejects generic cross-platform home and package-store paths without a known username', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-generic-paths-'))
+    temporary.push(root)
+    const metadata = join(root, 'runtime-config.txt')
+    const macHome = ['', 'Users', 'synthetic-person', 'cache'].join('/')
+    await writeFile(metadata, `cache=${macHome}/artifact\n`)
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+
+    const windowsHome = ['Q:', 'Users', 'synthetic-person', 'cache'].join('\\')
+    await writeFile(metadata, `cache=${windowsHome}\\artifact\n`)
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+
+    const packageStore = ['', 'var', 'cache', 'pnpm', 'store', 'v11'].join('/')
+    await writeFile(metadata, `storeDir=${packageStore}/files\n`)
+    await expect(auditPackagedTree(root)).rejects.toThrow('absolute package-store path')
+
+    const rootHome = ['', 'root', 'synthetic-person', 'cache'].join('/')
+    await writeFile(metadata, `cache=${rootHome}/artifact\n`)
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+
+    const macHomeWithoutSlash = ['', 'Users', 'synthetic-person'].join('/')
+    await writeFile(metadata, `cache=${macHomeWithoutSlash}\n`)
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+
+    const windowsHomeWithoutSlash = ['Q:', 'Users', 'synthetic-person'].join('\\')
+    await writeFile(metadata, `cache=${windowsHomeWithoutSlash}\n`)
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+
+    await writeFile(metadata, 'cache=/' + 'root\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('generic user home path')
+  })
+
+  it('allows generic vendor paths in binaries but rejects exact build paths in raw bytes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-binary-paths-'))
+    temporary.push(root)
+    const binary = join(root, 'vendor-runtime.bin')
+    const genericVendorHome = ['', 'Users', 'upstream-builder', 'symbols'].join('/')
+    await writeFile(binary, Buffer.concat([
+      Buffer.from([0, 255, 0]),
+      Buffer.from(`${genericVendorHome}/runtime`, 'utf8'),
+    ]))
+    await expect(auditPackagedTree(root)).resolves.toHaveLength(2)
+
+    await writeFile(binary, Buffer.concat([
+      Buffer.from([0, 255, 0]),
+      Buffer.from(join(homedir(), 'private-cache'), 'utf8'),
+    ]))
+    await expect(auditPackagedTree(root)).rejects.toThrow('local build path')
+
+    const syntheticStore = join(root, 'synthetic-package-store')
+    await writeFile(binary, Buffer.concat([
+      Buffer.from([0, 255, 0]),
+      Buffer.from(syntheticStore, 'utf8'),
+    ]))
+    await expect(auditPackagedTree(root, { packageStorePaths: [syntheticStore] }))
+      .rejects.toThrow('local build path')
+  })
+
+  it.runIf(process.platform !== 'win32')('requires 0755 macOS application and controller entrypoints', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-entrypoints-'))
+    temporary.push(root)
+    const application = join(root, 'Contents', 'MacOS', 'Creative RSI Studio')
+    const controller = join(root, 'Contents', 'Resources', 'controller', 'creative-rsi-controller')
+    await mkdir(dirname(application), { recursive: true })
+    await mkdir(dirname(controller), { recursive: true })
+    await writeFile(application, 'application')
+    await writeFile(controller, 'controller')
+    await chmod(application, 0o755)
+    await chmod(controller, 0o755)
+    await expect(assertPreviewEntrypoints(root, 'darwin')).resolves.toBeUndefined()
+
+    await chmod(controller, 0o750)
+    await expect(assertPreviewEntrypoints(root, 'darwin')).rejects.toThrow('mode must be 0755')
   })
 
   it('rejects a symlinked tree root', async () => {
@@ -54,10 +270,28 @@ describe('preview build inventory', () => {
   })
 
   it('rejects symlinks that escape the bundle', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'preview-escape-'))
-    temporary.push(root)
+    const parent = await mkdtemp(join(tmpdir(), 'preview-escape-'))
+    temporary.push(parent)
+    const root = join(parent, 'root')
+    await mkdir(root)
+    await writeFile(join(parent, 'outside'), 'outside')
     await symlink('../outside', join(root, 'escape'))
     await expect(inventoryTree(root)).rejects.toThrow('escapes preview root')
+  })
+
+  it('rejects broken symlinks and absolute raw targets even when they point inside', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-strict-links-'))
+    temporary.push(root)
+    await symlink('missing-target', join(root, 'broken'))
+    await expect(inventoryTree(root)).rejects.toThrow('broken')
+    await (await import('node:fs/promises')).rm(join(root, 'broken'))
+
+    if (process.platform !== 'win32') {
+      const inside = join(root, 'inside.txt')
+      await writeFile(inside, 'inside')
+      await symlink(inside, join(root, 'absolute-inside'))
+      await expect(inventoryTree(root)).rejects.toThrow('must be relative')
+    }
   })
 
   it('removes only the validated pnpm workspace self-reference', async () => {
@@ -231,8 +465,12 @@ describe('preview build inventory', () => {
   it('binds sidecar bytes and all tracked controller inputs to the source identity', async () => {
     const sidecar = await mkdtemp(join(tmpdir(), 'preview-sidecar-'))
     temporary.push(sidecar)
-    const executable = join(sidecar, 'Python')
+    const executableName = process.platform === 'win32'
+      ? 'creative-rsi-controller.exe'
+      : 'creative-rsi-controller'
+    const executable = join(sidecar, executableName)
     await writeFile(executable, 'synthetic-sidecar')
+    if (process.platform !== 'win32') await chmod(executable, 0o755)
     await writeFile(join(sidecar, 'base_library.zip'), 'base')
     const tracked = git('ls-files', '-z', '--', 'python', 'skills/creative-loop2rsi')
       .split('\0').filter(Boolean).sort()
@@ -244,10 +482,14 @@ describe('preview build inventory', () => {
       git_tree: git('rev-parse', 'HEAD^{tree}').trim(),
     }
     const evidence = {
+      schema_version: '2',
       kind: 'ControllerSidecarBuildManifest',
-      platform: { system: 'Darwin', machine: 'arm64' },
+      platform: process.platform === 'win32'
+        ? { system: 'Windows', machine: 'AMD64' }
+        : { system: 'Darwin', machine: 'arm64' },
       python: '3.11.13',
       pyinstaller: '6.22.0',
+      sidecar_name: 'creative-rsi-controller',
       source: {
         ...source,
         inputs,
@@ -255,22 +497,46 @@ describe('preview build inventory', () => {
         requirements_sha256: sha256(await readFile(join(repositoryRoot, 'python/requirements-build-hashed.txt'))),
       },
       files: {
-        Python: {
-          type: 'file', bytes: 17, sha256: sha256(Buffer.from('synthetic-sidecar')),
+        '.': {
+          type: 'directory',
+          mode: process.platform === 'win32' ? null : await modeOf(sidecar),
+        },
+        [executableName]: {
+          type: 'file',
+          bytes: 17,
+          sha256: sha256(Buffer.from('synthetic-sidecar')),
+          mode: process.platform === 'win32' ? null : await modeOf(executable),
         },
         'base_library.zip': {
-          type: 'file', bytes: 4, sha256: sha256(Buffer.from('base')),
+          type: 'file',
+          bytes: 4,
+          sha256: sha256(Buffer.from('base')),
+          mode: process.platform === 'win32' ? null : await modeOf(join(sidecar, 'base_library.zip')),
         },
       },
     }
     await expect(validateSidecarEvidence(sidecar, evidence, {
-      root: repositoryRoot, source, platform: 'darwin', arch: 'arm64',
+      root: repositoryRoot,
+      source,
+      platform: process.platform === 'win32' ? 'win32' : 'darwin',
+      arch: process.platform === 'win32' ? 'x64' : 'arm64',
     })).resolves.toBeUndefined()
 
     await writeFile(executable, 'different-sidecar')
     await expect(validateSidecarEvidence(sidecar, evidence, {
-      root: repositoryRoot, source, platform: 'darwin', arch: 'arm64',
-    })).rejects.toThrow('bytes differ')
+      root: repositoryRoot,
+      source,
+      platform: process.platform === 'win32' ? 'win32' : 'darwin',
+      arch: process.platform === 'win32' ? 'x64' : 'arm64',
+    })).rejects.toThrow('bytes or modes differ')
+
+    if (process.platform !== 'win32') {
+      await writeFile(executable, 'synthetic-sidecar')
+      await chmod(executable, 0o644)
+      await expect(validateSidecarEvidence(sidecar, evidence, {
+        root: repositoryRoot, source, platform: 'darwin', arch: 'arm64',
+      })).rejects.toThrow('bytes or modes differ')
+    }
   })
 })
 
@@ -280,4 +546,8 @@ function git(...args: string[]): string {
 
 function sha256(value: Buffer): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+async function modeOf(path: string): Promise<string> {
+  return ((await lstat(path)).mode & 0o7777).toString(8).padStart(4, '0')
 }
