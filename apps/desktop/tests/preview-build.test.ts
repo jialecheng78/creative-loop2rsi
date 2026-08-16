@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmod, link, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, link, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -8,17 +8,26 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  MAC_BUNDLE_BUILD_VERSION,
+  MAC_BUNDLE_SHORT_VERSION,
+  PACKAGED_NOTICE_MAPPINGS,
   auditPackagedTree,
   assertPreviewEntrypoints,
+  installElectronRuntimeEvidence,
+  installPackagedDependencyNotices,
   inventoryTree,
   previewOutputPath,
   removePackageManagerMetadata,
   removeRuntimeBuildMetadata,
   removePnpmWorkspaceSelfReference,
+  removeUnusedMacPrivacyDeclarations,
   restoreLegacyWorkspaceRuntimeDependencies,
+  sealMacBundle,
+  validateElectronRuntimeEvidence,
   validateSidecarEvidence,
   verifyDeployedRuntimeResolution,
 } from '../scripts/preview-build-lib.mjs'
+import { generateMacIcns } from '../scripts/generate-app-icon.mjs'
 
 const temporary: string[] = []
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -29,6 +38,11 @@ afterEach(async () => {
 })
 
 describe('preview build inventory', () => {
+  it('keeps prerelease identity outside Apple numeric bundle version fields', () => {
+    expect(MAC_BUNDLE_SHORT_VERSION).toBe('1.0.0')
+    expect(MAC_BUNDLE_BUILD_VERSION).toBe('1')
+  })
+
   it('uses a Finder-recognizable macOS app path', () => {
     expect(previewOutputPath('/repo', 'darwin', 'arm64'))
       .toBe('/repo/dist/studio-preview/darwin-arm64/Creative RSI Studio.app')
@@ -118,6 +132,115 @@ describe('preview build inventory', () => {
     ]))
     expect(inventory.some(entry => entry.path.endsWith('lock.yaml') || entry.path.endsWith('.modules.yaml')))
       .toBe(false)
+  })
+
+  it('pins canonical upstream notice sources and keeps declared versus verified AWS paths distinct', async () => {
+    const nested = PACKAGED_NOTICE_MAPPINGS.find(mapping => (
+      mapping.target.name === '@aws-sdk/nested-clients'
+    ))!
+    const pi = PACKAGED_NOTICE_MAPPINGS.find(mapping => mapping.target.name === '@earendil-works/pi-ai')!
+    expect(nested.target).toMatchObject({
+      version: '3.997.42',
+      declared_repository_directory: 'packages/nested-clients',
+    })
+    expect(nested.upstream).toEqual({
+      repository: 'https://github.com/aws/aws-sdk-js-v3.git',
+      tag: 'v3.1108.0',
+      tag_object: 'b187769e33bdccafdedf93d5c4ceca8436cc6cff',
+      commit: '26b0eb790ff86399b7af7b74ce8c188f25512cc6',
+      path: 'LICENSE',
+      verified_source_directory: 'packages-internal/nested-clients',
+    })
+    expect(sha256(await readFile(join(repositoryRoot, nested.source.file))))
+      .toBe(nested.source.sha256)
+    expect(pi.upstream).toMatchObject({
+      tag: 'v0.82.1',
+      commit: 'b4f293684bba718d59cc1157679bcf6157b3a7f5',
+      path: 'LICENSE',
+    })
+    expect(sha256(await readFile(join(repositoryRoot, pi.source.file)))).toBe(pi.source.sha256)
+  })
+
+  it('installs a tracked canonical notice and fails closed on provenance or source drift', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-canonical-notice-'))
+    temporary.push(root)
+    const deployed = join(root, 'deployed')
+    const workspace = join(root, 'workspace')
+    const sourceStore = join(workspace, 'node_modules', '.pnpm')
+    const source = join(workspace, 'third_party', 'licenses', 'canonical.txt')
+    const target = join(deployed, 'node_modules', 'synthetic-runtime')
+    await mkdir(sourceStore, { recursive: true })
+    await mkdir(dirname(source), { recursive: true })
+    await mkdir(target, { recursive: true })
+    await writeFile(join(deployed, 'package.json'), JSON.stringify({
+      name: '@creative-loop2rsi/desktop', version: '1.0.0-alpha.1', license: 'Apache-2.0',
+    }))
+    await writeFile(join(deployed, 'LICENSE'), 'synthetic app license\n')
+    await writeFile(join(target, 'package.json'), JSON.stringify({
+      name: 'synthetic-runtime',
+      version: '1.2.3',
+      license: 'MIT',
+      repository: { url: 'https://example.invalid/runtime.git', directory: 'packages/runtime' },
+    }))
+    const canonical = Buffer.from('synthetic canonical notice\n')
+    await writeFile(source, canonical)
+    const mapping = {
+      target: {
+        name: 'synthetic-runtime',
+        version: '1.2.3',
+        license: 'MIT',
+        repository: 'https://example.invalid/runtime.git',
+        declared_repository_directory: 'packages/runtime',
+      },
+      source: {
+        kind: 'tracked',
+        file: 'third_party/licenses/canonical.txt',
+        sha256: sha256(canonical),
+      },
+      upstream: {
+        repository: 'https://example.invalid/runtime.git',
+        tag: 'v1.2.3',
+        commit: 'a'.repeat(40),
+        path: 'LICENSE',
+        verified_source_directory: 'packages/runtime',
+      },
+      destination: 'LICENSE',
+    }
+    await expect(installPackagedDependencyNotices(deployed, workspace, {
+      sourceStore,
+      mappings: [{ ...mapping, upstream: { ...mapping.upstream, commit: 'invalid' } }],
+    })).rejects.toThrow('provenance is invalid')
+    await expect(installPackagedDependencyNotices(deployed, workspace, {
+      sourceStore,
+      mappings: [{ ...mapping, upstream: { ...mapping.upstream, path: '../LICENSE' } }],
+    })).rejects.toThrow('provenance is invalid')
+    await expect(installPackagedDependencyNotices(deployed, workspace, {
+      sourceStore,
+      mappings: [{ ...mapping, source: { ...mapping.source, sha256: 'b'.repeat(64) } }],
+    })).rejects.toThrow('source hash differs')
+    await expect(installPackagedDependencyNotices(deployed, workspace, {
+      sourceStore,
+      mappings: [{
+        ...mapping,
+        target: { ...mapping.target, declared_repository_directory: 'packages/other' },
+      }],
+    })).rejects.toThrow('target identity is invalid')
+
+    await expect(installPackagedDependencyNotices(deployed, workspace, {
+      sourceStore,
+      mappings: [mapping],
+    })).resolves.toBeUndefined()
+    await expect(readFile(join(target, 'LICENSE'))).resolves.toEqual(canonical)
+    const provenance = JSON.parse(await readFile(
+      join(deployed, 'release-license-provenance.json'),
+      'utf8',
+    ))
+    expect(JSON.stringify(provenance)).not.toContain(root)
+    expect(provenance.mappings[0]).toMatchObject({
+      target: { component: 'synthetic-runtime@1.2.3' },
+      source: { kind: 'tracked-canonical-license', sha256: sha256(canonical) },
+      upstream: mapping.upstream,
+    })
   })
 
   it('strips non-runtime build metadata and local source-origin comments across production dependencies', async () => {
@@ -526,6 +649,106 @@ describe('preview build inventory', () => {
     await expect(assertPreviewEntrypoints(root, 'darwin')).rejects.toThrow('mode must be 0755')
   })
 
+  it.runIf(process.platform === 'darwin')('generates the project CR icon as an icns file without overwriting', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-icon-'))
+    temporary.push(root)
+    const output = join(root, 'CreativeRSIStudio.icns')
+    await expect(generateMacIcns(output)).resolves.toBe(output)
+    expect((await lstat(output)).isFile()).toBe(true)
+    expect(execFileSync('/usr/bin/sips', ['-g', 'format', output], { encoding: 'utf8' }))
+      .toContain('format: icns')
+    await expect(generateMacIcns(output)).rejects.toThrow('already exists')
+  })
+
+  it('installs and hash-binds Electron, Node.js, and Chromium runtime notices', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-electron-runtime-'))
+    temporary.push(root)
+    const electronDist = join(root, 'electron-dist')
+    const resources = join(root, 'resources')
+    const executable = join(root, 'Electron')
+    await mkdir(electronDist)
+    await mkdir(resources)
+    await writeFile(executable, 'synthetic executable')
+    await writeFile(join(electronDist, 'LICENSE'), 'synthetic Electron license\n')
+    await writeFile(join(electronDist, 'LICENSES.chromium.html'), '<p>synthetic Chromium and Node notices</p>\n')
+
+    const evidence = await installElectronRuntimeEvidence({
+      electronDist,
+      resources,
+      executable,
+      runtimeVersions: {
+        electron: '43.4.0',
+        node: '24.18.1',
+        chrome: '150.0.7871.224',
+      },
+    })
+    expect(evidence.components.map(component => [component.name, component.version])).toEqual([
+      ['Chromium', '150.0.7871.224'],
+      ['Electron', '43.4.0'],
+      ['Node.js', '24.18.1'],
+    ])
+    expect(JSON.stringify(evidence)).not.toContain(root)
+    for (const component of evidence.components) {
+      for (const notice of component.notices) {
+        const bytes = await readFile(join(resources, ...notice.path.split('/')))
+        expect(notice).toEqual({ path: notice.path, bytes: bytes.length, sha256: sha256(bytes) })
+      }
+    }
+    await expect(validateElectronRuntimeEvidence(resources)).resolves.toEqual(evidence)
+
+    await writeFile(join(resources, 'licenses/electron/LICENSES.chromium.html'), 'tampered\n')
+    await expect(validateElectronRuntimeEvidence(resources)).rejects.toThrow('differs from its evidence')
+  })
+
+  it.runIf(process.platform === 'darwin')('removes inherited unused macOS privacy declarations', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-plist-'))
+    temporary.push(root)
+    const plist = join(root, 'Info.plist')
+    await writeFile(plist, [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0"><dict>',
+      '<key>CFBundleIdentifier</key><string>org.creativeloop2rsi.test</string>',
+      '<key>NSAudioCaptureUsageDescription</key><string>unused</string>',
+      '<key>NSBluetoothAlwaysUsageDescription</key><string>unused</string>',
+      '<key>NSBluetoothPeripheralUsageDescription</key><string>unused</string>',
+      '<key>NSCameraUsageDescription</key><string>unused</string>',
+      '<key>NSMicrophoneUsageDescription</key><string>unused</string>',
+      '</dict></plist>',
+      '',
+    ].join('\n'))
+    await expect(removeUnusedMacPrivacyDeclarations(plist)).resolves.toBeUndefined()
+    const parsed = JSON.parse(execFileSync(
+      '/usr/bin/plutil', ['-convert', 'json', '-o', '-', plist], { encoding: 'utf8' },
+    ))
+    expect(parsed).toEqual({ CFBundleIdentifier: 'org.creativeloop2rsi.test' })
+  })
+
+  it.runIf(process.platform === 'darwin')('ad-hoc seals a complete app and passes strict verification', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-seal-'))
+    temporary.push(root)
+    const bundle = join(root, 'Synthetic.app')
+    const contents = join(bundle, 'Contents')
+    const executable = join(contents, 'MacOS', 'Synthetic')
+    await mkdir(dirname(executable), { recursive: true })
+    await cp('/usr/bin/true', executable)
+    await chmod(executable, 0o755)
+    await writeFile(join(contents, 'Info.plist'), [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0"><dict>',
+      '<key>CFBundleExecutable</key><string>Synthetic</string>',
+      '<key>CFBundleIdentifier</key><string>org.creativeloop2rsi.synthetic</string>',
+      '<key>CFBundlePackageType</key><string>APPL</string>',
+      '</dict></plist>',
+      '',
+    ].join('\n'))
+    await expect(sealMacBundle(bundle)).resolves.toBeUndefined()
+    expect((await lstat(join(contents, '_CodeSignature', 'CodeResources'))).isFile()).toBe(true)
+    expect(() => execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle]))
+      .not.toThrow()
+  })
+
   it('rejects a symlinked tree root', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'preview-root-link-'))
     temporary.push(parent)
@@ -737,6 +960,12 @@ describe('preview build inventory', () => {
     await writeFile(executable, 'synthetic-sidecar')
     if (process.platform !== 'win32') await chmod(executable, 0o755)
     await writeFile(join(sidecar, 'base_library.zip'), 'base')
+    const licenseDirectory = join(sidecar, '_licenses')
+    const pythonNotice = join(licenseDirectory, 'CPython-LICENSE.txt')
+    const pyinstallerNotice = join(licenseDirectory, 'PyInstaller-COPYING.txt')
+    await mkdir(licenseDirectory)
+    await writeFile(pythonNotice, 'synthetic CPython license\n')
+    await writeFile(pyinstallerNotice, 'synthetic PyInstaller terms\n')
     const tracked = git('ls-files', '-z', '--', 'python', 'skills/creative-loop2rsi')
       .split('\0').filter(Boolean).sort()
     const inputs = Object.fromEntries(await Promise.all(tracked.map(async path => [
@@ -755,30 +984,37 @@ describe('preview build inventory', () => {
       python: '3.11.13',
       pyinstaller: '6.22.0',
       sidecar_name: 'creative-rsi-controller',
+      runtime_components: [
+        {
+          name: 'CPython',
+          version: '3.11.13',
+          license: 'PSF-2.0',
+          notice: {
+            path: '_licenses/CPython-LICENSE.txt',
+            bytes: (await readFile(pythonNotice)).length,
+            sha256: sha256(await readFile(pythonNotice)),
+          },
+        },
+        {
+          name: 'PyInstaller',
+          version: '6.22.0',
+          license: 'GPL-2.0-or-later WITH Bootloader-exception',
+          notice: {
+            path: '_licenses/PyInstaller-COPYING.txt',
+            bytes: (await readFile(pyinstallerNotice)).length,
+            sha256: sha256(await readFile(pyinstallerNotice)),
+          },
+        },
+      ],
       source: {
         ...source,
         inputs,
         builder_sha256: sha256(await readFile(join(repositoryRoot, 'tools/build_controller_sidecar.py'))),
         requirements_sha256: sha256(await readFile(join(repositoryRoot, 'python/requirements-build-hashed.txt'))),
       },
-      files: {
-        '.': {
-          type: 'directory',
-          mode: process.platform === 'win32' ? null : await modeOf(sidecar),
-        },
-        [executableName]: {
-          type: 'file',
-          bytes: 17,
-          sha256: sha256(Buffer.from('synthetic-sidecar')),
-          mode: process.platform === 'win32' ? null : await modeOf(executable),
-        },
-        'base_library.zip': {
-          type: 'file',
-          bytes: 4,
-          sha256: sha256(Buffer.from('base')),
-          mode: process.platform === 'win32' ? null : await modeOf(join(sidecar, 'base_library.zip')),
-        },
-      },
+      files: Object.fromEntries((await inventoryTree(sidecar, {
+        platform: process.platform === 'win32' ? 'win32' : 'darwin',
+      })).map(({ path, ...entry }) => [path, entry])),
     }
     await expect(validateSidecarEvidence(sidecar, evidence, {
       root: repositoryRoot,
@@ -786,6 +1022,15 @@ describe('preview build inventory', () => {
       platform: process.platform === 'win32' ? 'win32' : 'darwin',
       arch: process.platform === 'win32' ? 'x64' : 'arm64',
     })).resolves.toBeUndefined()
+
+    await writeFile(pythonNotice, 'tampered CPython license\n')
+    await expect(validateSidecarEvidence(sidecar, evidence, {
+      root: repositoryRoot,
+      source,
+      platform: process.platform === 'win32' ? 'win32' : 'darwin',
+      arch: process.platform === 'win32' ? 'x64' : 'arm64',
+    })).rejects.toThrow('notice differs from its manifest')
+    await writeFile(pythonNotice, 'synthetic CPython license\n')
 
     await writeFile(executable, 'different-sidecar')
     await expect(validateSidecarEvidence(sidecar, evidence, {

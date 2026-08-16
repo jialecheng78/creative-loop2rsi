@@ -1,6 +1,6 @@
 # creative-loop2rsi
 
-`creative-loop2rsi` 正在演进为 **Creative RSI Studio**：一套中文优先、本地优先的开源桌面应用，帮助普通用户从第一次创作开始，把自己的创作标准逐步变成一套可运行、可恢复、可审计、可验证改进的系统。
+`creative-loop2rsi` 正在演进为 **Creative RSI Studio**：一个中文优先、本地优先的开源创作系统实验室，帮助普通用户从第一次创作开始，把自己的创作标准逐步变成一套可运行、可恢复、可审计、可验证改进的系统。它不是通用写作器，也不训练或修改模型权重。
 
 原有 Codex Builder Skill 和 Python `loopctl` 治理控制器继续保留。当前应用源码已接通普通用户首次创作、跨作品重复反馈、声明式方法候选、三组人类盲比、明确采用与回滚。DSH 承载 Production 与 Candidate 生成，Python Controller 保存证据并执行门禁；Judge、模型 Evaluator 与正式 L4 仍未接入应用。候选工作流运行成功不等于候选已获准进入生产。
 
@@ -13,21 +13,25 @@
   -> RSI 实验室（仅实验，不自动晋升）
 ```
 
-当前稳定基线是 Skill `v0.1.0`；应用目标版本是无签名技术预览 `studio-v1.0.0-alpha.1`。L0–L4 是可验证实现范围；L5 始终标记为 `experimental / unvalidated`。本仓库不会训练或修改模型权重，也不会自动公开作品、修改创作宪法或替人决定核心审美。
+当前稳定基线是 Skill `v0.1.0`；应用目标版本是无开发者身份签名、未公证的技术预览 `studio-v1.0.0-alpha.1`。App 使用匿名 ad-hoc seal 保证 bundle 内部一致性，但它不证明发布者身份，也不会避免 Gatekeeper 警告。L0–L4 是可验证实现范围；L5 始终标记为 `experimental / unvalidated`。本仓库不会自动公开作品、修改创作宪法或替人决定核心审美。
 
-应用首发目标：macOS 13+ Apple Silicon 与 Windows 10/11 x64。无签名 alpha 会触发 Gatekeeper 或 SmartScreen，不能被描述为“普通用户无警告安装”；平台签名仍是稳定版门禁。
+`alpha.1` 只面向 **macOS 13+ / Apple Silicon arm64**。当前 macOS arm64 打包应用已经完成 Flash `32,768`、GUI 和最小应用级自我改进闭环的范围化验收；V4 Pro、Windows、Intel Mac、Developer ID 签名、Apple 公证、自动更新和独立真人安装仍未验证。没有 Developer ID 和公证的 alpha 会触发 Gatekeeper，不能被描述为“普通用户无警告安装”。安装边界见 [无开发者身份签名的技术预览安装说明](docs/product/unsigned-preview-install.md)，本轮证据见 [32,768 打包应用与最小闭环验收报告](docs/product/260817-32K打包应用与最小闭环验收报告.md)。
 
 ## 应用版首次使用
 
 ```text
-下载安装
+下载 macOS arm64 ZIP 并核对 SHA256
+  -> 解压并移入“应用程序”
+  -> 按系统标准流程允许打开这一 App
   -> 输入 DeepSeek 官方 API Key
-  -> 选择 V4 Pro（推荐）或 V4 Flash（快速 / 省钱）
+  -> 选择 V4 Flash（当前已验收）
   -> 回答“你想创作什么？”
   -> 立即开始创作
 ```
 
-应用不展示 Endpoint、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。模型请求固定使用 `thinking=enabled`、`reasoning_effort=high` 和单次最多 `32,768` 个总输出 token；达到上限仍记为 `OUTPUT_TRUNCATED`，不会把被截断内容封存为完整作品。Key 只由桌面主进程管理：系统安全存储可用时加密持久保存；不可用时，用户可以明确选择“仅本次验证并继续”，此时 Key 只保留在 Main 进程内存中，关闭后失效且不会写入凭证文件。作品和证据默认保留在本机。创作所需文本会发送到 DeepSeek 官方 API，完整边界见 [PRIVACY.md](PRIVACY.md)。
+应用不展示 Endpoint、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。模型请求固定使用 `thinking=enabled`、`reasoning_effort=high` 和单次最多 `32,768` 个总输出 token；达到上限仍记为 `OUTPUT_TRUNCATED`，不会把被截断内容封存为完整作品。V4 Pro 仍可见，但 `alpha.1` 尚未完成 Pro Chat 验收，当前只推荐已通过实网验收的 V4 Flash。已知限制：这个 alpha 的选择页仍会预选并标注 Pro 为“推荐”；首用必须主动点选 **V4 Flash**，不要沿用该默认值。
+
+用户需要自备 DeepSeek API Key 和可用额度，模型调用可能产生费用。普通的正文编辑、保留/拒绝、反馈保存、盲比选择、采用和回滚不调用模型；正常无重试的候选准备会调用一次 Builder，并生成四份盲比内容，共发起五次 Chat 请求。用户输入 Key 时，它会在密码输入页的 Renderer 内存中短暂停留，提交后立即清空；后续存储和读取只由 Main 进程管理，不向 Renderer 回读，也不记录。系统安全存储可用时加密持久保存；不可用时，用户可以明确选择“仅本次验证并继续”，此时 Key 只保留在 Main 进程内存中，完全退出应用（⌘Q）后失效且不会写入凭证文件。关闭窗口不等于退出。作品和证据默认保留在本机。创作所需文本会发送到 DeepSeek 官方 API，完整边界见 [PRIVACY.md](PRIVACY.md)。
 
 ## 它解决什么问题
 
@@ -55,6 +59,7 @@
 以下标签有严格含义：
 
 - `IMPLEMENTED`：仓库中已有实现和自动检查；不等于真实创作质量已得到证明。
+- `OPERATIONAL-PASS`：指定平台上的真实打包应用和/或真实模型路径已经跑通；仍不等于真人可用性或创作质量证明。
 - `FORWARD-TESTED`：由没有历史上下文的独立执行者按真实任务验证过，并保留结果。
 - `PROPOSED`：只有可解释方案，尚不是可依赖能力。
 - `UNVALIDATED`：明确未验证，不能据此作自动决策。
@@ -67,12 +72,12 @@
 | 三名非程序员在 20 分钟内完成 L0 与首个 L1 | `UNVALIDATED` | 尚未用真人测试，自动 Agent 测试不能替代 |
 | L5 修改 Judge、学习策略或改进控制器 | `UNVALIDATED` | 只生成 `CANDIDATE`；禁止自动晋升 |
 | 从 L0 到 L4、再证明晋升后运行 N 轮 | `IMPLEMENTED` | 分开 bootstrap 与 post-L4 计数；仍需真实人工门和独立评价者 |
-| Desktop monorepo、DeepSeek Gateway 与 DSH Adapter | `IMPLEMENTED` | 已通过 mock、协议、rc.6 启停探针、无 Key且零模型 fetch/lease 的 Electron 预检与 sandboxed Preload 真实 smoke；打包仍未验收 |
-| Electron Main → DSH → Gateway → Controller 的 Flash 创作、封存、重启恢复与本地取消边界 | `IMPLEMENTED` | macOS arm64 曾在历史 `max_tokens=16,384` epoch 取得一次真实 Flash PASS；当前固定 `32,768` 策略尚待本轮实网复验，旧结果不能作为新 epoch 的 live PASS，见 [验收报告](docs/product/260815-Flash真实验收报告.md) |
-| Renderer / Preload / IPC 的普通用户 GUI 闭环 | `IMPLEMENTED` | Computer Use + 真实 Flash operational PASS 属于历史 `16,384` epoch；当前 `32,768` 源码/打包应用尚待复验，且旧结果本来也不是独立真人测试或文学质量证明，见 [GUI 验收报告](docs/product/260815-Computer-Use-GUI验收报告.md) |
+| Desktop monorepo、DeepSeek Gateway 与 DSH Adapter | `OPERATIONAL-PASS` | macOS arm64 source-bound 打包应用已通过 manifest v2、Controller sidecar 等价性、DSH rc.6 五包解析/启停和零模型 packaged smoke；Windows 未验证 |
+| Electron Main → DSH → Gateway → Controller 的 Flash 创作、封存、重启恢复与本地取消边界 | `OPERATIONAL-PASS` | macOS arm64 固定 `32,768` epoch 已完成真实 Flash 创作和来源证据闭环；仍不证明供应商侧取消、Pro、Windows或作品质量，见 [本轮验收报告](docs/product/260817-32K打包应用与最小闭环验收报告.md) |
+| Renderer / Preload / IPC 的普通用户 GUI 闭环 | `OPERATIONAL-PASS` | 当前 `32,768` 打包应用已由 Computer Use simulated-user 跑通；Computer Use 不是身份认证、真实非程序员测试或文学质量证明 |
 | DSH 运行中 Session 的跨进程恢复 | `UNVALIDATED` | v1 主动禁用：rc.6 持久化会落盘 reasoning；只从 Controller 封存边界重新派发 |
-| 应用内跨作品重复反馈、候选三组盲比、采用与回滚 | `IMPLEMENTED` | 仅聚合三项独立作品中规范化后完全相同的直接反馈；评价者是本地用户，尚未做打包应用的独立模拟用户验收，也不改变正式 L0–L5 成熟度 |
-| 无签名 macOS / Windows 安装包 | `PROPOSED` | 当前只完成编译和 sidecar 预检；没有可下载的 DMG、EXE 或 portable ZIP |
+| 应用内跨作品重复反馈、候选三组盲比、采用、下一作品生效与回滚 | `OPERATIONAL-PASS` | `32,768` 打包应用已完成一次 Computer Use simulated-user 最小闭环；评价者仍是本地用户，该结果不改变正式 L0–L5 成熟度 |
+| 无开发者身份签名的 macOS arm64 技术预览 | `IMPLEMENTED` | 包含匿名 ad-hoc seal，但无 Developer ID 与公证。发布合同固定为 ZIP + SHA256SUMS + evidence ZIP；GitHub Release 页面出现三项附件前，不得声称已有公开下载。Windows 和 DMG 不在 `alpha.1` 范围 |
 
 ## Skill 基线安装
 
@@ -285,7 +290,7 @@ Electron 预览包的 deploy 收口、敏感构建元数据审计与 mode-aware 
 
 CI 提供五类 required-check 候选：9 格 Python 测试矩阵、`DCO`、`policy`、`gitleaks-history` 和 `archive-audit`。Gitleaks 固定版本、官方规则集和下载 SHA256，不接受仓库内 `.gitleaks.toml`、`.gitleaksignore` 或 `gitleaks:allow` 弱化门禁；它会先用合成泄漏验证扫描器确实失败，再扫描完整 Git 历史。`policy` 使用固定 OpenAI Codex commit 和文件哈希下载官方 `quick_validate.py`，同时校验 Builder Skill 与一次现场生成的领域 Skill。所有 GitHub Action 都固定到完整 commit SHA；工作流只使用 `contents: read`，不使用 `pull_request_target`、仓库密钥或持久化 checkout 凭据。
 
-这些文件只定义门禁。正式发布前仍须在 GitHub private staging 实际跑绿所有 hosted-runner jobs，在仓库 ruleset 中把它们设为 required，并启用 `web_commit_signoff_required`，防止 GitHub 合并时生成未签署的新 commit；本地 PASS 不能替代 GitHub 状态检查。
+这些文件只定义门禁。正式发布前仍须让目标 commit 的所有 hosted-runner jobs 在 GitHub 实际跑绿，在仓库 ruleset 中把它们设为 required，并启用 `web_commit_signoff_required`，防止 GitHub 合并时生成未签署的新 commit；本地 PASS 不能替代 GitHub 状态检查。二进制附件先进入 GitHub Draft Release，下载验收通过后才能公开为 Pre-release。
 
 贡献方式、DCO 和洁净室边界见 [CONTRIBUTING.md](CONTRIBUTING.md)。本项目采用 [Apache License 2.0](LICENSE)。
 

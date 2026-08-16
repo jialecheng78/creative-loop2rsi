@@ -13,6 +13,7 @@
     "test:node": "pnpm -r --if-present test",
     "check": "pnpm run typecheck && pnpm run test:node",
     "start": "pnpm --filter @creative-loop2rsi/desktop start",
-    "package:preview": "pnpm --filter @creative-loop2rsi/desktop package:preview"
+    "package:preview": "pnpm --filter @creative-loop2rsi/desktop package:preview",
+    "package:release:macos": "pnpm --filter @creative-loop2rsi/desktop package:release:macos"
   }
 }

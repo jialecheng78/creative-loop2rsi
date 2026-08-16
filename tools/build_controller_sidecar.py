@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -12,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Sequence
@@ -19,6 +21,8 @@ from typing import Dict, Optional, Sequence
 
 SIDECAR_NAME = "creative-rsi-controller"
 SUPPORTED = {("Darwin", "arm64"), ("Windows", "AMD64"), ("Windows", "x86_64")}
+PYTHON_LICENSE_EXPRESSION = "PSF-2.0"
+PYINSTALLER_LICENSE_EXPRESSION = "GPL-2.0-or-later WITH Bootloader-exception"
 
 
 def sha256_file(path: Path) -> str:
@@ -144,6 +148,113 @@ def validate_sidecar_executable(
         raise RuntimeError("POSIX sidecar executable mode must be 0755")
 
 
+def _regular_notice(path: Path, label: str) -> Path:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"{label} notice must be a regular file")
+    return path
+
+
+def python_license_path() -> Path:
+    stdlib = sysconfig.get_path("stdlib")
+    if not stdlib:
+        raise RuntimeError("CPython stdlib path is unavailable")
+    return select_python_license(
+        [Path(stdlib) / "LICENSE.txt", Path(sys.base_prefix) / "LICENSE.txt"],
+        Path(sys.base_prefix),
+    )
+
+
+def select_python_license(candidates: Sequence[Path], base_prefix: Path) -> Path:
+    resolved_base = base_prefix.resolve(strict=True)
+    selected: Dict[Path, Path] = {}
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        candidate = _regular_notice(candidate, "CPython")
+        resolved = candidate.resolve(strict=True)
+        try:
+            resolved.relative_to(resolved_base)
+        except ValueError as error:
+            raise RuntimeError("CPython notice escapes the runtime base prefix") from error
+        selected.setdefault(resolved, candidate)
+    if not selected:
+        raise RuntimeError("CPython distribution contains no LICENSE.txt")
+    hashes = {sha256_file(path) for path in selected.values()}
+    if len(hashes) != 1:
+        raise RuntimeError("CPython distribution contains conflicting LICENSE.txt files")
+    return selected[sorted(selected, key=str)[0]]
+
+
+def pyinstaller_license_path() -> Path:
+    distribution = importlib.metadata.distribution("pyinstaller")
+    if distribution.version != "6.22.0":
+        raise RuntimeError(f"unsupported PyInstaller distribution version: {distribution.version}")
+    candidates = []
+    for item in distribution.files or []:
+        normalized = str(item).replace("\\", "/").lower()
+        if normalized.endswith("/licenses/copying.txt"):
+            candidates.append(Path(distribution.locate_file(item)))
+    if len(candidates) != 1:
+        raise RuntimeError("PyInstaller distribution must contain exactly one licenses/COPYING.txt")
+    return _regular_notice(candidates[0], "PyInstaller")
+
+
+def install_runtime_notices(
+    output: Path,
+    python_version: str,
+    pyinstaller_version: str,
+    *,
+    python_license: Optional[Path] = None,
+    pyinstaller_license: Optional[Path] = None,
+) -> list[Dict[str, object]]:
+    """Install path-free runtime notices and return their hash-bound identities."""
+    if not python_version.startswith("3.11."):
+        raise RuntimeError(f"unsupported CPython runtime version: {python_version}")
+    if pyinstaller_version != "6.22.0":
+        raise RuntimeError(f"unsupported PyInstaller runtime version: {pyinstaller_version}")
+    if output.is_symlink() or not output.is_dir():
+        raise RuntimeError("sidecar notice target must be a regular directory")
+
+    definitions = [
+        (
+            "CPython",
+            python_version,
+            PYTHON_LICENSE_EXPRESSION,
+            python_license or python_license_path(),
+            "_licenses/CPython-LICENSE.txt",
+        ),
+        (
+            "PyInstaller",
+            pyinstaller_version,
+            PYINSTALLER_LICENSE_EXPRESSION,
+            pyinstaller_license or pyinstaller_license_path(),
+            "_licenses/PyInstaller-COPYING.txt",
+        ),
+    ]
+    components: list[Dict[str, object]] = []
+    for name, version, license_expression, source, relative in definitions:
+        source = _regular_notice(Path(source), name)
+        destination = output / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(str(destination)):
+            raise RuntimeError(f"sidecar runtime notice target already exists: {relative}")
+        shutil.copyfile(source, destination)
+        destination.chmod(0o644)
+        components.append(
+            {
+                "name": name,
+                "version": version,
+                "license": license_expression,
+                "notice": {
+                    "path": relative,
+                    "bytes": destination.stat().st_size,
+                    "sha256": sha256_file(destination),
+                },
+            }
+        )
+    return sorted(components, key=lambda component: str(component["name"]))
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -245,9 +356,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not built.is_dir():
             print("PyInstaller did not produce the expected onedir tree", file=sys.stderr)
             return 2
+        runtime_components = install_runtime_notices(
+            built,
+            platform.python_version(),
+            PyInstaller.__version__,
+        )
         os.replace(built, output)
         files = inventory_sidecar_tree(output, system)
         validate_sidecar_executable(output, system, files)
+        for component in runtime_components:
+            notice = component["notice"]
+            relative = str(notice["path"])
+            declared = files.get(relative)
+            if declared is None or declared.get("type") != "file":
+                raise RuntimeError(f"sidecar runtime notice is absent from inventory: {relative}")
+            component["notice"] = {
+                "path": relative,
+                "bytes": declared["bytes"],
+                "sha256": declared["sha256"],
+            }
         atomic_write_json(
             manifest_path,
             {
@@ -259,6 +386,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "entrypoint": "python/controller_sidecar.py",
                 "bundled_skill": "skills/creative-loop2rsi",
                 "sidecar_name": SIDECAR_NAME,
+                "runtime_components": runtime_components,
                 "source": {
                     "git_commit": git_commit,
                     "git_tree": git_tree,

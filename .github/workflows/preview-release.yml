@@ -1,10 +1,10 @@
-name: Preview release preflight
+name: Unsigned macOS release preflight
 
 on:
   workflow_dispatch:
   push:
     tags:
-      - "studio-v1.0.0-alpha.*"
+      - "studio-v1.0.0-alpha.1"
 
 permissions:
   contents: read
@@ -12,56 +12,15 @@ permissions:
 env:
   PYTHONDONTWRITEBYTECODE: "1"
   PYTHONUTF8: "1"
+  RELEASE_VERSION: "1.0.0-alpha.1"
+  PREVIEW_APP: "dist/studio-preview/darwin-arm64/Creative RSI Studio.app"
+  RELEASE_DIR: "dist/releases/studio-v1.0.0-alpha.1"
 
 jobs:
-  source-evidence:
-    name: source archive evidence
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout exact ref
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.11"
-
-      - name: Build and audit exact tracked source archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/source-evidence"
-          python tools/audit_release_archive.py . \
-            --treeish HEAD \
-            --output "$RUNNER_TEMP/source-evidence/creative-loop2rsi-source.tar" \
-            --manifest "$RUNNER_TEMP/source-evidence/source.manifest.json"
-
-      - name: Upload source evidence only
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: source-evidence
-          path: ${{ runner.temp }}/source-evidence
-          if-no-files-found: error
-          retention-days: 14
-
-  controller-sidecar:
-    name: controller sidecar (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS arm64
-            os: macos-15
-            sidecar_dir: dist/controller-sidecar-macos-arm64
-            executable: dist/controller-sidecar-macos-arm64/creative-rsi-controller
-          - name: Windows x64
-            os: windows-2025
-            sidecar_dir: dist/controller-sidecar-windows-x64
-            executable: dist/controller-sidecar-windows-x64/creative-rsi-controller.exe
-    runs-on: ${{ matrix.os }}
+  windows-sidecar-preflight:
+    name: Windows x64 sidecar protocol preflight (not a release asset)
+    runs-on: windows-2025
+    timeout-minutes: 30
     steps:
       - name: Checkout exact ref
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -73,104 +32,138 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install hash-locked builder
+      - name: Install hash-locked PyInstaller builder
         run: python -m pip install --disable-pip-version-check --require-hashes -r python/requirements-build-hashed.txt
 
-      - name: Build and compare sidecar protocol
+      - name: Build and compare source-bound Windows sidecar
         run: |
           python tools/build_controller_sidecar.py
-          python tools/check_controller_sidecar.py "${{ matrix.executable }}"
+          python tools/check_controller_sidecar.py "dist/controller-sidecar-windows-x64/creative-rsi-controller.exe"
 
-      - name: Upload unpacked sidecar evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: controller-sidecar-${{ runner.os }}-${{ runner.arch }}
-          path: |
-            ${{ matrix.sidecar_dir }}
-            ${{ matrix.sidecar_dir }}.manifest.json
-          if-no-files-found: error
-          retention-days: 14
+      - name: State the Windows boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Windows sidecar protocol preflight passed."
+          echo "This job does not produce or validate a Windows desktop release asset."
 
-  desktop-compiled-preflight:
-    name: desktop compiled preflight (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS arm64
-            os: macos-15
-          - name: Windows x64
-            os: windows-2025
-    runs-on: ${{ matrix.os }}
+  macos-release-assets-preflight:
+    name: macOS arm64 unsigned release assets preflight
+    runs-on: macos-15
+    timeout-minutes: 90
     steps:
-      - name: Checkout exact ref
+      - name: Checkout exact ref with history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Node 24
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24.19.0"
+      - name: Verify annotated release tag binding
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_ref="refs/tags/studio-v${RELEASE_VERSION}"
+          test "$GITHUB_REF" = "$expected_ref"
+          test "$(git cat-file -t "$GITHUB_REF")" = "tag"
+          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"
 
-      - name: Set up Python for evidence audit
+      - name: Set up CPython 3.11
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
 
-      - name: Install pinned workspace
+      - name: Install hash-locked PyInstaller builder
+        run: python -m pip install --disable-pip-version-check --require-hashes -r python/requirements-build-hashed.txt
+
+      - name: Build and compare source-bound macOS sidecar
+        shell: bash
         run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          python tools/build_controller_sidecar.py
+          python tools/check_controller_sidecar.py \
+            "dist/controller-sidecar-macos-arm64/creative-rsi-controller"
+
+      - name: Set up Node 24.19
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
+
+      - name: Install pinned pnpm and frozen workspace
+        shell: bash
+        run: |
+          set -euo pipefail
           npm install --global pnpm@11.7.0
+          test "$(pnpm --version)" = "11.7.0"
           pnpm install --frozen-lockfile
 
-      - name: Typecheck, test and compile desktop sources
+      - name: Check, test and build the workspace
+        shell: bash
         run: |
+          set -euo pipefail
+          python -X utf8 -m unittest discover -s tests -v
           pnpm run check
+          pnpm run build
           pnpm --filter @creative-loop2rsi/runtime-dsh probe:published
+          python tools/audit_public_tree.py . --mode tracked
+          python tools/check_dco.py . --range HEAD
+
+      - name: Build sealed macOS preview
+        shell: bash
+        run: |
+          set -euo pipefail
           pnpm run package:preview
+          test -d "$PREVIEW_APP"
+          test -f "${PREVIEW_APP}.manifest.json"
+          /usr/bin/codesign --verify --deep --strict "$PREVIEW_APP"
 
-      - name: Audit compiled desktop evidence
+      - name: Run sealed preview packaged smoke
         shell: bash
         run: |
           set -euo pipefail
-          if find apps/desktop/dist -type f -name '*.map' -print -quit | grep -q .; then
-            echo "Compiled preview evidence must not contain source maps." >&2
-            exit 1
-          fi
-          python tools/audit_public_tree.py apps/desktop/dist --mode full
+          pnpm --filter @creative-loop2rsi/desktop run smoke:packaged \
+            "$GITHUB_WORKSPACE/$PREVIEW_APP"
 
-      - name: Generate path-free dependency evidence
+      - name: Build and verify unsigned release assets
         shell: bash
         run: |
           set -euo pipefail
-          evidence="$RUNNER_TEMP/desktop-evidence"
-          mkdir -p "$evidence"
-          pnpm list --prod --json --depth Infinity > "$RUNNER_TEMP/pnpm-list.json"
-          pnpm licenses list --prod --json > "$RUNNER_TEMP/pnpm-licenses-raw.json"
-          python tools/build_node_sbom.py \
-            --input "$RUNNER_TEMP/pnpm-list.json" \
-            --output "$evidence/creative-rsi-studio.cdx.json"
-          python tools/sanitize_pnpm_licenses.py \
-            --input "$RUNNER_TEMP/pnpm-licenses-raw.json" \
-            --output "$evidence/licenses.json"
-          python tools/audit_public_tree.py "$evidence" --mode full
+          pnpm run package:release:macos
+          expected=(
+            "Creative-RSI-Studio-${RELEASE_VERSION}-macos-arm64.zip"
+            "Creative-RSI-Studio-${RELEASE_VERSION}-evidence.zip"
+            "SHA256SUMS.txt"
+          )
+          for asset in "${expected[@]}"; do
+            test -s "$RELEASE_DIR/$asset"
+          done
+          actual_count="$(find "$RELEASE_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$actual_count" = "${#expected[@]}"
+          (
+            cd "$RELEASE_DIR"
+            /usr/bin/shasum -a 256 --check SHA256SUMS.txt
+          )
 
-      - name: Upload compiled and dependency evidence
+      - name: Upload the three draft release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: desktop-compiled-preflight-${{ runner.os }}-${{ runner.arch }}
+          name: Creative-RSI-Studio-${{ env.RELEASE_VERSION }}-unsigned-macos-arm64-preflight
           path: |
-            apps/desktop/dist
-            ${{ runner.temp }}/desktop-evidence
+            ${{ env.RELEASE_DIR }}/Creative-RSI-Studio-${{ env.RELEASE_VERSION }}-macos-arm64.zip
+            ${{ env.RELEASE_DIR }}/Creative-RSI-Studio-${{ env.RELEASE_VERSION }}-evidence.zip
+            ${{ env.RELEASE_DIR }}/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0
 
-  release-blocker:
-    name: installer release remains blocked
-    runs-on: ubuntu-latest
-    steps:
-      - name: State the alpha packaging boundary
+      - name: State the preflight boundary
         shell: bash
         run: |
-          echo "This workflow intentionally does not create a GitHub Release."
-          echo "DMG, Windows installer, signing, notarization, packaged smoke, and human installation tests remain release blockers."
+          set -euo pipefail
+          echo "Unsigned macOS arm64 release preflight passed for ${GITHUB_SHA}."
+          echo "The three files above are temporary Actions artifacts retained for 14 days."
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual runs are diagnostic; public release still requires the annotated tag run to pass."
+          fi
+          echo "This workflow does not create, publish, or modify a GitHub Release."

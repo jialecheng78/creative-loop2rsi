@@ -6,11 +6,27 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { spawn } from 'node:child_process'
 import ts from 'typescript'
 
+import { generateMacIcns } from './generate-app-icon.mjs'
+
 const EXPECTED_NODE = 'v24.19.0'
 const EXPECTED_PNPM = '11.7.0'
 const PRODUCT_NAME = 'Creative RSI Studio'
 const APP_ID = 'org.creativeloop2rsi.studio'
 const CONTROLLER_SIDECAR_NAME = 'creative-rsi-controller'
+const EXPECTED_ELECTRON = '43.4.0'
+export const MAC_BUNDLE_SHORT_VERSION = '1.0.0'
+export const MAC_BUNDLE_BUILD_VERSION = '1'
+const MAC_ICON_FILE = 'CreativeRSIStudio.icns'
+export const MAC_RUNTIME_COMPONENTS_FILE = 'runtime-components.json'
+const ELECTRON_LICENSE_PATH = 'licenses/electron/LICENSE'
+const CHROMIUM_LICENSES_PATH = 'licenses/electron/LICENSES.chromium.html'
+const UNUSED_MAC_PRIVACY_KEYS = [
+  'NSAudioCaptureUsageDescription',
+  'NSBluetoothAlwaysUsageDescription',
+  'NSBluetoothPeripheralUsageDescription',
+  'NSCameraUsageDescription',
+  'NSMicrophoneUsageDescription',
+]
 const PACKAGE_MANAGER_METADATA_NAMES = new Set([
   '.modules.yaml',
   '.npmrc',
@@ -68,6 +84,125 @@ const NON_RUNTIME_DOCUMENT_EXTENSIONS = new Set(['adoc', 'markdown', 'md', 'rst'
 const SOURCE_COMMENT_EXTENSIONS = new Set(['.cjs', '.css', '.js', '.mjs'])
 const DEPENDENCY_TEST_DIRECTORIES = new Set(['__tests__', 'spec', 'specs', 'test', 'tests'])
 const DEPENDENCY_TEST_FILE = /\.(?:spec|test)\.(?:cjs|js|mjs|ts|tsx)$/i
+const PACKAGE_NOTICE_NAME = /^(?:licen[cs]e|notice|copying)(?:$|[._-])/i
+export const PACKAGED_NOTICE_MAPPINGS = [
+  ...[
+    [
+      '@aws-sdk/credential-provider-http',
+      '3.972.70',
+      'packages-internal/credential-provider-http',
+      'packages-internal/credential-provider-http',
+    ],
+    [
+      '@aws-sdk/credential-provider-login',
+      '3.972.75',
+      'packages-internal/credential-provider-login',
+      'packages-internal/credential-provider-login',
+    ],
+    [
+      '@aws-sdk/nested-clients',
+      '3.997.42',
+      'packages/nested-clients',
+      'packages-internal/nested-clients',
+    ],
+  ].map(([name, version, declaredDirectory, verifiedSourcePath]) => ({
+    target: {
+      name,
+      version,
+      license: 'Apache-2.0',
+      repository: 'https://github.com/aws/aws-sdk-js-v3.git',
+      declared_repository_directory: declaredDirectory,
+    },
+    source: {
+      kind: 'tracked',
+      file: 'third_party/licenses/aws-sdk-js-v3-v3.1108.0-Apache-2.0.txt',
+      sha256: 'edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d',
+    },
+    upstream: {
+      repository: 'https://github.com/aws/aws-sdk-js-v3.git',
+      tag: 'v3.1108.0',
+      tag_object: 'b187769e33bdccafdedf93d5c4ceca8436cc6cff',
+      commit: '26b0eb790ff86399b7af7b74ce8c188f25512cc6',
+      path: 'LICENSE',
+      verified_source_directory: verifiedSourcePath,
+    },
+    destination: 'LICENSE',
+  })),
+  {
+    target: {
+      name: '@earendil-works/pi-ai',
+      version: '0.82.1',
+      license: 'MIT',
+      repository: 'git+https://github.com/earendil-works/pi.git',
+      declared_repository_directory: 'packages/ai',
+    },
+    source: {
+      kind: 'tracked',
+      file: 'third_party/licenses/pi-v0.82.1-MIT.txt',
+      sha256: '0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48',
+    },
+    upstream: {
+      repository: 'https://github.com/earendil-works/pi.git',
+      tag: 'v0.82.1',
+      commit: 'b4f293684bba718d59cc1157679bcf6157b3a7f5',
+      path: 'LICENSE',
+      verified_source_directory: 'packages/ai',
+    },
+    destination: 'LICENSE',
+  },
+  {
+    target: {
+      name: '@img/sharp-libvips-darwin-arm64',
+      version: '1.3.2',
+      license: 'LGPL-3.0-or-later',
+      repository: 'git+https://github.com/lovell/sharp-libvips.git',
+    },
+    source: {
+      kind: 'package',
+      name: '@img/sharp-libvips-darwin-arm64',
+      version: '1.3.2',
+      file: 'README.md',
+      sha256: '47083f1ae7e990f74a56f576bcb8434051cb84ed1982fa57932720869e5147fe',
+    },
+    evidence_files: [{
+      file: 'versions.json',
+      sha256: '71e22ad5154a3891e09291e2f316b3d9b0d0f405459144a94897a203580df055',
+    }],
+    destination: 'NOTICE.md',
+  },
+  {
+    target: {
+      name: '@koromix/koffi-darwin-arm64',
+      version: '3.1.4',
+      license: 'MIT',
+      repository: 'https://github.com/Koromix/koffi',
+    },
+    source: {
+      kind: 'package',
+      name: 'koffi',
+      version: '3.1.4',
+      file: 'LICENSE.txt',
+      sha256: '22bcbbbacd739b026a8dc484f62a31484ce4c4e31f3408b60b29b4e41d62b290',
+    },
+    destination: 'LICENSE.txt',
+  },
+  {
+    target: {
+      name: 'data-uri-to-buffer',
+      version: '4.0.1',
+      license: 'MIT',
+      repository: 'git://github.com/TooTallNate/node-data-uri-to-buffer.git',
+    },
+    source: {
+      kind: 'package',
+      name: 'data-uri-to-buffer',
+      version: '4.0.1',
+      file: 'README.md',
+      sha256: 'a7cc4332acfa1f9b6530e01aac77fefe74f2efa32579215fddaa473013f9a25c',
+    },
+    destination: 'NOTICE.md',
+  },
+]
 
 export async function buildPreview(options) {
   const root = resolve(options.root)
@@ -153,6 +288,8 @@ export async function buildPreview(options) {
     ], { cwd: workspace, timeoutMs: 300_000, env: { ...process.env, CI: 'true' } })
     await restoreLegacyWorkspaceRuntimeDependencies(deployed, workspace)
     await reduceDeployedApp(deployed)
+    await installPackagedWorkspaceLicenses(deployed, root)
+    await installPackagedDependencyNotices(deployed, workspace)
     await auditPackagedTree(deployed, { platform, packageStorePaths: [packageStorePath] })
     await verifyDeployedRuntimeResolution(deployed)
     await probeDeployedRuntime(deployed)
@@ -162,6 +299,10 @@ export async function buildPreview(options) {
     const bundle = platform === 'darwin'
       ? await stageMacBundle(electronDist, stagingRoot, deployed, sidecarDirectory, source, root)
       : await stageWindowsBundle(electronDist, stagingRoot, deployed, sidecarDirectory, source, root)
+    if (platform === 'darwin') await sealMacBundle(bundle)
+    const runtimeComponentsSha256 = platform === 'darwin'
+      ? sha256(await readFile(join(bundle, 'Contents', 'Resources', MAC_RUNTIME_COMPONENTS_FILE)))
+      : undefined
     const inventory = await auditPackagedTree(bundle, { platform, packageStorePaths: [packageStorePath] })
     await assertPreviewEntrypoints(bundle, platform)
     const treeSha256 = sha256(Buffer.from(JSON.stringify(inventory), 'utf8'))
@@ -175,6 +316,13 @@ export async function buildPreview(options) {
       source,
       platform: { os: platform, arch },
       unsigned: true,
+      ...(platform === 'darwin' ? {
+        developer_id_signed: false,
+        notarized: false,
+        adhoc_sealed: true,
+        strict_codesign: 'PASS',
+        runtime_components_sha256: runtimeComponentsSha256,
+      } : {}),
       packaged_path: basename(outputRoot),
       file_count: inventory.length,
       tree_sha256: treeSha256,
@@ -237,6 +385,56 @@ export async function inventoryTree(root, options = {}) {
   return result.sort((left, right) => left.path === right.path ? 0 : left.path < right.path ? -1 : 1)
 }
 
+export async function validateSidecarRuntimeComponents(directory, components, versions) {
+  const required = new Map([
+    ['CPython', {
+      version: versions.python,
+      versionValid: value => typeof value === 'string' && value.startsWith('3.11.'),
+      license: 'PSF-2.0',
+      noticePath: '_licenses/CPython-LICENSE.txt',
+    }],
+    ['PyInstaller', {
+      version: versions.pyinstaller,
+      versionValid: value => value === '6.22.0',
+      license: 'GPL-2.0-or-later WITH Bootloader-exception',
+      noticePath: '_licenses/PyInstaller-COPYING.txt',
+    }],
+  ])
+  if (!Array.isArray(components) || components.length !== required.size) {
+    throw new Error('controller sidecar runtime component evidence is invalid')
+  }
+  const names = components.map(component => component?.name)
+  if (JSON.stringify(names) !== JSON.stringify([...required.keys()].sort())) {
+    throw new Error('controller sidecar runtime component evidence is invalid')
+  }
+  for (const component of components) {
+    const expected = required.get(component?.name)
+    const notice = component?.notice
+    if (expected === undefined
+      || Object.keys(component).sort().join(',') !== 'license,name,notice,version'
+      || component.version !== expected.version
+      || !expected.versionValid(component.version)
+      || component.license !== expected.license
+      || notice === null
+      || typeof notice !== 'object'
+      || Array.isArray(notice)
+      || Object.keys(notice).sort().join(',') !== 'bytes,path,sha256'
+      || notice.path !== expected.noticePath
+      || !Number.isSafeInteger(notice.bytes)
+      || notice.bytes <= 0
+      || typeof notice.sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(notice.sha256)) {
+      throw new Error('controller sidecar runtime component evidence is invalid')
+    }
+    const path = join(directory, ...notice.path.split('/'))
+    await assertRegularFile(path, `controller sidecar ${component.name} notice`)
+    const bytes = await readFile(path)
+    if (bytes.length !== notice.bytes || sha256(bytes) !== notice.sha256) {
+      throw new Error(`controller sidecar ${component.name} notice differs from its manifest`)
+    }
+  }
+}
+
 export async function validateSidecarEvidence(directory, evidence, options) {
   const expectedPlatform = options.platform === 'darwin'
     ? { system: 'Darwin', machine: 'arm64' }
@@ -275,6 +473,10 @@ export async function validateSidecarEvidence(directory, evidence, options) {
       throw new Error(`controller sidecar source hash differs: ${relativePath}`)
     }
   }
+  await validateSidecarRuntimeComponents(directory, evidence.runtime_components, {
+    python: evidence.python,
+    pyinstaller: evidence.pyinstaller,
+  })
   const actual = await inventoryTree(directory, { platform: options.platform })
   const declaredFiles = evidence.files
   if (declaredFiles === null || typeof declaredFiles !== 'object' || Array.isArray(declaredFiles)) {
@@ -405,6 +607,174 @@ export async function assertPreviewEntrypoints(root, platform) {
   }
 }
 
+export async function removeUnusedMacPrivacyDeclarations(plist) {
+  await assertRegularFile(plist, 'macOS Info.plist')
+  for (const key of UNUSED_MAC_PRIVACY_KEYS) {
+    await run('/usr/bin/plutil', ['-remove', key, plist], { allowFailure: true })
+  }
+  const result = await run('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plist])
+  const parsed = JSON.parse(result.stdout)
+  const remaining = UNUSED_MAC_PRIVACY_KEYS.filter(key => Object.hasOwn(parsed, key))
+  if (remaining.length !== 0) {
+    throw new Error(`macOS Info.plist retains unused privacy declarations: ${remaining.join(', ')}`)
+  }
+}
+
+export async function installElectronRuntimeEvidence(options) {
+  const electronDist = resolve(options.electronDist)
+  const resources = resolve(options.resources)
+  const executable = resolve(options.executable)
+  await assertRegularDirectory(electronDist, 'Electron distribution')
+  await assertRegularDirectory(resources, 'macOS app resources')
+  await assertRegularFile(executable, 'macOS Electron executable')
+  const versions = options.runtimeVersions ?? JSON.parse((await run(executable, [
+    '-p',
+    'JSON.stringify(process.versions)',
+  ], {
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    timeoutMs: 60_000,
+  })).stdout)
+  if (versions?.electron !== EXPECTED_ELECTRON
+    || typeof versions?.node !== 'string'
+    || !/^\d+\.\d+\.\d+$/.test(versions.node)
+    || typeof versions?.chrome !== 'string'
+    || !/^\d+\.\d+\.\d+\.\d+$/.test(versions.chrome)) {
+    throw new Error('Electron runtime identity is invalid')
+  }
+
+  const definitions = [
+    { source: 'LICENSE', path: ELECTRON_LICENSE_PATH },
+    { source: 'LICENSES.chromium.html', path: CHROMIUM_LICENSES_PATH },
+  ]
+  const notices = new Map()
+  for (const definition of definitions) {
+    const source = join(electronDist, definition.source)
+    const destination = join(resources, ...definition.path.split('/'))
+    await assertRegularFile(source, `Electron ${definition.source}`)
+    if (await exists(destination)) throw new Error(`Electron runtime notice already exists: ${definition.path}`)
+    await mkdir(dirname(destination), { recursive: true })
+    await cp(source, destination, { errorOnExist: true, force: false })
+    await chmod(destination, 0o644)
+    const bytes = await readFile(destination)
+    notices.set(definition.path, {
+      path: definition.path,
+      bytes: bytes.length,
+      sha256: sha256(bytes),
+    })
+  }
+  const evidence = {
+    schema_version: '1',
+    kind: 'StudioRuntimeComponents',
+    components: [
+      {
+        name: 'Chromium',
+        version: versions.chrome,
+        license: 'LicenseRef-Chromium-and-third-party-notices',
+        notices: [notices.get(CHROMIUM_LICENSES_PATH)],
+      },
+      {
+        name: 'Electron',
+        version: versions.electron,
+        license: 'MIT',
+        notices: [notices.get(ELECTRON_LICENSE_PATH)],
+      },
+      {
+        name: 'Node.js',
+        version: versions.node,
+        license: 'MIT',
+        notices: [notices.get(CHROMIUM_LICENSES_PATH)],
+      },
+    ],
+  }
+  const manifest = join(resources, MAC_RUNTIME_COMPONENTS_FILE)
+  if (await exists(manifest)) throw new Error('Electron runtime component manifest already exists')
+  await writeJson(manifest, evidence)
+  await chmod(manifest, 0o644)
+  await validateElectronRuntimeEvidence(resources, evidence)
+  return evidence
+}
+
+export async function validateElectronRuntimeEvidence(resources, evidence) {
+  const value = evidence ?? JSON.parse(await readFile(
+    join(resources, MAC_RUNTIME_COMPONENTS_FILE),
+    'utf8',
+  ))
+  const required = new Map([
+    ['Chromium', {
+      license: 'LicenseRef-Chromium-and-third-party-notices',
+      noticePath: CHROMIUM_LICENSES_PATH,
+      versionValid: version => typeof version === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(version),
+    }],
+    ['Electron', {
+      license: 'MIT',
+      noticePath: ELECTRON_LICENSE_PATH,
+      versionValid: version => version === EXPECTED_ELECTRON,
+    }],
+    ['Node.js', {
+      license: 'MIT',
+      noticePath: CHROMIUM_LICENSES_PATH,
+      versionValid: version => typeof version === 'string' && /^\d+\.\d+\.\d+$/.test(version),
+    }],
+  ])
+  if (value?.schema_version !== '1'
+    || value?.kind !== 'StudioRuntimeComponents'
+    || !Array.isArray(value?.components)
+    || value.components.length !== required.size
+    || JSON.stringify(value.components.map(component => component?.name))
+      !== JSON.stringify([...required.keys()].sort())) {
+    throw new Error('Electron runtime component evidence is invalid')
+  }
+  for (const component of value.components) {
+    const expected = required.get(component?.name)
+    if (expected === undefined
+      || Object.keys(component).sort().join(',') !== 'license,name,notices,version'
+      || component.license !== expected.license
+      || !expected.versionValid(component.version)
+      || !Array.isArray(component.notices)
+      || component.notices.length !== 1) {
+      throw new Error('Electron runtime component evidence is invalid')
+    }
+    const notice = component.notices[0]
+    if (notice === null
+      || typeof notice !== 'object'
+      || Array.isArray(notice)
+      || Object.keys(notice).sort().join(',') !== 'bytes,path,sha256'
+      || notice.path !== expected.noticePath
+      || !Number.isSafeInteger(notice.bytes)
+      || notice.bytes <= 0
+      || typeof notice.sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(notice.sha256)) {
+      throw new Error('Electron runtime component evidence is invalid')
+    }
+    const path = join(resolve(resources), ...notice.path.split('/'))
+    await assertRegularFile(path, `${component.name} runtime notice`)
+    const bytes = await readFile(path)
+    if (bytes.length !== notice.bytes || sha256(bytes) !== notice.sha256) {
+      throw new Error(`${component.name} runtime notice differs from its evidence`)
+    }
+  }
+  return value
+}
+
+export async function sealMacBundle(bundle) {
+  if (process.platform !== 'darwin') throw new Error('macOS ad-hoc sealing requires Darwin')
+  await assertRegularDirectory(bundle, 'macOS app bundle')
+  await run('/usr/bin/codesign', [
+    '--force',
+    '--deep',
+    '--sign',
+    '-',
+    '--timestamp=none',
+    bundle,
+  ], { timeoutMs: 300_000 })
+  await run('/usr/bin/codesign', [
+    '--verify',
+    '--deep',
+    '--strict',
+    bundle,
+  ], { timeoutMs: 300_000 })
+}
+
 async function stageMacBundle(electronDist, stagingRoot, deployed, sidecar, source, root) {
   const sourceBundle = join(electronDist, 'Electron.app')
   await assertRegularDirectory(sourceBundle, 'Electron.app')
@@ -422,16 +792,23 @@ async function stageMacBundle(electronDist, stagingRoot, deployed, sidecar, sour
     ['CFBundleExecutable', PRODUCT_NAME],
     ['CFBundleIdentifier', APP_ID],
     ['CFBundleName', PRODUCT_NAME],
-    ['CFBundleShortVersionString', source.app_version],
-    ['CFBundleVersion', source.app_version],
+    ['CFBundleIconFile', MAC_ICON_FILE],
+    ['CFBundleShortVersionString', MAC_BUNDLE_SHORT_VERSION],
+    ['CFBundleVersion', MAC_BUNDLE_BUILD_VERSION],
     ['LSApplicationCategoryType', 'public.app-category.productivity'],
     ['LSMinimumSystemVersion', '13.0'],
   ]) {
     await run('/usr/bin/plutil', ['-replace', key, '-string', value, plist])
   }
   await run('/usr/bin/plutil', ['-remove', 'ElectronAsarIntegrity', plist], { allowFailure: true })
+  await removeUnusedMacPrivacyDeclarations(plist)
   await run('/usr/bin/plutil', ['-replace', 'NSAppTransportSecurity.NSAllowsArbitraryLoads', '-bool', 'NO', plist])
+  await rm(join(resources, 'electron.icns'), { force: true })
+  await generateMacIcns(join(resources, MAC_ICON_FILE), {
+    source: join(root, 'apps', 'desktop', 'assets', 'app-icon.svg'),
+  })
   await installPayload(resources, deployed, sidecar, source, root)
+  await installElectronRuntimeEvidence({ electronDist, resources, executable })
   return bundle
 }
 
@@ -449,7 +826,299 @@ async function installPayload(resources, deployed, sidecar, source, root) {
   await cp(sidecar, join(resources, 'controller'), { recursive: true, verbatimSymlinks: true })
   await cp(join(root, 'LICENSE'), join(resources, 'LICENSE'))
   await cp(join(root, 'THIRD_PARTY_NOTICES.md'), join(resources, 'THIRD_PARTY_NOTICES.md'))
+  const deepseekLicense = join(resources, 'third_party', 'licenses', 'deepseek-harness-MIT.txt')
+  await mkdir(dirname(deepseekLicense), { recursive: true })
+  await cp(join(root, 'third_party', 'licenses', 'deepseek-harness-MIT.txt'), deepseekLicense)
+  await chmod(deepseekLicense, 0o644)
   await writeJson(join(resources, 'build-source.json'), source)
+}
+
+export async function installPackagedWorkspaceLicenses(deployed, root) {
+  const source = join(root, 'LICENSE')
+  await assertRegularFile(source, 'workspace Apache-2.0 license')
+  const sourceBytes = await readFile(source)
+  const definitions = [
+    ['@creative-loop2rsi/desktop', '.'],
+    ['@creative-loop2rsi/controller-bridge', 'node_modules/@creative-loop2rsi/controller-bridge'],
+    ['@creative-loop2rsi/model-gateway', 'node_modules/@creative-loop2rsi/model-gateway'],
+    ['@creative-loop2rsi/runtime-dsh', 'node_modules/@creative-loop2rsi/runtime-dsh'],
+  ]
+  for (const [name, relativePath] of definitions) {
+    const directory = relativePath === '.' ? deployed : join(deployed, ...relativePath.split('/'))
+    await assertRegularDirectory(directory, `packaged workspace component ${name}`)
+    const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
+    if (manifest?.name !== name || manifest?.license !== 'Apache-2.0') {
+      throw new Error(`packaged workspace license metadata is invalid: ${name}`)
+    }
+    const destination = join(directory, 'LICENSE')
+    if (await exists(destination)) {
+      const existing = await readFile(destination)
+      if (!existing.equals(sourceBytes)) {
+        throw new Error(`packaged workspace license bytes conflict: ${name}`)
+      }
+    } else {
+      await cp(source, destination, { errorOnExist: true, force: false })
+    }
+    await chmod(destination, 0o644)
+  }
+}
+
+export async function installPackagedDependencyNotices(deployed, workspace, options = {}) {
+  const mappings = options.mappings ?? PACKAGED_NOTICE_MAPPINGS
+  const sourceStore = resolve(options.sourceStore ?? join(workspace, 'node_modules', '.pnpm'))
+  const targets = await collectPhysicalNodePackageRoots(deployed, { includeRoot: true })
+  const sources = await collectPhysicalNodePackageRoots(sourceStore, { includeRoot: false })
+  const targetsByIdentity = packageRootsByIdentity(targets)
+  const sourcesByIdentity = packageRootsByIdentity(sources)
+  const provenanceMappings = []
+
+  for (const mapping of mappings) {
+    validatePackagedNoticeMapping(mapping)
+    const targetKey = `${mapping.target.name}\u0000${mapping.target.version}`
+    const targetRoots = targetsByIdentity.get(targetKey) ?? []
+    if (targetRoots.length === 0) {
+      throw new Error(`packaged notice target is missing: ${mapping.target.name}@${mapping.target.version}`)
+    }
+    let canonicalBytes
+    let sourceIdentity
+    if (mapping.source.kind === 'tracked') {
+      const source = join(workspace, ...mapping.source.file.split('/'))
+      await assertRegularFile(source, `tracked packaged notice source ${mapping.source.file}`)
+      canonicalBytes = await readFile(source)
+      if (sha256(canonicalBytes) !== mapping.source.sha256) {
+        throw new Error(`tracked packaged notice source hash differs: ${mapping.source.file}`)
+      }
+      sourceIdentity = {
+        kind: 'tracked-canonical-license',
+        file: mapping.source.file,
+        sha256: mapping.source.sha256,
+      }
+    } else if (mapping.source.kind === 'package') {
+      const sourceKey = `${mapping.source.name}\u0000${mapping.source.version}`
+      const sourceRoots = sourcesByIdentity.get(sourceKey) ?? []
+      if (sourceRoots.length === 0) {
+        throw new Error(`packaged notice source is missing: ${mapping.source.name}@${mapping.source.version}`)
+      }
+      for (const sourceRoot of sourceRoots) {
+        if (sourceRoot.manifest.license !== mapping.target.license
+          || packageRepositoryUrl(sourceRoot.manifest) !== mapping.target.repository) {
+          throw new Error(`packaged notice source identity is invalid: ${mapping.source.name}`)
+        }
+        const source = join(sourceRoot.directory, mapping.source.file)
+        await assertRegularFile(source, `packaged notice source ${mapping.source.name}/${mapping.source.file}`)
+        const bytes = await readFile(source)
+        if (sha256(bytes) !== mapping.source.sha256) {
+          throw new Error(`packaged notice source hash differs: ${mapping.source.name}/${mapping.source.file}`)
+        }
+        if (canonicalBytes !== undefined && !canonicalBytes.equals(bytes)) {
+          throw new Error(`packaged notice sources conflict: ${mapping.source.name}/${mapping.source.file}`)
+        }
+        canonicalBytes = bytes
+      }
+      sourceIdentity = {
+        kind: 'pinned-package-file',
+        component: `${mapping.source.name}@${mapping.source.version}`,
+        file: mapping.source.file,
+        sha256: mapping.source.sha256,
+      }
+    } else {
+      throw new Error(`packaged notice source kind is invalid: ${String(mapping.source.kind)}`)
+    }
+    const installations = []
+    const evidenceFiles = []
+    for (const targetRoot of targetRoots) {
+      if (targetRoot.manifest.license !== mapping.target.license
+        || packageRepositoryUrl(targetRoot.manifest) !== mapping.target.repository
+        || (mapping.target.declared_repository_directory !== undefined
+          && packageRepositoryDirectory(targetRoot.manifest)
+            !== mapping.target.declared_repository_directory)) {
+        throw new Error(`packaged notice target identity is invalid: ${mapping.target.name}`)
+      }
+      if ((await packageRootNotices(targetRoot.directory)).length !== 0) {
+        throw new Error(`packaged notice target unexpectedly already has a notice: ${mapping.target.name}`)
+      }
+      const destination = join(targetRoot.directory, mapping.destination)
+      await writeFile(destination, canonicalBytes, { flag: 'wx', mode: 0o644 })
+      if (sha256(await readFile(destination)) !== mapping.source.sha256) {
+        throw new Error(`packaged notice installation differs: ${mapping.target.name}`)
+      }
+      installations.push({
+        path: `${targetRoot.relativeDirectory}/${mapping.destination}`,
+        bytes: canonicalBytes.length,
+        sha256: mapping.source.sha256,
+      })
+      for (const evidence of mapping.evidence_files ?? []) {
+        const evidencePath = join(targetRoot.directory, evidence.file)
+        await assertRegularFile(evidencePath, `packaged component evidence ${mapping.target.name}/${evidence.file}`)
+        const bytes = await readFile(evidencePath)
+        if (sha256(bytes) !== evidence.sha256) {
+          throw new Error(`packaged component evidence hash differs: ${mapping.target.name}/${evidence.file}`)
+        }
+        evidenceFiles.push({
+          path: `${targetRoot.relativeDirectory}/${evidence.file}`,
+          bytes: bytes.length,
+          sha256: evidence.sha256,
+        })
+      }
+    }
+    provenanceMappings.push({
+      target: {
+        component: `${mapping.target.name}@${mapping.target.version}`,
+        license: mapping.target.license,
+        repository: mapping.target.repository,
+        ...(mapping.target.declared_repository_directory === undefined
+          ? {}
+          : { declared_repository_directory: mapping.target.declared_repository_directory }),
+      },
+      source: sourceIdentity,
+      ...(mapping.upstream === undefined ? {} : { upstream: mapping.upstream }),
+      installed_notices: installations.sort((left, right) => left.path < right.path ? -1 : 1),
+      evidence_files: evidenceFiles.sort((left, right) => left.path < right.path ? -1 : 1),
+    })
+  }
+
+  for (const target of targets) {
+    if (typeof target.manifest.license !== 'string' || target.manifest.license.trim() === '') {
+      throw new Error(`packaged Node component has no declared license: ${target.manifest.name}`)
+    }
+    if ((await packageRootNotices(target.directory)).length === 0) {
+      throw new Error(`packaged Node component has no canonical notice: ${target.manifest.name}@${target.manifest.version}`)
+    }
+  }
+  await writeJson(join(deployed, 'release-license-provenance.json'), {
+    schema_version: '1',
+    kind: 'PackagedLicenseProvenance',
+    mappings: provenanceMappings.sort((left, right) => (
+      left.target.component < right.target.component ? -1 : left.target.component > right.target.component ? 1 : 0
+    )),
+  })
+  await chmod(join(deployed, 'release-license-provenance.json'), 0o644)
+}
+
+async function collectPhysicalNodePackageRoots(root, options) {
+  const resolvedRoot = resolve(root)
+  await assertRegularDirectory(resolvedRoot, 'Node package closure root')
+  const realRoot = await realpath(resolvedRoot)
+  const result = []
+  const visit = async (directory, relativeDirectory) => {
+    if ((options.includeRoot === true && relativeDirectory === '.')
+      || isPhysicalNodePackageRoot(relativeDirectory)) {
+      const resolvedDirectory = await realpath(directory)
+      if (!inside(realRoot, resolvedDirectory)) throw new Error('Node package root escapes its closure')
+      const manifestPath = join(directory, 'package.json')
+      await assertRegularFile(manifestPath, `Node package root ${relativeDirectory}`)
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+      if (typeof manifest?.name !== 'string' || typeof manifest?.version !== 'string') {
+        throw new Error(`Node package root identity is invalid: ${relativeDirectory}`)
+      }
+      result.push({ directory, relativeDirectory, manifest })
+    }
+    for (const name of (await readdir(directory)).sort()) {
+      const path = join(directory, name)
+      const info = await lstat(path)
+      if (!info.isDirectory() || info.isSymbolicLink()) continue
+      await visit(path, relativeDirectory === '.' ? name : `${relativeDirectory}/${name}`)
+    }
+  }
+  await visit(resolvedRoot, '.')
+  return result
+}
+
+function isPhysicalNodePackageRoot(relativeDirectory) {
+  const segments = relativeDirectory.split('/')
+  const nodeModules = segments.lastIndexOf('node_modules')
+  if (nodeModules < 0) return false
+  const tail = segments.slice(nodeModules + 1)
+  return (tail.length === 1 && !tail[0].startsWith('.') && !tail[0].startsWith('@'))
+    || (tail.length === 2 && tail[0].startsWith('@') && !tail[1].startsWith('.'))
+}
+
+function packageRootsByIdentity(roots) {
+  const result = new Map()
+  for (const root of roots) {
+    const key = `${root.manifest.name}\u0000${root.manifest.version}`
+    const values = result.get(key) ?? []
+    values.push(root)
+    result.set(key, values)
+  }
+  return result
+}
+
+function packageRepositoryUrl(manifest) {
+  return typeof manifest.repository === 'string'
+    ? manifest.repository
+    : manifest.repository?.url
+}
+
+function packageRepositoryDirectory(manifest) {
+  return typeof manifest.repository === 'object' && manifest.repository !== null
+    ? manifest.repository.directory
+    : undefined
+}
+
+function validatePackagedNoticeMapping(mapping) {
+  const packageName = /^(?:@[A-Za-z0-9._~-]+\/)?[A-Za-z0-9._~-]+$/
+  const safeRelative = value => typeof value === 'string'
+    && value !== ''
+    && !isAbsolute(value)
+    && !value.split('/').some(segment => segment === '' || segment === '.' || segment === '..')
+  if (!packageName.test(mapping?.target?.name ?? '')
+    || typeof mapping?.target?.version !== 'string'
+    || mapping.target.version === ''
+    || typeof mapping?.target?.license !== 'string'
+    || mapping.target.license === ''
+    || typeof mapping?.target?.repository !== 'string'
+    || mapping.target.repository === ''
+    || !safeRelative(mapping?.destination)
+    || (mapping.target.declared_repository_directory !== undefined
+      && !safeRelative(mapping.target.declared_repository_directory))) {
+    throw new Error('packaged notice target mapping is invalid')
+  }
+  if (mapping.source?.kind === 'tracked') {
+    if (!safeRelative(mapping.source.file)
+      || !mapping.source.file.startsWith('third_party/licenses/')
+      || typeof mapping.source.sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(mapping.source.sha256)
+      || typeof mapping.upstream?.repository !== 'string'
+      || typeof mapping.upstream?.tag !== 'string'
+      || mapping.upstream.tag === ''
+      || (mapping.upstream?.tag_object !== undefined
+        && !/^[0-9a-f]{40}$/.test(mapping.upstream.tag_object))
+      || !/^[0-9a-f]{40}$/.test(mapping.upstream?.commit ?? '')
+      || !safeRelative(mapping.upstream?.path)
+      || !safeRelative(mapping.upstream?.verified_source_directory)) {
+      throw new Error('tracked canonical notice provenance is invalid')
+    }
+  } else if (mapping.source?.kind === 'package') {
+    if (!packageName.test(mapping.source?.name ?? '')
+      || typeof mapping.source?.version !== 'string'
+      || mapping.source.version === ''
+      || !safeRelative(mapping.source?.file)
+      || typeof mapping.source?.sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(mapping.source.sha256)
+      || mapping.upstream !== undefined) {
+      throw new Error('pinned package notice provenance is invalid')
+    }
+  } else {
+    throw new Error('packaged notice source kind is invalid')
+  }
+  for (const evidence of mapping.evidence_files ?? []) {
+    if (!safeRelative(evidence?.file)
+      || typeof evidence?.sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(evidence.sha256)) {
+      throw new Error('packaged notice evidence mapping is invalid')
+    }
+  }
+}
+
+async function packageRootNotices(directory) {
+  const result = []
+  for (const name of (await readdir(directory)).sort()) {
+    if (!PACKAGE_NOTICE_NAME.test(name)) continue
+    const info = await lstat(join(directory, name))
+    if (info.isFile() && !info.isSymbolicLink()) result.push(name)
+  }
+  return result
 }
 
 async function reduceDeployedApp(directory) {
@@ -467,6 +1136,7 @@ async function reduceDeployedApp(directory) {
     productName: raw.productName,
     version: raw.version,
     private: true,
+    license: raw.license,
     type: 'module',
     main: 'dist/main/index.js',
     dependencies: raw.dependencies,

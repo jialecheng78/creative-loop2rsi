@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import tempfile
@@ -8,12 +9,101 @@ from pathlib import Path
 
 from tools.build_controller_sidecar import (
     SIDECAR_NAME,
+    install_runtime_notices,
     inventory_sidecar_tree,
+    select_python_license,
+    sha256_file,
     validate_sidecar_executable,
 )
 
 
 class ControllerSidecarBuilderTests(unittest.TestCase):
+    def test_runtime_notices_are_copied_and_hash_bound_without_source_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sidecar-runtime-notices-") as temporary:
+            root = Path(temporary)
+            output = root / "sidecar"
+            sources = root / "sources"
+            output.mkdir()
+            sources.mkdir()
+            python_license = sources / "python-license.txt"
+            pyinstaller_license = sources / "pyinstaller-copying.txt"
+            python_license.write_bytes(b"synthetic CPython license\n")
+            pyinstaller_license.write_bytes(b"synthetic PyInstaller terms\n")
+
+            components = install_runtime_notices(
+                output,
+                "3.11.15",
+                "6.22.0",
+                python_license=python_license,
+                pyinstaller_license=pyinstaller_license,
+            )
+
+            self.assertEqual([item["name"] for item in components], ["CPython", "PyInstaller"])
+            encoded = json.dumps(components, sort_keys=True)
+            self.assertNotIn(str(root), encoded)
+            for component in components:
+                notice = component["notice"]
+                installed = output / str(notice["path"])
+                self.assertTrue(installed.is_file())
+                self.assertEqual(notice["bytes"], installed.stat().st_size)
+                self.assertEqual(notice["sha256"], sha256_file(installed))
+            files = inventory_sidecar_tree(output, "Darwin")
+            for component in components:
+                notice = component["notice"]
+                self.assertEqual(files[str(notice["path"])]["sha256"], notice["sha256"])
+
+            with self.assertRaisesRegex(RuntimeError, "already exists"):
+                install_runtime_notices(
+                    output,
+                    "3.11.15",
+                    "6.22.0",
+                    python_license=python_license,
+                    pyinstaller_license=pyinstaller_license,
+                )
+
+    def test_runtime_notices_reject_unpinned_builder_versions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sidecar-runtime-version-") as temporary:
+            output = Path(temporary)
+            notice = output / "notice.txt"
+            notice.write_text("synthetic\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unsupported CPython"):
+                install_runtime_notices(
+                    output,
+                    "3.12.1",
+                    "6.22.0",
+                    python_license=notice,
+                    pyinstaller_license=notice,
+                )
+            with self.assertRaisesRegex(RuntimeError, "unsupported PyInstaller"):
+                install_runtime_notices(
+                    output,
+                    "3.11.15",
+                    "6.21.0",
+                    python_license=notice,
+                    pyinstaller_license=notice,
+                )
+
+    def test_python_license_selects_windows_root_fallback_and_rejects_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sidecar-python-license-") as temporary:
+            base = Path(temporary)
+            windows_root_license = base / "LICENSE.txt"
+            stdlib_license = base / "Lib" / "LICENSE.txt"
+            windows_root_license.write_bytes(b"synthetic CPython terms\n")
+
+            self.assertEqual(
+                select_python_license([stdlib_license, windows_root_license], base),
+                windows_root_license,
+            )
+            stdlib_license.parent.mkdir()
+            stdlib_license.write_bytes(windows_root_license.read_bytes())
+            self.assertIn(
+                select_python_license([stdlib_license, windows_root_license], base),
+                {stdlib_license, windows_root_license},
+            )
+            stdlib_license.write_bytes(b"conflicting terms\n")
+            with self.assertRaisesRegex(RuntimeError, "conflicting"):
+                select_python_license([stdlib_license, windows_root_license], base)
+
     @unittest.skipIf(os.name == "nt", "symlink creation is not guaranteed on Windows CI")
     def test_symlinks_must_be_relative_strict_and_inside(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sidecar-builder-links-") as temporary:

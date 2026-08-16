@@ -3,6 +3,7 @@
   "productName": "Creative RSI Studio",
   "version": "1.0.0-alpha.1",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "main": "dist/main/index.js",
   "scripts": {
@@ -12,6 +13,7 @@
     "test": "vitest run",
     "start": "pnpm run build && electron .",
     "package:preview": "pnpm run build && node scripts/preview-build.mjs",
+    "package:release:macos": "node scripts/release-build.mjs",
     "smoke:packaged": "node scripts/packaged-smoke.mjs"
   },
   "dependencies": {
