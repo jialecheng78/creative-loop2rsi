@@ -1050,6 +1050,128 @@ export function isExpectedUnsignedSpctlAssessment(code, value) {
   return classifyAdhocSpctlAssessment(code, value) !== null
 }
 
+function parseStrictRawSpctlPlist(value) {
+  let offset = 0
+
+  const skipWhitespace = () => {
+    while (offset < value.length && /\s/.test(value[offset])) offset += 1
+  }
+  const consumeLiteral = (literal) => {
+    skipWhitespace()
+    if (!value.startsWith(literal, offset)) return false
+    offset += literal.length
+    return true
+  }
+  const consumePattern = (pattern) => {
+    skipWhitespace()
+    const match = pattern.exec(value.slice(offset))
+    if (match === null || match.index !== 0) return null
+    offset += match[0].length
+    return match[0]
+  }
+  const parseTextElement = (tag) => {
+    if (!consumeLiteral(`<${tag}>`)) return null
+    const closing = `</${tag}>`
+    const end = value.indexOf(closing, offset)
+    if (end === -1) return null
+    const text = value.slice(offset, end)
+    if (/[<&]/.test(text)) return null
+    offset = end + closing.length
+    return text
+  }
+  const parseValue = () => {
+    skipWhitespace()
+    if (value.startsWith('<dict>', offset)) return parseDictionary()
+    if (value.startsWith('<integer>', offset)) {
+      const integer = parseTextElement('integer')
+      return integer !== null && /^-?(?:0|[1-9]\d*)$/.test(integer)
+        ? { type: 'integer', value: integer }
+        : null
+    }
+    if (value.startsWith('<string>', offset)) {
+      const string = parseTextElement('string')
+      return string === null ? null : { type: 'string', value: string }
+    }
+    if (consumePattern(/^<true\s*\/>/) !== null) return { type: 'boolean', value: true }
+    if (consumePattern(/^<false\s*\/>/) !== null) return { type: 'boolean', value: false }
+    return null
+  }
+  const parseDictionary = () => {
+    if (!consumeLiteral('<dict>')) return null
+    const entries = new Map()
+    while (true) {
+      skipWhitespace()
+      if (value.startsWith('</dict>', offset)) {
+        offset += '</dict>'.length
+        return { type: 'dictionary', value: entries }
+      }
+      const key = parseTextElement('key')
+      if (key === null || entries.has(key)) return null
+      const entry = parseValue()
+      if (entry === null) return null
+      entries.set(key, entry)
+    }
+  }
+
+  skipWhitespace()
+  if (value.startsWith('<?xml', offset)
+    && !consumeLiteral('<?xml version="1.0" encoding="UTF-8"?>')) {
+    return null
+  }
+  skipWhitespace()
+  if (value.startsWith('<!DOCTYPE', offset)
+    && !consumeLiteral('<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">')) {
+    return null
+  }
+  if (!consumeLiteral('<plist version="1.0">')) return null
+  const root = parseDictionary()
+  if (root === null || !consumeLiteral('</plist>')) return null
+  skipWhitespace()
+  return offset === value.length ? root : null
+}
+
+function classifyRawAdhocSpctlPlist(value) {
+  const plist = parseStrictRawSpctlPlist(value)
+  if (plist === null) return null
+  const root = plist.value
+  const rootKeys = [...root.keys()]
+  const expectedRootKeys = new Set([
+    'assessment:authority',
+    'assessment:remote',
+    'assessment:verdict',
+  ])
+  if (rootKeys.length !== expectedRootKeys.size
+    || rootKeys.some(key => !expectedRootKeys.has(key))) {
+    return null
+  }
+  const authority = root.get('assessment:authority')
+  const remote = root.get('assessment:remote')
+  const verdict = root.get('assessment:verdict')
+  if (authority?.type !== 'dictionary'
+    || remote?.type !== 'boolean'
+    || verdict?.type !== 'boolean'
+    || verdict.value !== false) {
+    return null
+  }
+  const authorityKeys = [...authority.value.keys()]
+  const allowedAuthorityKeys = new Set([
+    'assessment:authority:flags',
+    'assessment:authority:source',
+  ])
+  if (authorityKeys.length < 1
+    || authorityKeys.length > allowedAuthorityKeys.size
+    || authorityKeys.some(key => !allowedAuthorityKeys.has(key))) {
+    return null
+  }
+  const flags = authority.value.get('assessment:authority:flags')
+  if (flags?.type !== 'integer' || flags.value !== '0') return null
+  const source = authority.value.get('assessment:authority:source')
+  if (source === undefined) return 'REJECTED_ADHOC_UNATTRIBUTED'
+  return source.type === 'string' && source.value.toLowerCase() === 'no usable signature'
+    ? 'REJECTED_UNSIGNED_EXPECTED'
+    : null
+}
+
 export function classifyAdhocSpctlAssessment(code, value, diagnostic = '') {
   if (code !== 3 || typeof value !== 'string' || typeof diagnostic !== 'string') return null
   const primary = value.trim()
@@ -1064,31 +1186,7 @@ export function classifyAdhocSpctlAssessment(code, value, diagnostic = '') {
   if (rawAssessment) {
     const diagnosticLines = detail.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
     const bareDiagnostic = diagnosticLines.length === 1 && /^.+:\s*rejected$/.test(diagnosticLines[0])
-    if (!bareDiagnostic
-      || !/<key>\s*assessment:verdict\s*<\/key>\s*<false\s*\/>/i.test(primary)
-      || !/<key>\s*assessment:authority\.flags\s*<\/key>\s*<integer>\s*0\s*<\/integer>/i.test(primary)
-      || !/<key>\s*assessment:remote\s*<\/key>\s*<(?:true|false)\s*\/>/i.test(primary)) {
-      return null
-    }
-    const keys = [...primary.matchAll(/<key>\s*([^<]+?)\s*<\/key>/gi)].map(match => match[1].trim())
-    const allowedKeys = new Set([
-      'assessment:authority.flags',
-      'assessment:authority:source',
-      'assessment:remote',
-      'assessment:verdict',
-    ])
-    if (keys.length < 3
-      || new Set(keys).size !== keys.length
-      || keys.some(key => !allowedKeys.has(key))) {
-      return null
-    }
-    const sourceKeyPresent = keys.includes('assessment:authority:source')
-    if (!sourceKeyPresent) return 'REJECTED_ADHOC_UNATTRIBUTED'
-    const rawSource = /<key>\s*assessment:authority:source\s*<\/key>\s*<string>\s*([^<]+?)\s*<\/string>/i
-      .exec(primary)?.[1]?.trim()
-    return rawSource?.toLowerCase() === 'no usable signature'
-      ? 'REJECTED_UNSIGNED_EXPECTED'
-      : null
+    return bareDiagnostic ? classifyRawAdhocSpctlPlist(primary) : null
   }
   const lines = assessment.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
   if (lines.length === 1 && /^.+:\s*rejected$/.test(lines[0])) {

@@ -55,6 +55,14 @@ const sharpReadmeFixture = join(
   'fixtures',
   'sharp-libvips-1.3.2-README.md',
 )
+const spctlRawFixture = join(
+  repositoryRoot,
+  'apps',
+  'desktop',
+  'tests',
+  'fixtures',
+  'spctl-adhoc-rejected-raw.plist',
+)
 const sharpVersionsBytes = Buffer.from(JSON.stringify({
   aom: '3.14.1',
   archive: '3.8.8',
@@ -398,7 +406,87 @@ describe('macOS release packaging', () => {
     )).rejects.toThrow('differs from its manifest')
   })
 
-  it('distinguishes explicit unsigned spctl evidence from an unattributed bare ad-hoc rejection', () => {
+  it('parses the preserved real-shape spctl raw plist without weakening rejection gates', async () => {
+    const raw = await readFile(spctlRawFixture, 'utf8')
+    expect(sha256(raw)).toBe('52a63c052ae3600589a533943b927731aa662849555b65c62ede1f929b922cae')
+    expect(classifyAdhocSpctlAssessment(
+      3,
+      raw,
+      '/Applications/Creative RSI Studio.app: rejected',
+    )).toBe('REJECTED_ADHOC_UNATTRIBUTED')
+
+    const authorityClose = '\t</dict>\n\t<key>assessment:remote</key>'
+    const withExplicitSource = raw.replace(authorityClose, [
+      '\t\t<key>assessment:authority:source</key>',
+      '\t\t<string>no usable signature</string>',
+      authorityClose,
+    ].join('\n'))
+    expect(withExplicitSource).not.toBe(raw)
+    expect(classifyAdhocSpctlAssessment(
+      3,
+      withExplicitSource,
+      '/Applications/Creative RSI Studio.app: rejected',
+    )).toBe('REJECTED_UNSIGNED_EXPECTED')
+
+    const mutations = [
+      raw.replace('assessment:authority:flags', 'assessment:authority.flags'),
+      raw.replace('<integer>0</integer>', '<integer>1</integer>'),
+      raw.replace('<integer>0</integer>', '<string>0</string>'),
+      raw.replace('<key>assessment:remote</key>\n\t<true/>', '<key>assessment:remote</key>\n\t<string>true</string>'),
+      raw.replace('<key>assessment:verdict</key>\n\t<false/>', '<key>assessment:verdict</key>\n\t<true/>'),
+      raw.replace(authorityClose, [
+        '\t\t<key>assessment:reason</key>',
+        '\t\t<string>policy denied</string>',
+        authorityClose,
+      ].join('\n')),
+      raw.replace('<key>assessment:verdict</key>', [
+        '<key>assessment:unknown</key>',
+        '\t<string>unexpected</string>',
+        '\t<key>assessment:verdict</key>',
+      ].join('\n')),
+      raw.replace('<integer>0</integer>', [
+        '<integer>0</integer>',
+        '\t\t<key>assessment:authority:flags</key>',
+        '\t\t<integer>0</integer>',
+      ].join('\n')),
+      raw.replace([
+        '\t<key>assessment:authority</key>',
+        '\t<dict>',
+        '\t\t<key>assessment:authority:flags</key>',
+        '\t\t<integer>0</integer>',
+        '\t</dict>',
+      ].join('\n'), [
+        '\t<key>assessment:authority:flags</key>',
+        '\t<integer>0</integer>',
+      ].join('\n')),
+    ]
+    expect(new Set(mutations).size).toBe(mutations.length)
+    for (const mutation of mutations) {
+      expect(mutation).not.toBe(raw)
+      expect(classifyAdhocSpctlAssessment(3, mutation, 'app: rejected')).toBeNull()
+    }
+    expect(classifyAdhocSpctlAssessment(
+      3,
+      withExplicitSource.replace('no usable signature', 'Unnotarized Developer ID'),
+      'app: rejected',
+    )).toBeNull()
+    expect(classifyAdhocSpctlAssessment(
+      3,
+      withExplicitSource,
+      'app: rejected\nreason=policy denied',
+    )).toBeNull()
+    expect(classifyAdhocSpctlAssessment(
+      3,
+      withExplicitSource.replace(authorityClose, [
+        '\t\t<key>assessment:reason</key>',
+        '\t\t<string>policy denied</string>',
+        authorityClose,
+      ].join('\n')),
+      'app: rejected',
+    )).toBeNull()
+  })
+
+  it('distinguishes explicit unsigned spctl evidence from an unattributed bare non-raw rejection', () => {
     expect(classifyAdhocSpctlAssessment(
       3,
       '/Applications/Creative RSI Studio.app: rejected',
@@ -408,46 +496,6 @@ describe('macOS release packaging', () => {
       'source=no usable signature',
     ].join('\n'))).toBe(true)
     expect(classifyAdhocSpctlAssessment(3, [
-      '<?xml version="1.0"?>',
-      '<plist><dict>',
-      '<key>assessment:authority.flags</key><integer>0</integer>',
-      '<key>assessment:remote</key><true/>',
-      '<key>assessment:verdict</key><false/>',
-      '<key>assessment:authority:source</key><string>no usable signature</string>',
-      '</dict></plist>',
-    ].join('\n'), 'app: rejected')).toBe('REJECTED_UNSIGNED_EXPECTED')
-    expect(classifyAdhocSpctlAssessment(3, [
-      '<?xml version="1.0"?>',
-      '<plist><dict>',
-      '<key>assessment:authority.flags</key><integer>0</integer>',
-      '<key>assessment:remote</key><true/>',
-      '<key>assessment:verdict</key><false/>',
-      '</dict></plist>',
-    ].join('\n'), '/Applications/Creative RSI Studio.app: rejected')).toBe('REJECTED_ADHOC_UNATTRIBUTED')
-    expect(classifyAdhocSpctlAssessment(3, [
-      '<plist><dict>',
-      '<key>assessment:authority.flags</key><integer>0</integer>',
-      '<key>assessment:remote</key><true/>',
-      '<key>assessment:verdict</key><false/>',
-      '<key>assessment:reason</key><string>policy denied</string>',
-      '</dict></plist>',
-    ].join('\n'), 'app: rejected')).toBeNull()
-    expect(classifyAdhocSpctlAssessment(3, [
-      '<plist><dict>',
-      '<key>assessment:authority.flags</key><integer>0</integer>',
-      '<key>assessment:remote</key><true/>',
-      '<key>assessment:verdict</key><false/>',
-      '</dict></plist>',
-    ].join('\n'), 'app: rejected\nreason=policy denied')).toBeNull()
-    expect(classifyAdhocSpctlAssessment(3, [
-      '<plist><dict>',
-      '<key>assessment:authority.flags</key><integer>0</integer>',
-      '<key>assessment:remote</key><true/>',
-      '<key>assessment:verdict</key><false/>',
-      '<key>assessment:authority:source</key><string>no usable signature</string>',
-      '</dict></plist>',
-    ].join('\n'), 'app: rejected\nunknown extra')).toBeNull()
-    expect(classifyAdhocSpctlAssessment(3, [
       'app: rejected',
       'source=no usable signature',
       'reason=policy denied',
@@ -455,6 +503,8 @@ describe('macOS release packaging', () => {
     expect(isExpectedUnsignedSpctlAssessment(1, 'app: rejected')).toBe(false)
     expect(isExpectedUnsignedSpctlAssessment(3, 'app: rejected\nsource=Unnotarized Developer ID')).toBe(false)
     expect(isExpectedUnsignedSpctlAssessment(3, 'app: rejected\nmalware detected')).toBe(false)
+    expect(isExpectedUnsignedSpctlAssessment(3, 'app: rejected\ndamaged bundle')).toBe(false)
+    expect(isExpectedUnsignedSpctlAssessment(3, 'app: rejected\ncertificate revoked')).toBe(false)
     expect(() => createDeliveryManifest({
       identity: { git_commit: 'a'.repeat(40), git_tree: 'b'.repeat(40) },
       mainArtifact: {
