@@ -360,11 +360,15 @@ class TracedController implements ControllerPort {
 class SyntheticCredentials implements CredentialStorePort {
   readAttempts = 0
 
-  isAvailable(): boolean { return true }
-  async status(): Promise<{ secureStorageAvailable: boolean; configured: boolean }> {
-    return { secureStorageAvailable: true, configured: true }
+  async status(): Promise<{
+    secureStorageAvailable: boolean
+    configured: boolean
+    persistence: 'protected'
+  }> {
+    return { secureStorageAvailable: true, configured: true, persistence: 'protected' }
   }
   async set(): Promise<void> {}
+  clearSession(): void {}
   async get(): Promise<string | null> {
     this.readAttempts += 1
     throw new Error('synthetic integration must not read a credential')

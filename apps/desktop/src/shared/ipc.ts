@@ -30,6 +30,8 @@ export type FeedbackAction = 'edit' | 'keep' | 'reject' | 'rewrite'
 export interface CredentialPublicStatus {
   readonly secureStorageAvailable: boolean
   readonly configured: boolean
+  /** `session` means Main-memory only and cannot survive process exit. */
+  readonly persistence: 'none' | 'protected' | 'session'
 }
 
 export interface WorkSnapshot {
@@ -150,6 +152,8 @@ export interface StudioStatus {
   readonly version: string
   readonly credential: 'not-configured' | 'configured'
   readonly secureStorageAvailable: boolean
+  /** Public projection of how the configured Key is retained; never contains the Key. */
+  readonly credentialPersistence: 'none' | 'protected' | 'session'
   readonly selectedModel: ModelChoice
   readonly runtime: RuntimeStatus
   readonly activeSystem: SystemSnapshot | null
@@ -161,6 +165,8 @@ export interface StudioStatus {
 
 export interface ConfigureCredentialInput {
   readonly apiKey: string
+  /** Explicit permission for Main-memory-only use when safeStorage is unavailable. */
+  readonly allowSessionOnly: boolean
 }
 
 export interface SelectModelInput {

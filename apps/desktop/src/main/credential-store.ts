@@ -16,6 +16,11 @@ export interface SafeStoragePort {
 export interface CredentialStatus {
   readonly secureStorageAvailable: boolean
   readonly configured: boolean
+  readonly persistence: 'none' | 'protected' | 'session'
+}
+
+export interface CredentialSetOptions {
+  readonly allowSessionOnly: boolean
 }
 
 export class CredentialStoreError extends Error {
@@ -32,11 +37,14 @@ export class CredentialStoreError extends Error {
  * Main-process-only DeepSeek credential storage.
  *
  * The public UI may consume `status`, `set`, and `delete`. `get` exists only for
- * the trusted Model Gateway and must never cross IPC.
+ * the trusted Model Gateway and must never cross IPC. When Electron safeStorage
+ * is unavailable, the validated value remains in this instance only and no
+ * credential file is created or modified.
  */
 export class EncryptedCredentialStore {
   private readonly directory: string
   private readonly credentialPath: string
+  private sessionCredential: string | null = null
 
   constructor(
     userDataPath: string,
@@ -50,6 +58,10 @@ export class EncryptedCredentialStore {
   }
 
   isAvailable(): boolean {
+    return this.sessionCredential !== null || this.isSecureStorageAvailable()
+  }
+
+  isSecureStorageAvailable(): boolean {
     try {
       return this.safeStorage.isEncryptionAvailable() === true
     } catch {
@@ -58,19 +70,33 @@ export class EncryptedCredentialStore {
   }
 
   async status(): Promise<CredentialStatus> {
-    const secureStorageAvailable = this.isAvailable()
-    if (!secureStorageAvailable) {
-      return { secureStorageAvailable: false, configured: false }
+    const secureStorageAvailable = this.isSecureStorageAvailable()
+    if (this.sessionCredential !== null) {
+      return { secureStorageAvailable, configured: true, persistence: 'session' }
     }
+    if (!secureStorageAvailable) {
+      return { secureStorageAvailable: false, configured: false, persistence: 'none' }
+    }
+    const configured = await this.hasUsableCiphertextFile()
     return {
       secureStorageAvailable: true,
-      configured: await this.hasUsableCiphertextFile(),
+      configured,
+      persistence: configured ? 'protected' : 'none',
     }
   }
 
-  async set(value: string): Promise<void> {
-    this.assertAvailable()
+  async set(value: string, options: CredentialSetOptions = { allowSessionOnly: false }): Promise<void> {
     validateApiKey(value)
+    if (!this.isSecureStorageAvailable()) {
+      if (options.allowSessionOnly !== true) {
+        throw new CredentialStoreError(
+          'UNAVAILABLE',
+          '系统安全存储不可用；只有明确选择“仅本次打开有效”后才能连接。',
+        )
+      }
+      this.sessionCredential = value
+      return
+    }
 
     let ciphertext: Buffer
     try {
@@ -84,11 +110,13 @@ export class EncryptedCredentialStore {
 
     await mkdir(this.directory, { recursive: true })
     await atomicWritePrivateFile(this.directory, this.credentialPath, ciphertext)
+    this.sessionCredential = null
   }
 
   /** Trusted Model Gateway use only. Never expose this method through IPC. */
   async get(): Promise<string | null> {
-    this.assertAvailable()
+    if (this.sessionCredential !== null) return this.sessionCredential
+    if (!this.isSecureStorageAvailable()) return null
     let ciphertext: Buffer
     try {
       const info = await lstat(this.credentialPath)
@@ -115,6 +143,7 @@ export class EncryptedCredentialStore {
   }
 
   async delete(): Promise<void> {
+    this.sessionCredential = null
     try {
       await rm(this.credentialPath, { force: true })
     } catch (error) {
@@ -122,10 +151,9 @@ export class EncryptedCredentialStore {
     }
   }
 
-  private assertAvailable(): void {
-    if (!this.isAvailable()) {
-      throw new CredentialStoreError('UNAVAILABLE', '系统安全存储不可用，凭证操作已阻止。')
-    }
+  /** Application shutdown hook. It deliberately leaves encrypted storage intact. */
+  clearSession(): void {
+    this.sessionCredential = null
   }
 
   private async hasUsableCiphertextFile(): Promise<boolean> {

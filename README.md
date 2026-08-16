@@ -27,7 +27,7 @@
   -> 立即开始创作
 ```
 
-应用不展示 Endpoint、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。Key 只由桌面主进程通过操作系统安全存储管理；作品和证据默认保留在本机。创作所需文本会发送到 DeepSeek 官方 API，完整边界见 [PRIVACY.md](PRIVACY.md)。
+应用不展示 Endpoint、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。Key 只由桌面主进程管理：系统安全存储可用时加密持久保存；不可用时，用户可以明确选择“仅本次验证并继续”，此时 Key 只保留在 Main 进程内存中，关闭后失效且不会写入凭证文件。作品和证据默认保留在本机。创作所需文本会发送到 DeepSeek 官方 API，完整边界见 [PRIVACY.md](PRIVACY.md)。
 
 ## 它解决什么问题
 

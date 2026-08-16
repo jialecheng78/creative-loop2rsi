@@ -104,6 +104,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .privacy-dot { flex: none; width: 7px; height: 7px; margin-top: 6px; border-radius: 50%; background: #7cc2a4; box-shadow: 0 0 0 4px rgba(124, 194, 164, .12); }
 
 .workspace { min-width: 0; padding: 48px clamp(32px, 5vw, 82px) 60px; background: var(--cream); }
+.session-credential-notice {
+  max-width: 1260px;
+  margin: 0 auto 28px;
+  padding: 11px 15px;
+  color: #6e572d;
+  border: 1px solid #d1b982;
+  border-radius: 11px;
+  background: #fff8e7;
+  font-size: 13px;
+  line-height: 1.6;
+}
 .centered-view { display: grid; min-height: calc(100vh - 108px); place-content: center; justify-items: center; color: var(--muted); }
 .loading-mark { width: 28px; height: 28px; border: 2px solid #c8d1cb; border-top-color: var(--green); border-radius: 50%; animation: spin .9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

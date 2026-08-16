@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import type { MethodCandidateSnapshot } from '../shared/ipc.js'
-import { App, LearningPage, NewMethodsPage } from './App.js'
+import { App, CredentialView, LearningPage, NewMethodsPage } from './App.js'
 import type { StudioViewStatus } from './renderer-api.js'
 
 describe('App shell', () => {
@@ -18,6 +18,32 @@ describe('App shell', () => {
   it('does not expose implementation vocabulary in the initial interface', () => {
     const html = renderToStaticMarkup(<App />)
     expect(html).not.toMatch(/Prompt|DAG|DSH|Token/u)
+  })
+
+  it('makes the session-only credential choice explicit when protected storage is unavailable', () => {
+    const unavailable = renderToStaticMarkup(
+      <CredentialView
+        error=""
+        message="可以继续"
+        onConfigured={() => undefined}
+        secureStorageAvailable={false}
+      />,
+    )
+    expect(unavailable).toContain('只保留在本次应用内存中')
+    expect(unavailable).toContain('关闭应用后失效')
+    expect(unavailable).toContain('>仅本次验证并继续</button>')
+
+    const protectedStorage = renderToStaticMarkup(
+      <CredentialView
+        error=""
+        message="可以继续"
+        onConfigured={() => undefined}
+        secureStorageAvailable
+      />,
+    )
+    expect(protectedStorage).toContain('由系统安全存储')
+    expect(protectedStorage).toContain('>验证并继续</button>')
+    expect(protectedStorage).not.toContain('>仅本次验证并继续</button>')
   })
 
   it('only offers crash-recovery adoption when Controller marks it pending', () => {

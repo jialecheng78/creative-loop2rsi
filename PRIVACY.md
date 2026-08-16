@@ -21,7 +21,9 @@ DeepSeek 如何处理 API 请求由其公开政策和用户与 DeepSeek 之间�
 
 - 创作系统、作品、反馈、finding、候选、评价、晋升和回滚证据；
 - 应用、Controller、DSH、Profile、模型和 `system_fingerprint` 等运行来源信息；
-- 经操作系统安全存储加密后的 API Key 密文。
+- 操作系统安全存储可用时，经其加密后的 API Key 密文。
+
+如果操作系统安全存储不可用，用户仍可主动选择连接，但 API Key 只保留在当前 Electron Main 进程内存中：不会创建或修改凭证文件，关闭或崩溃后即失效，下次打开必须重新输入。作品、反馈和其他本地证据仍按正常规则保存。
 
 模型的 `reasoning_content` 只在需要完成当前工具调用回合时暂存在内存，回合封存后不写入作品、证据或导出包。
 
@@ -31,8 +33,9 @@ DeepSeek 如何处理 API 请求由其公开政策和用户与 DeepSeek 之间�
 
 - Key 只由 Electron Main 进程读取；
 - Key 只在输入页内存中短暂停留，并通过一次性业务 IPC 交给 Main；Renderer 无法回读或持久化它，DSH Worker、Python Controller 和候选也拿不到明文 Key；
+- 系统安全存储可用时，Main 使用其加密并持久保存 Key；不可用时，Main 只在本次应用进程内存中持有已经验证的 Key，界面会明确提示“关闭即失效”；
 - Key 不进入环境变量、命令行、日志、崩溃报告、Session、Git 或导出包；
-- 删除 Key 会删除本地密文，但不会删除用户在 DeepSeek 平台创建的 Key；如怀疑泄露，仍应在 DeepSeek 平台撤销并轮换。
+- 删除 Key 会清除当前会话值并删除本地密文（如有），但不会删除用户在 DeepSeek 平台创建的 Key；如怀疑泄露，仍应在 DeepSeek 平台撤销并轮换。
 
 ## 导出和删除
 

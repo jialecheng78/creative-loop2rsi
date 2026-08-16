@@ -22,6 +22,7 @@ let mainWindow: BrowserWindow | undefined
 let removeIpc: (() => void) | undefined
 let service: StudioService | undefined
 let loopback: LoopbackModelGateway | undefined
+let credentialStore: EncryptedCredentialStore | undefined
 
 const preloadPath = fileURLToPath(new URL('../preload/index.cjs', import.meta.url))
 const workerPath = fileURLToPath(new URL('../worker/index.js', import.meta.url))
@@ -59,6 +60,7 @@ async function bootstrapDesktop(): Promise<void> {
 
   const userDataPath = app.getPath('userData')
   const credentials = new EncryptedCredentialStore(userDataPath, safeStorage)
+  credentialStore = credentials
   const settings = new SettingsStore(userDataPath)
   const startedLoopback = new LoopbackModelGateway({ keyStore: credentials })
   loopback = startedLoopback
@@ -156,6 +158,11 @@ async function runPackagedSmoke(window: BrowserWindow, activeService: StudioServ
 }
 
 async function shutdownDesktop(): Promise<void> {
+  const activeCredentials = credentialStore
+  credentialStore = undefined
+  // Drop an in-memory session Key before any other shutdown work.
+  activeCredentials?.clearSession()
+
   try {
     removeIpc?.()
   } catch {

@@ -12,6 +12,7 @@
 - 私密素材、凭证或本机路径被意外打包进公开树；
 - GitHub Actions 获得超出只读源码所需的权限。
 - API Key 出现在环境变量、命令行、Renderer、DSH Session、Controller、日志、崩溃报告或导出包；
+- 系统安全存储不可用时，会话 API Key 被写入磁盘、跨进程转交给 DSH/Controller，或在应用进程退出后仍可恢复；
 - Model Gateway 访问 DeepSeek 官方白名单以外的地址，或跟随跨域重定向；
 - Renderer 暴露任意 IPC、Shell、URL 或绝对路径能力；
 - Candidate/Evaluator 越权读取 production、held-out、晋升政策或 active release pointer；
@@ -36,7 +37,7 @@
 ## 使用者的隐私责任
 
 - Python Controller 不联网；桌面应用只有 Main 进程中的 Model Gateway 可以访问 DeepSeek 官方 API。创作输入与必要上下文会发送给 DeepSeek，详情见 [PRIVACY.md](PRIVACY.md)。
-- API Key 由操作系统安全存储保护。拥有同一系统账户或控制桌面主进程的恶意软件仍可能读取运行中的凭证，本项目不宣称抵御已控制本机账户的攻击者。
+- 操作系统安全存储可用时，API Key 由其加密保护；不可用时，应用会明确标为“仅本次打开有效”，Key 只在 Electron Main 进程内存中保留，关闭后需要重新输入。拥有同一系统账户或控制桌面主进程的恶意软件仍可能读取运行中的凭证，本项目不宣称抵御已控制本机账户的攻击者。
 - `loopctl.py` 会在指定位置写入项目状态和证据。运行前检查目标路径和文件权限。
 - 生成项目会忽略常见输入、输出和运行轨迹，但 `.gitignore` 不是访问控制。提交前仍应检查 `git status` 和公开树审计结果。
 - attempt 哈希用于发现意外或事后改写，不是加密签名，也不能抵御拥有本机写权限的攻击者。

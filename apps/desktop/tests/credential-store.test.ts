@@ -2,7 +2,8 @@ import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { DeepSeekGateway } from '@creative-loop2rsi/model-gateway'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   CredentialStoreError,
@@ -17,15 +18,32 @@ afterEach(async () => {
 })
 
 describe('EncryptedCredentialStore', () => {
-  it('fails closed when platform encryption is unavailable', async () => {
+  it('requires explicit session permission and loses the fallback on restart', async () => {
     const directory = await temporaryDirectory()
     const store = new EncryptedCredentialStore(directory, fakeSafeStorage(false))
+    const value = 'synthetic-session-credential'
 
     expect(store.isAvailable()).toBe(false)
-    await expect(store.status()).resolves.toEqual({ secureStorageAvailable: false, configured: false })
-    await expect(store.set('synthetic-credential-value')).rejects.toMatchObject({ code: 'UNAVAILABLE' })
-    await expect(store.get()).rejects.toMatchObject({ code: 'UNAVAILABLE' })
+    await expect(store.status()).resolves.toEqual({
+      secureStorageAvailable: false, configured: false, persistence: 'none',
+    })
+    await expect(store.set(value)).rejects.toMatchObject({ code: 'UNAVAILABLE' })
+    await expect(store.get()).resolves.toBeNull()
+
+    await store.set(value, { allowSessionOnly: true })
+    expect(store.isAvailable()).toBe(true)
+    await expect(store.status()).resolves.toEqual({
+      secureStorageAvailable: false, configured: true, persistence: 'session',
+    })
+    await expect(store.get()).resolves.toBe(value)
     await expect(readdir(directory)).resolves.toEqual([])
+
+    const restarted = new EncryptedCredentialStore(directory, fakeSafeStorage(false))
+    expect(restarted.isAvailable()).toBe(false)
+    await expect(restarted.status()).resolves.toEqual({
+      secureStorageAvailable: false, configured: false, persistence: 'none',
+    })
+    await expect(restarted.get()).resolves.toBeNull()
   })
 
   it('writes only ciphertext atomically with private permissions', async () => {
@@ -41,7 +59,9 @@ describe('EncryptedCredentialStore', () => {
     const bytes = await readFile(file)
     expect(bytes.toString('utf8')).not.toContain(value)
     expect(bytes.toString('utf8')).toContain('encrypted:')
-    await expect(store.status()).resolves.toEqual({ secureStorageAvailable: true, configured: true })
+    await expect(store.status()).resolves.toEqual({
+      secureStorageAvailable: true, configured: true, persistence: 'protected',
+    })
     await expect(store.get()).resolves.toBe(value)
     if (process.platform !== 'win32') {
       expect((await stat(file)).mode & 0o777).toBe(0o600)
@@ -69,10 +89,67 @@ describe('EncryptedCredentialStore', () => {
 
     await store.delete()
     await store.delete()
-    await expect(store.status()).resolves.toEqual({ secureStorageAvailable: true, configured: false })
+    await expect(store.status()).resolves.toEqual({
+      secureStorageAvailable: true, configured: false, persistence: 'none',
+    })
 
     storage.available = false
     await expect(store.delete()).resolves.toBeUndefined()
+  })
+
+  it('does not modify protected ciphertext while using a session override', async () => {
+    const directory = await temporaryDirectory()
+    const storage = fakeSafeStorage(true)
+    const store = new EncryptedCredentialStore(directory, storage)
+    await store.set('protected-value')
+    const [name] = await readdir(directory)
+    const file = join(directory, name ?? '')
+    const before = await readFile(file)
+
+    storage.available = false
+    await store.set('session-value', { allowSessionOnly: true })
+    await expect(store.get()).resolves.toBe('session-value')
+    expect(await readFile(file)).toEqual(before)
+
+    store.clearSession()
+    expect(store.isAvailable()).toBe(false)
+    storage.available = true
+    await expect(store.get()).resolves.toBe('protected-value')
+  })
+
+  it('presents the session value to the Main-owned Model Gateway without network access', async () => {
+    const directory = await temporaryDirectory()
+    const store = new EncryptedCredentialStore(directory, fakeSafeStorage(false))
+    const value = 'synthetic-session-gateway-key'
+    await store.set(value, { allowSessionOnly: true })
+    const fetch = vi.fn<typeof globalThis.fetch>(async (_input, init) => {
+      expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${value}`)
+      return new Response(JSON.stringify({ object: 'list', data: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    await expect(new DeepSeekGateway({ keyStore: store, fetch }).listModels()).resolves.toEqual({
+      object: 'list', data: [],
+    })
+    expect(fetch).toHaveBeenCalledOnce()
+    await expect(readdir(directory)).resolves.toEqual([])
+  })
+
+  it('never silently falls back when safeStorage reports available but encryption fails', async () => {
+    const directory = await temporaryDirectory()
+    const storage = fakeSafeStorage(true)
+    storage.encryptString = () => { throw new Error('synthetic encryption failure') }
+    const store = new EncryptedCredentialStore(directory, storage)
+
+    await expect(store.set('synthetic-value', { allowSessionOnly: true })).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+    })
+    await expect(store.status()).resolves.toEqual({
+      secureStorageAvailable: true, configured: false, persistence: 'none',
+    })
+    await expect(readdir(directory)).resolves.toEqual([])
   })
 })
 

@@ -35,7 +35,8 @@ export function registerIpc(
   })
   handle(IPC_CHANNELS.credentialsConfigure, boundary, args => {
     const [input] = oneArgument(args)
-    return service.configureCredential(validateCredentialInput(input).apiKey)
+    const credential = validateCredentialInput(input)
+    return service.configureCredential(credential.apiKey, credential.allowSessionOnly)
   })
   handle(IPC_CHANNELS.credentialsDelete, boundary, args => {
     noArguments(args)

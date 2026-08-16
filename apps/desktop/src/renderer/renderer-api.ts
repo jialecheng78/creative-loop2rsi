@@ -70,8 +70,11 @@ export async function getStudioStatus(): Promise<StudioViewStatus> {
   return toViewStatus(await api().getStatus())
 }
 
-export async function configureCredential(key: string): Promise<StudioViewStatus> {
-  const result = await api().credentials.configure({ apiKey: key })
+export async function configureCredential(
+  key: string,
+  allowSessionOnly: boolean,
+): Promise<StudioViewStatus> {
+  const result = await api().credentials.configure({ apiKey: key, allowSessionOnly })
   if (!result.configured) throw new Error('连接信息没有通过验证。')
   return await getStudioStatus()
 }

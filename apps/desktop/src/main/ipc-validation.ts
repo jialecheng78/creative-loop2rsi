@@ -18,8 +18,14 @@ const RUN_ID_PATTERN = /^run-[0-9a-f-]+$/u
 const KEBAB_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
 
 export function validateCredentialInput(value: unknown): ConfigureCredentialInput {
-  const record = exactRecord(value, ['apiKey'], 'API Key')
-  return { apiKey: text(record.apiKey, 'API Key', 4096, false, false) }
+  const record = exactRecord(value, ['apiKey', 'allowSessionOnly'], 'API Key')
+  if (typeof record.allowSessionOnly !== 'boolean') {
+    throw new TypeError('会话连接授权必须是明确的布尔值。')
+  }
+  return {
+    apiKey: text(record.apiKey, 'API Key', 4096, false, false),
+    allowSessionOnly: record.allowSessionOnly,
+  }
 }
 
 export function validateModelInput(value: unknown): SelectModelInput {

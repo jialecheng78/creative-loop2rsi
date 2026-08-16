@@ -4,6 +4,7 @@ import type { CreativeRsiApi, StudioStatus } from '../src/shared/ipc.js'
 import {
   adoptNewMethod,
   compareNewMethod,
+  configureCredential,
   prepareNewMethod,
   rejectNewMethod,
   rollbackMethod,
@@ -14,6 +15,7 @@ const STATUS: StudioStatus = {
   version: '1.0.0-alpha.1',
   credential: 'configured',
   secureStorageAvailable: true,
+  credentialPersistence: 'protected',
   selectedModel: 'deepseek-v4-flash',
   runtime: { state: 'ready' },
   feedbackRecoveryState: 'none',
@@ -123,5 +125,34 @@ describe('renderer business adapter', () => {
     expect(candidates.reject).toHaveBeenCalledWith({ candidateId: 'method-two' })
     expect(rollback).toHaveBeenCalledWith({ version: 'baseline-v1' })
     expect(fakeApi.getStatus).toHaveBeenCalledTimes(5)
+  })
+
+  it('forwards an explicit session-only decision without exposing the key in status', async () => {
+    const configure = vi.fn(async () => ({
+      secureStorageAvailable: false,
+      configured: true,
+      persistence: 'session' as const,
+    }))
+    const fakeApi = {
+      getStatus: vi.fn(async () => ({
+        ...STATUS,
+        secureStorageAvailable: false,
+        credentialPersistence: 'session' as const,
+      })),
+      credentials: { configure },
+    } as unknown as CreativeRsiApi
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      value: { creativeRsi: fakeApi },
+    })
+
+    const transientValue = ['synthetic', 'transient', 'value'].join('-')
+    const status = await configureCredential(transientValue, true)
+
+    expect(configure).toHaveBeenCalledExactlyOnceWith({
+      apiKey: transientValue, allowSessionOnly: true,
+    })
+    expect(status.credentialPersistence).toBe('session')
+    expect(JSON.stringify(status)).not.toContain(transientValue)
   })
 })

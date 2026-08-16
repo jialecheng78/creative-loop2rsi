@@ -12,6 +12,7 @@
 - 示例必须为纯虚构内容，不使用真实未发表作品、客户材料、公司名称、内部域名、模型渠道、账号、密钥或本机绝对路径。
 - 应用只允许通过受信任的 Model Gateway 访问 `https://api.deepseek.com` 的 `/models` 与 `/chat/completions`；不得支持自定义 Base URL、代理或其他模型供应商。
 - API Key 只允许在用户录入时短暂存在于输入页内存，并立即通过一次性窄 IPC 交给桌面主进程；Renderer 不得持久化、回读或记录 Key。Key 的校验与操作系统安全存储只由主进程管理，且不得进入环境变量、命令行、DSH Session、Controller、作品目录、日志、崩溃报告、测试 fixture 或导出包。
+- 操作系统安全存储不可用时，可以在用户主动提交且界面明确说明“仅本次打开有效”后使用 Main 进程内存会话 Key；该 fallback 不得创建或修改凭证文件，不得把 Key 转交 DSH 或 Controller，删除连接、正常关闭、崩溃或进程退出后必须失效。安全存储可用时仍必须使用原加密持久路径，不得静默降级为会话保存。
 - DSH 受信 Profile 不得挂载持久 Session backend 或 checkpoint policy。固定 rc.6 会把 `reasoning` 分片无损写入 Session 日志，违反本项目“推理内容不落盘”的公开承诺；v1 只能从 Controller 已封存边界重新派发，不能宣称恢复未完成的模型回合。
 - 不接入遥测、云同步、后台任务、自动训练、自动公开作品或自动发布候选。
 - L0–L4 是实现目标；L5 必须标记为 `experimental / unvalidated`，且任何 L5 候选都不得自动晋升。

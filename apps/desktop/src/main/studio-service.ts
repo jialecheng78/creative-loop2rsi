@@ -87,7 +87,7 @@ export interface ControllerPort {
 }
 
 export interface CredentialStorePort extends Pick<EncryptedCredentialStore,
-  'delete' | 'get' | 'isAvailable' | 'set' | 'status'> {}
+  'clearSession' | 'delete' | 'set' | 'status'> {}
 
 export interface SettingsStorePort extends Pick<SettingsStore, 'load' | 'update'> {}
 
@@ -278,6 +278,7 @@ export class StudioService {
       version: this.options.appVersion,
       credential: credential.configured ? 'configured' : 'not-configured',
       secureStorageAvailable: credential.secureStorageAvailable,
+      credentialPersistence: credential.persistence,
       selectedModel: settings.selectedModel,
       runtime: this.options.runtime.status(),
       activeSystem,
@@ -290,15 +291,19 @@ export class StudioService {
     return publicCredentialStatus(await this.options.credentials.status())
   }
 
-  async configureCredential(apiKey: string): Promise<CredentialPublicStatus> {
+  async configureCredential(apiKey: string, allowSessionOnly: boolean): Promise<CredentialPublicStatus> {
     if (this.active !== undefined || this.launchInProgress || this.methodOperationInProgress || this.credentialMutationInProgress) {
       throw new StudioServiceError('WORK_ACTIVE', '请先结束当前创作，再更换 API Key。')
     }
     this.credentialMutationInProgress = true
     let candidate = apiKey
     try {
-      if (!this.options.credentials.isAvailable()) {
-        throw new StudioServiceError('SECURE_STORAGE_UNAVAILABLE', '系统安全存储不可用，API Key 未保存。')
+      const initialStatus = await this.options.credentials.status()
+      if (!initialStatus.secureStorageAvailable && !allowSessionOnly) {
+        throw new StudioServiceError(
+          'SECURE_STORAGE_UNAVAILABLE',
+          '系统安全存储不可用；如接受连接信息仅本次打开有效，请重新提交。',
+        )
       }
       let available: readonly ModelChoice[]
       try {
@@ -312,7 +317,7 @@ export class StudioService {
           '这个 Key 暂时无法使用 V4 Pro 和 V4 Flash，请检查 DeepSeek 账号权限。',
         )
       }
-      await this.options.credentials.set(candidate)
+      await this.options.credentials.set(candidate, { allowSessionOnly })
       return await this.credentialStatus()
     } finally {
       candidate = ''
@@ -325,6 +330,8 @@ export class StudioService {
       throw new StudioServiceError('CREDENTIAL_BUSY', '正在检查 API Key，请稍后再试。')
     }
     this.credentialMutationInProgress = true
+    // A user-requested delete revokes a session Key before cancellation or I/O.
+    this.options.credentials.clearSession()
     try {
       if (this.methodOperationInProgress) throw new StudioServiceError('METHOD_ACTIVE', '请等待新方式比较完成。')
       if (this.active !== undefined || this.launchInProgress) await this.cancelWork('active')
@@ -1972,6 +1979,7 @@ function publicCredentialStatus(value: CredentialStatus): CredentialPublicStatus
   return {
     secureStorageAvailable: value.secureStorageAvailable,
     configured: value.configured,
+    persistence: value.persistence,
   }
 }
 

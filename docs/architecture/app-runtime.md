@@ -8,7 +8,7 @@
 Sandboxed Renderer
     ↓ 白名单 IPC
 Electron Main / Trusted Supervisor
-    ├── Credential Store
+    ├── Credential Store（safeStorage 密文或 Main 内存会话）
     ├── Model Gateway
     ├── Evidence Sink
     ├── Python Controller sidecar
@@ -40,7 +40,9 @@ v1 的受信 Profile 只保留进程内 Session，不挂载 DSH JSONL persistenc
 - 请求 host 固定为 `api.deepseek.com`；
 - 只允许 `/models` 与 `/chat/completions`；
 - 不跟随跨 origin 重定向；
-- Key 只在用户录入的 Renderer 内存中短暂停留，提交后不回显、不持久化；Main 校验并加密保存，DSH、Controller 和候选永远拿不到明文 Key；
+- Key 只在用户录入的 Renderer 内存中短暂停留，提交后立即清空输入且不回显；Main 先通过官方 `/models` 校验，再按公开状态处理：`protected` 使用 safeStorage 加密持久保存，`session` 只保留在当前 Main 进程内存，`none` 表示没有可用 Key；
+- 只有 safeStorage 不可用且 Renderer 明确提交 `allowSessionOnly=true` 时才允许 `session`；该路径不创建或修改凭证文件，删除连接与 Main shutdown 都先清除内存引用，会话值在重启后不得恢复；如果没有另一个可用的 `protected` 密文，公开状态必须回到 `none`。safeStorage 可用但加密或写入失败时不得自动 fallback；
+- Main-owned Model Gateway 可以读取 `protected` 或 `session` Key；DSH、Controller 和候选永远拿不到明文 Key；
 - Worker 只获得有角色、模型和预算限制的 capability handle；
 - `reasoning_content` 只在需要的工具回合内存中保留；
 - 所有出入站日志先脱敏，再进入 Evidence Sink。

@@ -76,13 +76,14 @@ export function App(): React.JSX.Element {
       if (value.credential === 'configured') {
         setStep('ready')
         setMessage(recovery?.message
-          ?? (savedOutput === '' ? '已安全连接，可以开始创作。' : '已恢复上次保存的作品。'))
+          ?? (value.credentialPersistence === 'session'
+            ? '已连接；连接信息仅本次打开有效，关闭后需要重新输入。'
+            : savedOutput === '' ? '已安全连接，可以开始创作。' : '已恢复上次保存的作品。'))
       } else {
         setStep('credential')
-        if (!value.secureStorageAvailable) {
-          setError('这台设备暂时无法使用系统安全存储，因此不会保存连接信息。请先启用系统钥匙串或凭据保护，再重启应用。')
-        }
-        setMessage(recovery?.message ?? '连接后才能开始创作。')
+        setMessage(recovery?.message ?? (value.secureStorageAvailable
+          ? '连接后才能开始创作。'
+          : '系统安全存储不可用；可以只为本次打开连接，关闭后需要重新输入。'))
       }
     }).catch(caught => {
       if (!active) return
@@ -281,10 +282,16 @@ export function App(): React.JSX.Element {
   const content = step === 'loading'
     ? <LoadingView message={message} />
     : step === 'credential'
-      ? <CredentialView error={error} message={message} onConfigured={(nextStatus) => {
+      ? <CredentialView
+          error={error}
+          message={message}
+          secureStorageAvailable={status?.secureStorageAvailable ?? false}
+          onConfigured={(nextStatus) => {
           setStatus(nextStatus)
           setError('')
-          setMessage('连接成功。选择这次创作使用的方式。')
+          setMessage(nextStatus.credentialPersistence === 'session'
+            ? '连接成功；本次关闭应用后需要重新输入。请选择创作方式。'
+            : '连接成功。选择这次创作使用的方式。')
           setStep('model')
         }} />
       : step === 'model'
@@ -332,6 +339,11 @@ export function App(): React.JSX.Element {
         section={section}
       />
       <main className="workspace" id="main-content" tabIndex={-1}>
+        {status?.credentialPersistence === 'session'
+          ? <div className="session-credential-notice" role="status">
+              连接信息仅保留在本次应用内存中；关闭应用后失效，需要重新输入。
+            </div>
+          : null}
         {content}
       </main>
     </div>
@@ -384,10 +396,11 @@ function LoadingView({ message }: { readonly message: string }): React.JSX.Eleme
   )
 }
 
-function CredentialView(props: {
+export function CredentialView(props: {
   readonly error: string
   readonly message: string
   readonly onConfigured: (status: StudioViewStatus) => void
+  readonly secureStorageAvailable: boolean
 }): React.JSX.Element {
   const [key, setKey] = useState('')
   const [busy, setBusy] = useState(false)
@@ -396,19 +409,20 @@ function CredentialView(props: {
 
   async function submit(event: React.FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
-    const submittedKey = key
+    let submittedKey = key
     setKey('')
     setLocalError('')
-    if (submittedKey.trim() === '' || submittedKey !== submittedKey.trim()) {
-      setLocalError('请粘贴完整的 DeepSeek API Key，前后不要带空格。')
-      return
-    }
-    setBusy(true)
     try {
-      props.onConfigured(await configureCredential(submittedKey))
+      if (submittedKey.trim() === '' || submittedKey !== submittedKey.trim()) {
+        setLocalError('请粘贴完整的 DeepSeek API Key，前后不要带空格。')
+        return
+      }
+      setBusy(true)
+      props.onConfigured(await configureCredential(submittedKey, !props.secureStorageAvailable))
     } catch (caught) {
       setLocalError(actionableError(caught))
     } finally {
+      submittedKey = ''
       setBusy(false)
     }
   }
@@ -420,7 +434,9 @@ function CredentialView(props: {
       <p className="lead">你输入的创作主题和作品内容会发送给 DeepSeek 官方服务，用来完成创作。</p>
       <form className="setup-card" onSubmit={event => void submit(event)}>
         <label htmlFor="api-key">DeepSeek API Key</label>
-        <p className="field-help" id={descriptionId}>只用于连接官方服务，由系统安全存储；提交后不会在页面中显示。</p>
+        <p className="field-help" id={descriptionId}>{props.secureStorageAvailable
+          ? '只用于连接官方服务，由系统安全存储；提交后不会在页面中显示。'
+          : '系统安全存储不可用。Key 只保留在本次应用内存中，不写入磁盘；关闭应用后失效。'}</p>
         <input
           aria-describedby={descriptionId}
           autoComplete="off"
@@ -434,9 +450,13 @@ function CredentialView(props: {
           value={key}
         />
         <div className="setup-footer">
-          <p aria-live="polite" className="inline-status" role="status">{busy ? '正在验证并安全保存…' : props.message}</p>
+          <p aria-live="polite" className="inline-status" role="status">{busy
+            ? (props.secureStorageAvailable ? '正在验证并安全保存…' : '正在验证，仅为本次打开连接…')
+            : props.message}</p>
           <button className="primary-button" disabled={busy || key === ''} type="submit">
-            {busy ? '正在连接…' : '验证并继续'}
+            {busy
+              ? (props.secureStorageAvailable ? '正在连接…' : '正在进行本次连接…')
+              : (props.secureStorageAvailable ? '验证并继续' : '仅本次验证并继续')}
           </button>
         </div>
       </form>

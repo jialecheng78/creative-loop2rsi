@@ -29,9 +29,18 @@ describe('business IPC validation', () => {
     expect(() => validateStartWorkInput({ task: 'a'.repeat(100_001) })).toThrow()
   })
 
-  it('never accepts credential configuration fields besides the transient key', () => {
-    expect(validateCredentialInput({ apiKey: 'sk-example' })).toEqual({ apiKey: 'sk-example' })
-    expect(() => validateCredentialInput({ apiKey: 'sk-example', endpoint: 'https://example.invalid' })).toThrow()
+  it('requires an explicit session-only decision and accepts no other credential fields', () => {
+    expect(validateCredentialInput({ apiKey: 'sk-example', allowSessionOnly: false })).toEqual({
+      apiKey: 'sk-example', allowSessionOnly: false,
+    })
+    expect(validateCredentialInput({ apiKey: 'sk-example', allowSessionOnly: true })).toEqual({
+      apiKey: 'sk-example', allowSessionOnly: true,
+    })
+    expect(() => validateCredentialInput({ apiKey: 'sk-example' })).toThrow()
+    expect(() => validateCredentialInput({ apiKey: 'sk-example', allowSessionOnly: 'yes' })).toThrow()
+    expect(() => validateCredentialInput({
+      apiKey: 'sk-example', allowSessionOnly: true, endpoint: 'https://example.invalid',
+    })).toThrow()
   })
 
   it('binds feedback shape to its action', () => {

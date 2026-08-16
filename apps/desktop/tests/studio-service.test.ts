@@ -42,16 +42,38 @@ describe('StudioService governed alpha loop', () => {
     fixture.credentials.configured = true
     fixture.credentialValidator.mockRejectedValueOnce(new Error('synthetic network detail /private/path'))
 
-    await expect(fixture.service.configureCredential('bad-key')).rejects.toMatchObject({
+    await expect(fixture.service.configureCredential('bad-key', false)).rejects.toMatchObject({
       code: 'CREDENTIAL_CHECK_FAILED',
     })
     expect(fixture.credentials.value).toBe('old-key')
 
     fixture.credentialValidator.mockResolvedValueOnce(['deepseek-v4-pro', 'deepseek-v4-flash'])
-    const result = await fixture.service.configureCredential('new-key')
-    expect(result).toEqual({ secureStorageAvailable: true, configured: true })
+    const result = await fixture.service.configureCredential('new-key', false)
+    expect(result).toEqual({
+      secureStorageAvailable: true, configured: true, persistence: 'protected',
+    })
     expect(fixture.credentials.value).toBe('new-key')
     expect(JSON.stringify(result)).not.toContain('new-key')
+  })
+
+  it('uses an explicitly authorized Main-memory session key when protected storage is unavailable', async () => {
+    const fixture = await createFixture()
+    fixture.credentials.available = false
+
+    await expect(fixture.service.configureCredential('session-key', false)).rejects.toMatchObject({
+      code: 'SECURE_STORAGE_UNAVAILABLE',
+    })
+    expect(fixture.credentialValidator).not.toHaveBeenCalled()
+    expect(fixture.credentials.value).toBeNull()
+
+    fixture.credentialValidator.mockResolvedValueOnce(['deepseek-v4-pro', 'deepseek-v4-flash'])
+    const result = await fixture.service.configureCredential('session-key', true)
+    expect(result).toEqual({
+      secureStorageAvailable: false, configured: true, persistence: 'session',
+    })
+    expect(fixture.credentials.value).toBe('session-key')
+    expect(fixture.credentials.sessionOnly).toBe(true)
+    expect(JSON.stringify(result)).not.toContain('session-key')
   })
 
   it('creates a system only under userData/systems and restores its snapshot', async () => {
@@ -1069,15 +1091,34 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 class FakeCredentials implements CredentialStorePort {
   available = true
   configured = false
+  sessionOnly = false
   value: string | null = null
 
-  isAvailable(): boolean { return this.available }
-  async status(): Promise<{ secureStorageAvailable: boolean; configured: boolean }> {
-    return { secureStorageAvailable: this.available, configured: this.available && this.configured }
+  async status(): Promise<{
+    secureStorageAvailable: boolean
+    configured: boolean
+    persistence: 'none' | 'protected' | 'session'
+  }> {
+    return {
+      secureStorageAvailable: this.available,
+      configured: this.configured,
+      persistence: !this.configured ? 'none' : this.sessionOnly ? 'session' : 'protected',
+    }
   }
-  async set(value: string): Promise<void> { this.value = value; this.configured = true }
+  async set(value: string, options?: { readonly allowSessionOnly: boolean }): Promise<void> {
+    if (!this.available && options?.allowSessionOnly !== true) throw new Error('session permission required')
+    this.value = value
+    this.configured = true
+    this.sessionOnly = !this.available
+  }
   async get(): Promise<string | null> { return this.value }
-  async delete(): Promise<void> { this.value = null; this.configured = false }
+  clearSession(): void {
+    if (!this.sessionOnly) return
+    this.value = null
+    this.configured = false
+    this.sessionOnly = false
+  }
+  async delete(): Promise<void> { this.value = null; this.configured = false; this.sessionOnly = false }
 }
 
 class FakeSettings implements SettingsStorePort {
