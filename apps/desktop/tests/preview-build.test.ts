@@ -161,6 +161,34 @@ describe('preview build inventory', () => {
     expect(sha256(await readFile(join(repositoryRoot, pi.source.file)))).toBe(pi.source.sha256)
   })
 
+  it('does not read source storage or emit stale provenance when every mapped target is absent', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-absent-notice-targets-'))
+    temporary.push(root)
+    const deployed = join(root, 'deployed')
+    await mkdir(deployed)
+    await writeFile(join(deployed, 'package.json'), JSON.stringify({
+      name: '@creative-loop2rsi/desktop',
+      version: '1.0.0-alpha.1',
+      license: 'Apache-2.0',
+    }))
+    await writeFile(join(deployed, 'LICENSE'), 'synthetic app license\n')
+    const missingSourceStore = join(root, 'ambient-store-must-not-be-read')
+    await expect(installPackagedDependencyNotices(deployed, join(root, 'missing-workspace'), {
+      sourceStore: missingSourceStore,
+    })).resolves.toBeUndefined()
+    await expect(lstat(missingSourceStore)).rejects.toMatchObject({ code: 'ENOENT' })
+    const provenance = JSON.parse(await readFile(
+      join(deployed, 'release-license-provenance.json'),
+      'utf8',
+    ))
+    expect(provenance).toEqual({
+      schema_version: '1',
+      kind: 'PackagedLicenseProvenance',
+      mappings: [],
+    })
+    expect(JSON.stringify(provenance)).not.toContain('@img/sharp-libvips-darwin-arm64')
+  })
+
   it('installs a tracked canonical notice and fails closed on provenance or source drift', async () => {
     const root = await mkdtemp(join(tmpdir(), 'preview-canonical-notice-'))
     temporary.push(root)

@@ -42,6 +42,49 @@ const requiredDsh = [
   '@deepseek-ai/dsh-sdk-jsonrpc-demo',
   '@deepseek-ai/dsh-sdk-jsonrpc-server',
 ]
+const defaultFixtureMappingNames = [
+  '@aws-sdk/nested-clients',
+  '@earendil-works/pi-ai',
+  '@img/sharp-libvips-darwin-arm64',
+]
+const sharpReadmeFixture = join(
+  repositoryRoot,
+  'apps',
+  'desktop',
+  'tests',
+  'fixtures',
+  'sharp-libvips-1.3.2-README.md',
+)
+const sharpVersionsBytes = Buffer.from(JSON.stringify({
+  aom: '3.14.1',
+  archive: '3.8.8',
+  cairo: '1.18.4',
+  cgif: '0.5.3',
+  exif: '0.6.26',
+  expat: '2.8.2',
+  ffi: '3.6.0',
+  fontconfig: '2.18.1',
+  freetype: '2.14.3',
+  fribidi: '1.0.16',
+  glib: '2.89.1',
+  harfbuzz: '14.2.1',
+  heif: '1.23.1',
+  highway: '1.4.0',
+  imagequant: '2.4.1',
+  lcms: '2.19.1',
+  mozjpeg: '0826579',
+  pango: '1.58.0',
+  pixman: '0.46.4',
+  png: '1.6.58',
+  'proxy-libintl': '0.5',
+  rsvg: '2.62.90',
+  tiff: 'd01a94b',
+  uhdr: '1acdbed',
+  vips: '8.18.3',
+  webp: '1.6.0',
+  xml2: '2.15.3',
+  'zlib-ng': '2.3.3',
+}, null, 2))
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex')
@@ -87,7 +130,9 @@ afterEach(async () => {
   await Promise.all(temporary.splice(0).map(path => rm(path, { force: true, recursive: true })))
 })
 
-async function buildSyntheticPackagedEvidenceFixture() {
+async function buildSyntheticPackagedEvidenceFixture(options: {
+  readonly mappingNames?: readonly string[]
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), 'release-packaged-evidence-'))
   temporary.push(root)
   const app = join(root, 'Creative RSI Studio.app')
@@ -106,16 +151,12 @@ async function buildSyntheticPackagedEvidenceFixture() {
     }, `synthetic notice for ${name}\n`)
   }
 
-  const pinnedPackageRoot = (name: string, version: string) => join(
-    repositoryRoot,
-    'node_modules',
-    '.pnpm',
-    `${name.replace('/', '+')}@${version}`,
-    'node_modules',
-    ...name.split('/'),
-  )
+  const includedNames = new Set(options.mappingNames ?? defaultFixtureMappingNames)
+  const includedMappings = (PACKAGED_NOTICE_MAPPINGS as any[]).filter(mapping => (
+    includedNames.has(mapping.target.name)
+  ))
   const targetRoots = new Map<string, string>()
-  for (const mapping of PACKAGED_NOTICE_MAPPINGS as any[]) {
+  for (const mapping of includedMappings) {
     const variants = mapping.target.name === '@aws-sdk/nested-clients'
       || mapping.target.name === '@img/sharp-libvips-darwin-arm64'
       ? ['', '_peer-copy']
@@ -125,16 +166,17 @@ async function buildSyntheticPackagedEvidenceFixture() {
       if (variant === '') targetRoots.set(`${mapping.target.name}@${mapping.target.version}`, targetRoot)
       await writeSyntheticPackage(targetRoot, packagedManifestForMapping(mapping))
       for (const evidence of mapping.evidence_files ?? []) {
-        await cp(
-          join(pinnedPackageRoot(mapping.target.name, mapping.target.version), evidence.file),
-          join(targetRoot, evidence.file),
-        )
+        if (mapping.target.name !== '@img/sharp-libvips-darwin-arm64'
+          || evidence.file !== 'versions.json') {
+          throw new Error(`test fixture has no packaged evidence for ${mapping.target.name}/${evidence.file}`)
+        }
+        await writeFile(join(targetRoot, evidence.file), sharpVersionsBytes)
       }
     }
   }
 
   const workspace = join(root, 'workspace')
-  for (const mapping of PACKAGED_NOTICE_MAPPINGS as any[]) {
+  for (const mapping of includedMappings) {
     if (mapping.source.kind === 'tracked') {
       const destination = join(workspace, ...mapping.source.file.split('/'))
       await mkdir(dirname(destination), { recursive: true })
@@ -148,10 +190,12 @@ async function buildSyntheticPackagedEvidenceFixture() {
       license: mapping.target.license,
       repository: mapping.target.repository,
     })
-    await cp(
-      join(pinnedPackageRoot(mapping.source.name, mapping.source.version), mapping.source.file),
-      join(sourceRoot, mapping.source.file),
-    )
+    if (mapping.source.name !== '@img/sharp-libvips-darwin-arm64'
+      || mapping.source.version !== '1.3.2'
+      || mapping.source.file !== 'README.md') {
+      throw new Error(`test fixture has no pinned package source for ${mapping.source.name}`)
+    }
+    await cp(sharpReadmeFixture, join(sourceRoot, mapping.source.file))
   }
   await installPackagedDependencyNotices(payload, workspace)
 
@@ -217,7 +261,7 @@ async function buildSyntheticPackagedEvidenceFixture() {
     resources,
     sidecarManifest,
     provenancePath: join(payload, 'release-license-provenance.json'),
-    sharpRoot: targetRoots.get('@img/sharp-libvips-darwin-arm64@1.3.2')!,
+    sharpRoot: targetRoots.get('@img/sharp-libvips-darwin-arm64@1.3.2'),
   }
 }
 
@@ -476,6 +520,66 @@ describe('macOS release packaging', () => {
     },
   )
 
+  it('omits every absent canonical mapping from provenance, SBOM, licenses, and sharp limitations', async () => {
+    const fixture = await buildSyntheticPackagedEvidenceFixture({ mappingNames: [] })
+    const provenance = JSON.parse(await readFile(fixture.provenancePath, 'utf8'))
+    expect(provenance.mappings).toEqual([])
+    const evidence = await buildPackagedReleaseEvidence({
+      app: fixture.app,
+      sidecarManifest: fixture.sidecarManifest,
+    })
+    const serialized = JSON.stringify(evidence)
+    for (const mapping of PACKAGED_NOTICE_MAPPINGS as any[]) {
+      expect(serialized).not.toContain(mapping.target.name)
+      expect(serialized).not.toContain(mapping.source.sha256)
+    }
+    expect(evidence.licenses.evidence_granularity)
+      .toBe('physical-npm-package-roots-plus-explicit-runtime-components')
+    expect(evidence.licenses.known_limitations).toEqual([])
+    expect(evidence.licenses.components.some((component: any) => (
+      component.bom_ref.startsWith('aggregate:')
+    ))).toBe(false)
+    expect(evidence.sbom.properties.some((property: any) => property.name.includes('sharp-libvips')))
+      .toBe(false)
+  })
+
+  it('uses the exact final-closure mapping intersection and rejects stale, missing, or duplicate records', async () => {
+    const fixture = await buildSyntheticPackagedEvidenceFixture({
+      mappingNames: ['@aws-sdk/nested-clients'],
+    })
+    const evidence = await buildPackagedReleaseEvidence({
+      app: fixture.app,
+      sidecarManifest: fixture.sidecarManifest,
+    })
+    const serialized = JSON.stringify(evidence)
+    expect(serialized).toContain('@aws-sdk/nested-clients')
+    expect(serialized).not.toContain('@earendil-works/pi-ai')
+    expect(serialized).not.toContain('@img/sharp-libvips-darwin-arm64')
+    expect(evidence.licenses.known_limitations).toEqual([])
+
+    const provenance = JSON.parse(await readFile(fixture.provenancePath, 'utf8'))
+    expect(provenance.mappings.map((record: any) => record.target.component)).toEqual([
+      '@aws-sdk/nested-clients@3.997.42',
+    ])
+    for (const mappings of [
+      [],
+      [provenance.mappings[0], structuredClone(provenance.mappings[0])],
+      [
+        provenance.mappings[0],
+        {
+          ...structuredClone(provenance.mappings[0]),
+          target: { component: '@earendil-works/pi-ai@0.82.1' },
+        },
+      ],
+    ]) {
+      await writeJson(fixture.provenancePath, { ...provenance, mappings })
+      await expect(buildPackagedReleaseEvidence({
+        app: fixture.app,
+        sidecarManifest: fixture.sidecarManifest,
+      })).rejects.toThrow('packaged license provenance is invalid')
+    }
+  })
+
   it('builds path-free SBOM and license evidence from the final App package roots and explicit runtimes', async () => {
     const fixture = await buildSyntheticPackagedEvidenceFixture()
     const evidence = await buildPackagedReleaseEvidence({
@@ -596,7 +700,7 @@ describe('macOS release packaging', () => {
     })).rejects.toThrow('provenance component evidence')
     await writeJson(fixture.provenancePath, originalProvenance)
 
-    const versionsPath = join(fixture.sharpRoot, 'versions.json')
+    const versionsPath = join(fixture.sharpRoot!, 'versions.json')
     const originalVersions = await readFile(versionsPath)
     await writeFile(versionsPath, `${originalVersions.toString('utf8').trimEnd()} \n`)
     await expect(buildPackagedReleaseEvidence({
@@ -605,7 +709,7 @@ describe('macOS release packaging', () => {
     })).rejects.toThrow(/component evidence is invalid|versions\.json hash differs/)
     await writeFile(versionsPath, originalVersions)
 
-    const noticePath = join(fixture.sharpRoot, 'NOTICE.md')
+    const noticePath = join(fixture.sharpRoot!, 'NOTICE.md')
     const originalNotice = await readFile(noticePath)
     await writeFile(noticePath, Buffer.concat([originalNotice, Buffer.from('\n')]))
     await expect(buildPackagedReleaseEvidence({

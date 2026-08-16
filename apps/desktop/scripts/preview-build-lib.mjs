@@ -867,18 +867,20 @@ export async function installPackagedDependencyNotices(deployed, workspace, opti
   const mappings = options.mappings ?? PACKAGED_NOTICE_MAPPINGS
   const sourceStore = resolve(options.sourceStore ?? join(workspace, 'node_modules', '.pnpm'))
   const targets = await collectPhysicalNodePackageRoots(deployed, { includeRoot: true })
-  const sources = await collectPhysicalNodePackageRoots(sourceStore, { includeRoot: false })
   const targetsByIdentity = packageRootsByIdentity(targets)
+  for (const mapping of mappings) validatePackagedNoticeMapping(mapping)
+  const activeMappings = mappings.filter(mapping => (
+    (targetsByIdentity.get(`${mapping.target.name}\u0000${mapping.target.version}`) ?? []).length !== 0
+  ))
+  const sources = activeMappings.some(mapping => mapping.source.kind === 'package')
+    ? await collectPhysicalNodePackageRoots(sourceStore, { includeRoot: false })
+    : []
   const sourcesByIdentity = packageRootsByIdentity(sources)
   const provenanceMappings = []
 
-  for (const mapping of mappings) {
-    validatePackagedNoticeMapping(mapping)
+  for (const mapping of activeMappings) {
     const targetKey = `${mapping.target.name}\u0000${mapping.target.version}`
     const targetRoots = targetsByIdentity.get(targetKey) ?? []
-    if (targetRoots.length === 0) {
-      throw new Error(`packaged notice target is missing: ${mapping.target.name}@${mapping.target.version}`)
-    }
     let canonicalBytes
     let sourceIdentity
     if (mapping.source.kind === 'tracked') {

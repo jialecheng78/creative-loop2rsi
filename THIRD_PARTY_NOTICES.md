@@ -16,4 +16,4 @@ Creative RSI Studio 自有代码按根目录 [LICENSE](LICENSE) 中的 Apache-2.
 
 ## Release requirement
 
-每次预览或正式发布必须从最终 App 的实际 package roots、Electron runtime 与 Controller sidecar 生成组件清单和 SBOM，并复核安装包已携带的许可证与上游许可声明。`@img/sharp-libvips-darwin-arm64` 作为 aggregate 绑定其 `README.md` 的 29 条许可声明和 `versions.json` 的 28 个版本键；其中 `libnsgif` 只出现在 README，上游未在该 `versions.json` 声明版本。这只证明原包中的版本与上游声明，不代表 alpha 已提供每个内嵌库的完整许可证文本。该 component-level license completeness 为 alpha 已知非阻断缺口。本文不是传递依赖的静态穷举，不能替代 Release 产物审计。
+每次预览或正式发布必须从最终 App 的实际 package roots、Electron runtime 与 Controller sidecar 生成组件清单和 SBOM，并复核安装包已携带的许可证与上游许可声明。canonical notice 只能对最终 physical closure 中实际存在的 target 补装，不得因 workspace/pnpm store 残留而把未分发组件带入 App 或证据。若最终 App 实际包含 `@img/sharp-libvips-darwin-arm64`，则将它作为 aggregate 绑定其 `README.md` 的 29 条许可声明和 `versions.json` 的 28 个版本键；其中 `libnsgif` 只出现在 README，上游未在该 `versions.json` 声明版本。这只证明原包中的版本与上游声明，不代表 alpha 已提供每个内嵌库的完整许可证文本。该 component-level license completeness 只在分发该 aggregate 时成为 alpha 已知非阻断缺口。本文不是传递依赖的静态穷举，不能替代 Release 产物审计。

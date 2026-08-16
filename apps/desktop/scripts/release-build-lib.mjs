@@ -499,6 +499,7 @@ export async function buildPackagedReleaseEvidence(options) {
   }))
   const licenseProvenance = await validatePackagedLicenseProvenance(app, nodePackages)
   const aggregateComponents = await collectSharpLibvipsAggregate(app, nodePackages)
+  const includesSharpAggregate = aggregateComponents.length !== 0
   const runtimeComponents = [
     ...electronEvidence.components.map(component => ({
       name: component.name,
@@ -587,12 +588,16 @@ export async function buildPackagedReleaseEvidence(options) {
     application_notices: applicationNotices,
     provenance_files: [licenseProvenance.file],
     dsh_production_closure: dshProductionClosure,
-    evidence_granularity: 'physical-npm-package-roots-plus-explicit-runtimes-plus-sharp-libvips-aggregate-declarations',
-    known_limitations: [{
-      component: `${SHARP_LIBVIPS_PACKAGE}@${SHARP_LIBVIPS_VERSION}`,
-      status: 'NON_BLOCKING_ALPHA_GAP',
-      scope: '29 upstream license declarations and 28 versions are bound; libnsgif has no version in versions.json and per-library complete license texts are not claimed',
-    }],
+    evidence_granularity: includesSharpAggregate
+      ? 'physical-npm-package-roots-plus-explicit-runtimes-plus-sharp-libvips-aggregate-declarations'
+      : 'physical-npm-package-roots-plus-explicit-runtime-components',
+    known_limitations: includesSharpAggregate
+      ? [{
+          component: `${SHARP_LIBVIPS_PACKAGE}@${SHARP_LIBVIPS_VERSION}`,
+          status: 'NON_BLOCKING_ALPHA_GAP',
+          scope: '29 upstream license declarations and 28 versions are bound; libnsgif has no version in versions.json and per-library complete license texts are not claimed',
+        }]
+      : [],
   }
   const sbom = createPackagedCycloneDx({
     nodePackages,
@@ -611,17 +616,21 @@ export async function validatePackagedLicenseProvenance(app, nodePackages) {
   const file = await appFileEvidence(app, relativePath)
   const value = JSON.parse(await readFile(join(app, ...relativePath.split('/')), 'utf8'))
   assertPathFreeEvidenceJson(value)
+  const packageIdentities = new Set(nodePackages.map(component => `${component.name}@${component.version}`))
+  const activeMappings = PACKAGED_NOTICE_MAPPINGS.filter(mapping => (
+    packageIdentities.has(`${mapping.target.name}@${mapping.target.version}`)
+  ))
   if (value?.schema_version !== '1'
     || value?.kind !== 'PackagedLicenseProvenance'
     || !Array.isArray(value?.mappings)
-    || value.mappings.length !== PACKAGED_NOTICE_MAPPINGS.length) {
+    || value.mappings.length !== activeMappings.length) {
     throw new Error('packaged license provenance is invalid')
   }
   const packagesByIdentity = new Map(nodePackages.map(component => [
     `${component.name}@${component.version}`,
     component,
   ]))
-  const expectedByIdentity = new Map(PACKAGED_NOTICE_MAPPINGS.map(mapping => [
+  const expectedByIdentity = new Map(activeMappings.map(mapping => [
     `${mapping.target.name}@${mapping.target.version}`,
     mapping,
   ]))
@@ -741,7 +750,7 @@ export async function collectSharpLibvipsAggregate(app, nodePackages) {
   const parent = nodePackages.find(component => (
     component.name === SHARP_LIBVIPS_PACKAGE && component.version === SHARP_LIBVIPS_VERSION
   ))
-  if (parent === undefined) throw new Error('sharp-libvips aggregate package is missing')
+  if (parent === undefined) return []
   const expectedKeys = Object.values(SHARP_LIBVIPS_AGGREGATE_VERSION_KEYS)
     .filter(value => value !== null)
     .sort()
@@ -954,12 +963,16 @@ export function createPackagedCycloneDx(input) {
     properties: [
       {
         name: 'creative-rsi:evidence-granularity',
-        value: 'physical-npm-package-roots-plus-explicit-runtimes-plus-sharp-libvips-aggregate-declarations',
+        value: aggregate.length === 0
+          ? 'physical-npm-package-roots-plus-explicit-runtime-components'
+          : 'physical-npm-package-roots-plus-explicit-runtimes-plus-sharp-libvips-aggregate-declarations',
       },
-      {
-        name: 'creative-rsi:sharp-libvips-aggregate-limitation',
-        value: '29 upstream license declarations and 28 versions are bound; libnsgif has no version in versions.json and per-library complete license texts are not claimed',
-      },
+      ...(aggregate.length === 0
+        ? []
+        : [{
+            name: 'creative-rsi:sharp-libvips-aggregate-limitation',
+            value: '29 upstream license declarations and 28 versions are bound; libnsgif has no version in versions.json and per-library complete license texts are not claimed',
+          }]),
       { name: 'creative-rsi:dsh-production-closure', value: input.dshProductionClosure.join(',') },
     ],
   }
