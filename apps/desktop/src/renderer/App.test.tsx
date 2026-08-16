@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import type { MethodCandidateSnapshot } from '../shared/ipc.js'
-import { App, CredentialView, LearningPage, NewMethodsPage } from './App.js'
+import { App, BlindComparison, CredentialView, LearningPage, NewMethodsPage } from './App.js'
 import type { StudioViewStatus } from './renderer-api.js'
 
 describe('App shell', () => {
@@ -236,7 +236,30 @@ describe('App shell', () => {
     expect(html.match(/tabindex="0"/gu)).toHaveLength(2)
     expect(html).toContain('aria-label="版本 A 正文"')
     expect(html).toContain('aria-label="版本 B 正文"')
+    expect(html).toContain('data-comparison-phase="targeted"')
     expect(html).toContain('正文较长时，请在 A/B 正文框内滚动至末尾再选择。')
+
+    const nextPhase = renderCandidate({
+      status: 'EVALUATING',
+      ready: false,
+      completedGenerationCount: 4,
+      comparisons: [
+        { phase: 'targeted', left: 'A 正文', right: 'B 正文', choice: 'A' },
+        { phase: 'regression', left: '回归 A', right: '回归 B', choice: null },
+        { phase: 'heldout', left: '留出 A', right: '留出 B', choice: null },
+      ],
+    })
+    expect(nextPhase).toContain('data-comparison-phase="regression"')
+    expect(nextPhase).not.toContain('data-comparison-phase="targeted"')
+  })
+
+  it('gives each blind-comparison phase a different React root key so scroll positions reset', () => {
+    const targeted = BlindComparison({ left: 'A', phase: 'targeted', right: 'B' })
+    const regression = BlindComparison({ left: 'A', phase: 'regression', right: 'B' })
+
+    expect(targeted.key).toBe('targeted')
+    expect(regression.key).toBe('regression')
+    expect(regression.key).not.toBe(targeted.key)
   })
 })
 
