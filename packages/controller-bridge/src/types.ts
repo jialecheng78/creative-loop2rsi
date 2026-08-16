@@ -1,4 +1,6 @@
 export const CONTROLLER_PROTOCOL_VERSION = "1" as const;
+export const CONTROLLER_MAX_OUTPUT_TOKENS = 32_768 as const;
+export const LEGACY_CONTROLLER_MAX_OUTPUT_TOKENS = 16_384 as const;
 
 export type JsonPrimitive = boolean | null | number | string;
 export type JsonValue = JsonPrimitive | JsonObject | readonly JsonValue[];
@@ -66,13 +68,25 @@ export interface TerminateWorkPayload {
   readonly outcome: "CANCELLED" | "FAILED";
   readonly reason: string;
   readonly error_code?: string;
-  readonly runtime_provenance?: CompleteWorkRuntimeProvenance;
+  readonly runtime_provenance?: TerminationRuntimeProvenance;
 }
 
 export interface RuntimeProvenanceParameters {
   readonly thinking: "enabled";
   readonly reasoning_effort: "high";
-  readonly max_tokens: 16384;
+  readonly max_tokens: typeof CONTROLLER_MAX_OUTPUT_TOKENS;
+}
+
+export interface TerminationRuntimeProvenanceParameters {
+  readonly thinking: "enabled";
+  readonly reasoning_effort: "high";
+  /**
+   * 16384 is a terminate_work-only protocol compatibility value. Trusted Main
+   * uses it only to replay an older TERMINATION_REQUIRED pending-work intent.
+   */
+  readonly max_tokens:
+    | typeof CONTROLLER_MAX_OUTPUT_TOKENS
+    | typeof LEGACY_CONTROLLER_MAX_OUTPUT_TOKENS;
 }
 
 export interface RuntimeProvenanceUsage {
@@ -101,6 +115,13 @@ export interface CompleteWorkRuntimeProvenance {
   readonly system_fingerprint: string | null;
   readonly usage: RuntimeProvenanceUsage;
 }
+
+export type TerminationRuntimeProvenance = Omit<
+  CompleteWorkRuntimeProvenance,
+  "parameters"
+> & {
+  readonly parameters: TerminationRuntimeProvenanceParameters;
+};
 
 export interface RuntimeRequestProvenance {
   readonly request_number: number;

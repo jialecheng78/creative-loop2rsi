@@ -34,4 +34,13 @@ describe('trusted DSH profile', () => {
     const retryBlock = profile.slice(profile.indexOf('    retryPolicy:'), profile.indexOf('    models:'))
     expect(retryBlock).not.toMatch(/^\s*- (?:TIMEOUT|TRANSPORT)$/mu)
   })
+
+  it('pins high thinking to 32768 tokens without treating the ceiling as success', async () => {
+    const profile = await readFile(new URL('../profiles/studio.cordis.yml', import.meta.url), 'utf8')
+    expect(profile).toContain('thinking: enabled')
+    expect(profile).toContain('reasoningEffort: high')
+    expect(profile).toContain('maxTokensAsSuccess: false')
+    expect(profile.match(/^\s+maxTokens: 32768$/gmu)).toHaveLength(3)
+    expect(profile).not.toContain('maxTokens: 16384')
+  })
 })

@@ -7,6 +7,8 @@ import type {
 import type { CandidateTargetComponent, CreativeSystemAppViewModel } from "./system.js";
 
 export const PYTHON_GOVERNANCE_SOURCE_OF_TRUTH = "python-controller-on-disk" as const;
+export const CURRENT_RUNTIME_MAX_OUTPUT_TOKENS = 32_768 as const;
+export type RecordedRuntimeMaxOutputTokens = 16_384 | typeof CURRENT_RUNTIME_MAX_OUTPUT_TOKENS;
 
 export interface GoverningRecordBase<TSchemaVersion extends "0.1" | "1.0"> {
   readonly schema_version: TSchemaVersion;
@@ -39,7 +41,8 @@ export interface RuntimeProvenance extends GoverningRecordBase<"1.0"> {
   readonly parameters: {
     readonly thinking: "enabled";
     readonly reasoning_effort: "high";
-    readonly max_tokens: 16384;
+    /** Current records use 32768; 16384 remains readable as sealed historical evidence. */
+    readonly max_tokens: RecordedRuntimeMaxOutputTokens;
   };
   readonly usage: {
     readonly cache_hit_tokens?: number;

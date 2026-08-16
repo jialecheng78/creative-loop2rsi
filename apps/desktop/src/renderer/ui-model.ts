@@ -32,6 +32,9 @@ export function actionableError(error: unknown, code?: string): string {
   if (code === 'DEEPSEEK_TOTAL_TIMEOUT') {
     return `本次生成已达到十分钟上限${requestAttempts}。未完成内容不会保存；可以缩短任务后重新开始。`
   }
+  if (code === 'OUTPUT_TRUNCATED') {
+    return '模型达到本次生成上限，未完成内容没有保存。请缩短篇幅或拆成更小的任务后重新开始。'
+  }
   if (code === 'WORK_TERMINATION_PENDING') {
     return '生成已经停止，但失败记录还没有安全封存。请重启应用恢复；本次不会计为作品或学习证据。'
   }

@@ -85,10 +85,31 @@ LEGACY_APP_CANCELLED_REASONS = {
     "user-cancelled",
     "user-cancelled-during-launch",
 }
+CURRENT_MODEL_MAX_OUTPUT_TOKENS = 32768
+LEGACY_MODEL_MAX_OUTPUT_TOKENS = 16384
 
 
 class AppRequestError(RuntimeError):
     """An expected, user-actionable app bridge refusal."""
+
+
+def _uses_fixed_model_parameters(
+    parameters: Mapping[str, Any], max_output_tokens: int
+) -> bool:
+    return parameters == {
+        "thinking": "enabled",
+        "reasoning_effort": "high",
+        "max_tokens": max_output_tokens,
+    }
+
+
+def _method_epoch_uses_current_policy(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    parameters = value.get("parameters")
+    return isinstance(parameters, Mapping) and _uses_fixed_model_parameters(
+        parameters, CURRENT_MODEL_MAX_OUTPUT_TOKENS
+    )
 
 
 def _reject_sensitive_fields(value: Any, path: str = "request") -> None:
@@ -983,6 +1004,7 @@ def _persist_termination_provenance_locked(
         raw_provenance,
         run_id,
         require_completed=False,
+        allow_legacy_termination=True,
         fallback_created_at=dispatch.get("opened_at"),
         expected_context_sha256=_work_task_context_sha256(core, project, run_id),
     )
@@ -1464,6 +1486,7 @@ def _assert_existing_termination_matches_request(
         raw_provenance,
         run_id,
         require_completed=False,
+        allow_legacy_termination=True,
         fallback_created_at=dispatch.get("opened_at"),
         expected_context_sha256=_work_task_context_sha256(core, project, run_id),
     )
@@ -1675,6 +1698,7 @@ def _runtime_provenance(
     run_id: str,
     *,
     require_completed: bool = True,
+    allow_legacy_termination: bool = False,
     fallback_created_at: Optional[str] = None,
     expected_context_sha256: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1753,11 +1777,13 @@ def _runtime_provenance(
         "runtime_provenance.parameters",
         {"max_tokens", "reasoning_effort", "thinking"},
     )
-    if parameters != {
-        "thinking": "enabled",
-        "reasoning_effort": "high",
-        "max_tokens": 16384,
-    }:
+    current_policy = _uses_fixed_model_parameters(
+        parameters, CURRENT_MODEL_MAX_OUTPUT_TOKENS
+    )
+    legacy_termination = allow_legacy_termination and _uses_fixed_model_parameters(
+        parameters, LEGACY_MODEL_MAX_OUTPUT_TOKENS
+    )
+    if not current_policy and not legacy_termination:
         raise AppRequestError("runtime_provenance.parameters 与 v1 固定模型策略不一致")
     usage = _mapping(raw.get("usage"), "runtime_provenance.usage")
     allowed_usage = {
@@ -2498,11 +2524,10 @@ def _method_epoch_value(
         "method epoch parameters",
         {"max_tokens", "reasoning_effort", "thinking"},
     )
-    if parameters != {
-        "thinking": "enabled",
-        "reasoning_effort": "high",
-        "max_tokens": 16384,
-    }:
+    if not (
+        _uses_fixed_model_parameters(parameters, LEGACY_MODEL_MAX_OUTPUT_TOKENS)
+        or _uses_fixed_model_parameters(parameters, CURRENT_MODEL_MAX_OUTPUT_TOKENS)
+    ):
         raise AppRequestError("方法基线模型参数与 v1 固定策略不一致")
     value = {
         "method_version": method_version,
@@ -2764,7 +2789,10 @@ def _method_observations(core: Any, project: Path) -> list[Dict[str, Any]]:
                 "independent_works": len(works),
                 "independent_runs": len(runs),
                 "independent_tasks": len(tasks),
-                "ready_for_candidate": isinstance(cluster.get("epoch_sha256"), str)
+                "ready_for_candidate": _method_epoch_uses_current_policy(
+                    cluster.get("epoch")
+                )
+                and isinstance(cluster.get("epoch_sha256"), str)
                 and len(works) >= 3
                 and len(runs) >= 3
                 and len(tasks) >= 3,
@@ -4323,7 +4351,14 @@ def _candidate_context_value(
         ),
         None,
     )
-    if not isinstance(observation, dict) or observation.get("ready_for_candidate") is not True:
+    if not isinstance(observation, dict):
+        raise AppRequestError("这条观察尚未达到三个独立作品的候选门槛")
+    epoch = observation.get("epoch")
+    if isinstance(epoch, Mapping) and not _method_epoch_uses_current_policy(epoch):
+        raise AppRequestError(
+            "这条观察来自旧版 16384 输出策略，只能保留查看；请用当前固定 32768 策略重新积累三个独立作品"
+        )
+    if observation.get("ready_for_candidate") is not True:
         raise AppRequestError("这条观察尚未达到三个独立作品的候选门槛")
     evidence = observation.get("evidence")
     if not isinstance(evidence, list) or len(evidence) < 3:
@@ -4355,7 +4390,6 @@ def _candidate_context_value(
     if len({str(item["work_id"]) for item in works}) != 3:
         raise AppRequestError("候选来源必须是三个不同作品")
     current = _production_context_snapshot(core, project)
-    epoch = observation.get("epoch")
     epoch_sha256 = observation.get("epoch_sha256")
     if (
         not isinstance(epoch, dict)

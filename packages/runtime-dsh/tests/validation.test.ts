@@ -31,7 +31,7 @@ function spec(): DshRuntimeLaunchSpec {
       url: 'http://127.0.0.1:43123',
       token: 'a'.repeat(32),
     },
-    maxTokens: 16_384,
+    maxTokens: 32_768,
   }
 }
 
@@ -61,6 +61,11 @@ describe('runtime launch validation', () => {
     expect(env).not.toHaveProperty('RANDOM_SECRET')
     expect(env).not.toHaveProperty('HOME')
     expect(containsDeepSeekCredential(env)).toBe(false)
+  })
+
+  it('accepts the exact 32768 output ceiling and rejects values above it', () => {
+    expect(() => validateLaunchSpec(spec())).not.toThrow()
+    expect(() => validateLaunchSpec({ ...spec(), maxTokens: 32_769 })).toThrow(/32768/u)
   })
 
   it('scopes the official rc.6 anonymous id to the app-owned DSH home', async () => {

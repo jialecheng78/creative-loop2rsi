@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import {
   DeepSeekGateway,
   GatewayError,
+  MAX_DEEPSEEK_OUTPUT_TOKENS,
   type ApiKeyStore,
   type ChatCompletionRequest,
   type ChatStreamChunk,
@@ -275,7 +276,7 @@ export class LoopbackModelGateway {
         ...requestBody,
         thinking: { type: 'enabled' },
         reasoning_effort: 'high',
-        max_tokens: 16_384,
+        max_tokens: MAX_DEEPSEEK_OUTPUT_TOKENS,
       }
       abortScope = createRequestAbortScope(lease.abortController.signal, response)
       requestObservation = {

@@ -2,8 +2,10 @@ import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 
 import {
+  CONTROLLER_MAX_OUTPUT_TOKENS,
   CONTROLLER_OPERATIONS,
   CONTROLLER_PROTOCOL_VERSION,
+  LEGACY_CONTROLLER_MAX_OUTPUT_TOKENS,
   ControllerBridgeError,
   type ControllerBridgeOptions,
   type ControllerExecutable,
@@ -142,7 +144,11 @@ function optionalNonNegativeInteger(record: UnknownRecord, key: string): void {
   }
 }
 
-function validateRuntimeProvenance(rawValue: unknown, requireCompleted: boolean): void {
+function validateRuntimeProvenance(
+  rawValue: unknown,
+  requireCompleted: boolean,
+  allowLegacyTermination = false,
+): void {
   const provenance = asRecord(rawValue, "runtime_provenance");
   exactKeys(provenance, "runtime_provenance", [
     "app_version",
@@ -189,11 +195,12 @@ function validateRuntimeProvenance(rawValue: unknown, requireCompleted: boolean)
     "reasoning_effort",
     "max_tokens",
   ]);
-  if (
-    parameters.thinking !== "enabled" ||
-    parameters.reasoning_effort !== "high" ||
-    parameters.max_tokens !== 16_384
-  ) {
+  const currentPolicy = parameters.max_tokens === CONTROLLER_MAX_OUTPUT_TOKENS;
+  const legacyTermination = allowLegacyTermination
+    && parameters.max_tokens === LEGACY_CONTROLLER_MAX_OUTPUT_TOKENS;
+  if (parameters.thinking !== "enabled"
+    || parameters.reasoning_effort !== "high"
+    || (!currentPolicy && !legacyTermination)) {
     requestError("runtime_provenance.parameters 与固定模型策略不一致");
   }
 
@@ -381,7 +388,9 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
       if (outcome === "CANCELLED" && payload.error_code !== undefined) {
         requestError("CANCELLED terminate_work 不得提供 error_code");
       }
-      if (payload.runtime_provenance !== undefined) validateRuntimeProvenance(payload.runtime_provenance, false);
+      if (payload.runtime_provenance !== undefined) {
+        validateRuntimeProvenance(payload.runtime_provenance, false, true);
+      }
       return;
     }
     case "complete_work":

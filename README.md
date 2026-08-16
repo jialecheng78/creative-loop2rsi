@@ -27,7 +27,7 @@
   -> 立即开始创作
 ```
 
-应用不展示 Endpoint、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。Key 只由桌面主进程管理：系统安全存储可用时加密持久保存；不可用时，用户可以明确选择“仅本次验证并继续”，此时 Key 只保留在 Main 进程内存中，关闭后失效且不会写入凭证文件。作品和证据默认保留在本机。创作所需文本会发送到 DeepSeek 官方 API，完整边界见 [PRIVACY.md](PRIVACY.md)。
+应用不展示 Endpoint、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。模型请求固定使用 `thinking=enabled`、`reasoning_effort=high` 和单次最多 `32,768` 个总输出 token；达到上限仍记为 `OUTPUT_TRUNCATED`，不会把被截断内容封存为完整作品。Key 只由桌面主进程管理：系统安全存储可用时加密持久保存；不可用时，用户可以明确选择“仅本次验证并继续”，此时 Key 只保留在 Main 进程内存中，关闭后失效且不会写入凭证文件。作品和证据默认保留在本机。创作所需文本会发送到 DeepSeek 官方 API，完整边界见 [PRIVACY.md](PRIVACY.md)。
 
 ## 它解决什么问题
 
@@ -68,8 +68,8 @@
 | L5 修改 Judge、学习策略或改进控制器 | `UNVALIDATED` | 只生成 `CANDIDATE`；禁止自动晋升 |
 | 从 L0 到 L4、再证明晋升后运行 N 轮 | `IMPLEMENTED` | 分开 bootstrap 与 post-L4 计数；仍需真实人工门和独立评价者 |
 | Desktop monorepo、DeepSeek Gateway 与 DSH Adapter | `IMPLEMENTED` | 已通过 mock、协议、rc.6 启停探针、无 Key且零模型 fetch/lease 的 Electron 预检与 sandboxed Preload 真实 smoke；打包仍未验收 |
-| Electron Main → DSH → Gateway → Controller 的 Flash 创作、封存、重启恢复与本地取消边界 | `IMPLEMENTED` | macOS arm64 当前 headless build 已取得一次真实 Flash PASS；`quality_status=NOT_EVALUATED`，且本次未绑定忽略目录 build digest，不能外推为文学质量或可复现发布产物，见 [验收报告](docs/product/260815-Flash真实验收报告.md) |
-| Renderer / Preload / IPC 的普通用户 GUI 闭环 | `IMPLEMENTED` | macOS arm64 当前源码 build 已取得一次 Computer Use + 真实 Flash operational PASS；不是独立真人测试、安装包或可复现发布证据，见 [GUI 验收报告](docs/product/260815-Computer-Use-GUI验收报告.md) |
+| Electron Main → DSH → Gateway → Controller 的 Flash 创作、封存、重启恢复与本地取消边界 | `IMPLEMENTED` | macOS arm64 曾在历史 `max_tokens=16,384` epoch 取得一次真实 Flash PASS；当前固定 `32,768` 策略尚待本轮实网复验，旧结果不能作为新 epoch 的 live PASS，见 [验收报告](docs/product/260815-Flash真实验收报告.md) |
+| Renderer / Preload / IPC 的普通用户 GUI 闭环 | `IMPLEMENTED` | Computer Use + 真实 Flash operational PASS 属于历史 `16,384` epoch；当前 `32,768` 源码/打包应用尚待复验，且旧结果本来也不是独立真人测试或文学质量证明，见 [GUI 验收报告](docs/product/260815-Computer-Use-GUI验收报告.md) |
 | DSH 运行中 Session 的跨进程恢复 | `UNVALIDATED` | v1 主动禁用：rc.6 持久化会落盘 reasoning；只从 Controller 封存边界重新派发 |
 | 应用内跨作品重复反馈、候选三组盲比、采用与回滚 | `IMPLEMENTED` | 仅聚合三项独立作品中规范化后完全相同的直接反馈；评价者是本地用户，尚未做打包应用的独立模拟用户验收，也不改变正式 L0–L5 成熟度 |
 | 无签名 macOS / Windows 安装包 | `PROPOSED` | 当前只完成编译和 sidecar 预检；没有可下载的 DMG、EXE 或 portable ZIP |

@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve } from 'node:path'
 import { DshRuntimeError } from './errors.js'
 import {
   DSH_MODEL_IDS,
+  MAX_DSH_OUTPUT_TOKENS,
   RUNTIME_ROLES,
   type DshRuntimeLaunchSpec,
 } from './types.js'
@@ -60,7 +61,7 @@ export function validateLaunchSpec(spec: DshRuntimeLaunchSpec): void {
     throw new DshRuntimeError('INVALID_LAUNCH', 'DSH runtime 参数包含非法控制字符。')
   }
   if (spec.maxTokens !== undefined
-    && (!Number.isSafeInteger(spec.maxTokens) || spec.maxTokens < 1 || spec.maxTokens > 16_384)) {
-    throw new DshRuntimeError('INVALID_LAUNCH', 'maxTokens 必须是 1 到 16384 的整数。')
+    && (!Number.isSafeInteger(spec.maxTokens) || spec.maxTokens < 1 || spec.maxTokens > MAX_DSH_OUTPUT_TOKENS)) {
+    throw new DshRuntimeError('INVALID_LAUNCH', 'maxTokens 必须是 1 到 32768 的整数。')
   }
 }

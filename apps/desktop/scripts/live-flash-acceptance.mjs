@@ -659,7 +659,7 @@ function validateSuccessfulProvenance(provenance, snapshot, provenanceBytes) {
     || provenance.reasoning_content_persisted !== false
     || provenance.parameters?.thinking !== 'enabled'
     || provenance.parameters?.reasoning_effort !== 'high'
-    || provenance.parameters?.max_tokens !== 16_384
+    || provenance.parameters?.max_tokens !== 32_768
     || provenance.request_count !== provenance.requests?.length
     || provenance.completed_requests < 1
     || provenance.requests.some(item => item.status === 'STARTED')

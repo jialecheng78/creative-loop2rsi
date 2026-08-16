@@ -1,4 +1,5 @@
 export const DEEPSEEK_ORIGIN = "https://api.deepseek.com" as const;
+export const MAX_DEEPSEEK_OUTPUT_TOKENS = 32_768 as const;
 
 export type DeepSeekEndpoint = "/models" | "/chat/completions";
 

@@ -42,3 +42,8 @@ recognizes all three codes when rc.6 exposes them. Because rc.6 flattens an
 HTTP 5xx exhausted before the first stream event to `SERVER`, Main also reads
 the loopback request ledger and restores the precise timeout class before it
 is shown or committed; the runtime event alone is not authoritative.
+
+The trusted profile fixes thinking to `enabled`, reasoning effort to `high`,
+and the total output ceiling to 32,768 tokens for every Studio role. It keeps
+`maxTokensAsSuccess: false`, so reaching that ceiling remains
+`OUTPUT_TRUNCATED`; partial output cannot be promoted to a completed work.

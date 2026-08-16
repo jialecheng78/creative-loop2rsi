@@ -6,7 +6,7 @@
 
 - 只请求 `https://api.deepseek.com/models` 与 `https://api.deepseek.com/chat/completions`。
 - API Key 只从调用方提供的 `ApiKeyStore` 抽象读取；安全存储不可用时 fail closed。
-- 请求固定使用 `thinking: { type: "enabled" }` 与 `reasoning_effort: "high"`，`max_tokens` 不得超过 `16384`。
+- 请求固定使用 `thinking: { type: "enabled" }` 与 `reasoning_effort: "high"`，`max_tokens` 不得超过 `32768`；达到上限由 Runtime 归类为 `OUTPUT_TRUNCATED`，不能视为完整成功。
 - 通过请求次数、请求/响应字节数、SSE 单行大小和分层超时控制预算，不按价格累计。
 - completion 日志只含模型、fingerprint、request id、参数摘要与 token usage，不含消息正文或 `reasoning_content`。
 

@@ -19,7 +19,7 @@
     baseURL: !!js process.env.CREATIVE_RSI_GATEWAY_URL
     thinking: enabled
     reasoningEffort: high
-    maxTokens: 16384
+    maxTokens: 32768
     defaultContextWindow: 128000
     # Main owns the shorter 120s first-event, 90s stream-idle and 600s total
     # limits. This is only a fail-closed fallback if the loopback contract is
@@ -42,11 +42,11 @@
       - id: deepseek-v4-pro
         name: DeepSeek V4 Pro
         contextWindow: 128000
-        maxTokens: 16384
+        maxTokens: 32768
       - id: deepseek-v4-flash
         name: DeepSeek V4 Flash
         contextWindow: 128000
-        maxTokens: 16384
+        maxTokens: 32768
 
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'

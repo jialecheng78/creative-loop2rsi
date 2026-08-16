@@ -53,7 +53,7 @@ describe("Python governance boundary", () => {
       parameters: {
         thinking: "enabled",
         reasoning_effort: "high",
-        max_tokens: 16_384,
+        max_tokens: 32_768,
       },
       usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
       app_version: "1.0.0",
@@ -65,6 +65,12 @@ describe("Python governance boundary", () => {
     };
     expect(parsePythonGovernanceDocument(provenance)).toBe(provenance);
     expect("reasoning_content" in provenance).toBe(false);
+
+    const legacy: RuntimeProvenance = {
+      ...provenance,
+      parameters: { ...provenance.parameters, max_tokens: 16_384 },
+    };
+    expect(parsePythonGovernanceDocument(legacy)).toBe(legacy);
   });
 
   it("continues to require legacy 0.1 for PromotionRecord", () => {

@@ -44,6 +44,8 @@ v1 的受信 Profile 只保留进程内 Session，不挂载 DSH JSONL persistenc
 - 只有 safeStorage 不可用且 Renderer 明确提交 `allowSessionOnly=true` 时才允许 `session`；该路径不创建或修改凭证文件，删除连接与 Main shutdown 都先清除内存引用，会话值在重启后不得恢复；如果没有另一个可用的 `protected` 密文，公开状态必须回到 `none`。safeStorage 可用但加密或写入失败时不得自动 fallback；
 - Main-owned Model Gateway 可以读取 `protected` 或 `session` Key；DSH、Controller 和候选永远拿不到明文 Key；
 - Worker 只获得有角色、模型和预算限制的 capability handle；
+- Main、Gateway 与受信 DSH Profile 对所有角色固定使用 `thinking=enabled`、`reasoning_effort=high` 和单次最多 `32,768` 个总输出 token；DSH 保持 `maxTokensAsSuccess=false`，达到上限必须归类为 `OUTPUT_TRUNCATED`，不得封存部分输出；
+- Controller 继续只读识别旧版已封存证据中的 `max_tokens=16,384`。当前 Bridge 与 Controller 只在 `terminate_work` endpoint 接受这个旧值；endpoint 本身不验证 Main pending 文件来源，受信 Main 只能用它重放升级前已持久化的 `TERMINATION_REQUIRED` pending-work 及其幂等重试，以便收敛失败终态。`complete_work`、取消新写入、Builder、候选生成和评价仍只接受 `32,768`。输出预算变化属于方法基线参数变化，旧证据必须保留在原 epoch，旧观察只能展示且永远 `ready=false`，不能触发模型调用或与 `32,768` 的新作品合并计算改进；
 - `reasoning_content` 只在需要的工具回合内存中保留；
 - 所有出入站日志先脱敏，再进入 Evidence Sink。
 

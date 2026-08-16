@@ -30,7 +30,7 @@ describe('RuntimeWorkerManager process failure', () => {
       role: 'production',
       model: 'deepseek-v4-pro',
       gateway: { url: 'http://127.0.0.1:12345', token: 'x'.repeat(32) },
-      maxTokens: 16_384,
+      maxTokens: 32_768,
     })
 
     const handle = await manager.startRun('写一个场景')
@@ -69,7 +69,7 @@ describe('RuntimeWorkerManager process failure', () => {
       role: 'production',
       model: 'deepseek-v4-pro',
       gateway: { url: 'http://127.0.0.1:12345', token: 'x'.repeat(32) },
-      maxTokens: 16_384,
+      maxTokens: 32_768,
     })
 
     await manager.startRun('写一个场景')

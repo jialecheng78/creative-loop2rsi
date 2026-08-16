@@ -50,7 +50,7 @@ function completeWorkRequest(): ControllerRequest {
         parameters: {
           thinking: "enabled",
           reasoning_effort: "high",
-          max_tokens: 16_384,
+          max_tokens: 32_768,
         },
         profile_sha256: "a".repeat(64),
         request_count: 1,
@@ -172,7 +172,7 @@ describe("buildControllerWireRequest", () => {
       operation: "complete_work",
       payload: {
         runtime_provenance: {
-          parameters: { thinking: "enabled", reasoning_effort: "high", max_tokens: 16_384 },
+          parameters: { thinking: "enabled", reasoning_effort: "high", max_tokens: 32_768 },
         },
       },
     });
@@ -228,6 +228,51 @@ describe("buildControllerWireRequest", () => {
       operation: "terminate_work",
       payload: { outcome: "FAILED", error_code: "DEEPSEEK_TOTAL_TIMEOUT" },
     });
+  });
+
+  it("allows the legacy 16384 policy only for persisted terminate_work replay", () => {
+    const source = completeWorkRequest();
+    if (source.operation !== "complete_work") throw new Error("fixture operation mismatch");
+    const legacyProvenance = {
+      ...source.payload.runtime_provenance,
+      parameters: {
+        ...source.payload.runtime_provenance.parameters,
+        max_tokens: 16_384 as const,
+      },
+    };
+
+    const termination = buildControllerWireRequest({
+      request_id: "request-legacy-termination",
+      operation: "terminate_work",
+      payload: {
+        project: projectPath,
+        run_id: "run-one",
+        dispatch_id: "dispatch-one",
+        outcome: "FAILED",
+        reason: "runtime-failed-before-commit",
+        error_code: "OUTPUT_TRUNCATED",
+        runtime_provenance: legacyProvenance,
+      },
+    });
+    expect(termination.payload).toMatchObject({
+      runtime_provenance: { parameters: { max_tokens: 16_384 } },
+    });
+
+    expect(() => buildControllerWireRequest({
+      request_id: "request-legacy-cancel",
+      operation: "cancel_work",
+      payload: {
+        project: projectPath,
+        run_id: "run-one",
+        dispatch_id: "dispatch-one",
+        reason: "user-cancelled",
+        runtime_provenance: legacyProvenance,
+      },
+    } as never)).toThrowError(/固定模型策略/);
+    expect(() => buildControllerWireRequest({
+      ...source,
+      payload: { ...source.payload, runtime_provenance: legacyProvenance },
+    } as never)).toThrowError(/固定模型策略/);
   });
 
   it("keeps termination outcome and error code consistent", () => {
@@ -305,6 +350,20 @@ describe("buildControllerWireRequest", () => {
           parameters: {
             ...valid.payload.runtime_provenance.parameters,
             reasoning_effort: "medium",
+          },
+        },
+      },
+    } as never)).toThrowError(/固定模型策略/);
+
+    expect(() => buildControllerWireRequest({
+      ...valid,
+      payload: {
+        ...valid.payload,
+        runtime_provenance: {
+          ...valid.payload.runtime_provenance,
+          parameters: {
+            ...valid.payload.runtime_provenance.parameters,
+            max_tokens: 16_384,
           },
         },
       },

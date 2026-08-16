@@ -99,7 +99,7 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
       parameters: {
         thinking: 'enabled',
         reasoning_effort: 'high',
-        max_tokens: 16_384,
+        max_tokens: 32_768,
       },
     })
 

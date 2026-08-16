@@ -6,6 +6,7 @@ import { parseDeepSeekSse } from "./sse.js";
 import { assertDeepSeekUsage, normalizeUsage } from "./usage.js";
 import {
   DEEPSEEK_ORIGIN,
+  MAX_DEEPSEEK_OUTPUT_TOKENS,
   type ChatCompletionRequest,
   type ChatCompletionResponse,
   type ChatStreamEvent,
@@ -46,8 +47,6 @@ const ALLOWED_MESSAGE_FIELDS = new Set([
   "tool_calls",
   "reasoning_content",
 ]);
-const MAX_OUTPUT_TOKENS = 16_384;
-
 interface RequestContext {
   endpoint: DeepSeekEndpoint;
   requestNumber: number;
@@ -432,7 +431,7 @@ function validateChatRequest(
   validateOptionalFinite(request, "top_p");
   validateOptionalFinite(request, "frequency_penalty");
   validateOptionalFinite(request, "presence_penalty");
-  validateOptionalPositiveInteger(request, "max_tokens", MAX_OUTPUT_TOKENS);
+  validateOptionalPositiveInteger(request, "max_tokens", MAX_DEEPSEEK_OUTPUT_TOKENS);
   validateOptionalPositiveInteger(request, "top_logprobs");
   return request;
 }

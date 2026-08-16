@@ -1,8 +1,10 @@
 # Creative RSI Studio：Computer Use GUI 真实验收报告
 
+> 历史 epoch 注记（2026-08-16）：下述 GUI operational `PASS` 发生在固定 `thinking=enabled`、`reasoning_effort=high`、单次总输出上限 `16,384` 的旧策略。当前代码已固定为 `32,768`，尚未完成本轮实网 GUI 复验；历史结果不能替代当前基线验收。
+
 ## 结论
 
-限定范围内结论是 **`PASS`**：macOS arm64 当前本地源码 build 已通过一次由 Computer Use 模拟普通用户完成的真实 GUI 路径：输入并安全保存 DeepSeek Key、选择 V4 Flash、提交创作主题、取得作品、直接修改正文、提交文字反馈、封存版本，并在完整退出后的新 Electron 进程中恢复相同结果。
+限定范围内的历史结论是 **`PASS`**：macOS arm64 当时的本地源码 build 已通过一次由 Computer Use 模拟普通用户完成的真实 GUI 路径：输入并安全保存 DeepSeek Key、选择 V4 Flash、提交创作主题、取得作品、直接修改正文、提交文字反馈、封存版本，并在完整退出后的新 Electron 进程中恢复相同结果。
 
 这不是“真人测试”或 `FORWARD-TESTED`。执行者是有项目上下文的自动化 Agent；本次也没有覆盖安装包、Windows、Pro Chat、非程序员理解成本、文学质量、Candidate/Evaluator 或应用内 RSI 闭环。
 
@@ -52,7 +54,7 @@ Key 输入前取得了用户明确授权。Key 只粘贴到应用的密码输入
 - 完整退出并启动新 Electron 进程后，整树、运行来源、修订稿和加密凭证文件哈希全部不变；界面恢复 Flash、修订稿、已保存版本和已封存决定。
 - 重启只出现 Electron GPU、NetworkService 与 Renderer 进程，没有启动 DSH Worker；创作系统文件树没有任何写入，因此可以证明没有新的 DSH 创作 run 或作品版本。本次 GUI 重启没有绑定 Gateway request counter，不能仅凭这些现象证明所有网络请求为 0。
 
-四个入口均按当前能力诚实展示：
+四个入口均按当时能力诚实展示：
 
 | 入口 | 实际展示 |
 |---|---|
@@ -106,9 +108,10 @@ untracked repository Key matches: 0
 
 | 能力 | 本次状态 | 说明 |
 |---|---|---|
-| macOS arm64 源码 build 的 GUI Flash 首创作闭环 | operational PASS | 保持 `IMPLEMENTED`；不是独立执行、source-bound release 或真人验收 |
-| Preload / Renderer / Main 窄 IPC | operational PASS | 真实 Electron smoke + Computer Use 路径通过 |
-| GUI 编辑、反馈、封存与重启恢复 | operational PASS | 一次纯虚构任务通过；不证明长期稳定性 |
+| macOS arm64 旧 `16,384` 源码 build 的 GUI Flash 首创作闭环 | 历史 operational PASS | 只证明旧 epoch；不是当前 `32,768`、独立执行、source-bound release 或真人验收 |
+| 当前 `32,768` GUI Flash 首创作闭环 | `UNVALIDATED` | 输出策略变化建立了新基线，尚未实网 GUI 复验 |
+| Preload / Renderer / Main 窄 IPC | 历史 operational PASS | 当时真实 Electron smoke + Computer Use 路径通过；当前离线测试另行记录 |
+| GUI 编辑、反馈、封存与重启恢复 | 历史 operational PASS | 当时一次纯虚构任务通过；不证明当前实网基线或长期稳定性 |
 | Pro Chat | `UNVALIDATED` | 只在 `/models` 中发现，没有调用 Chat |
 | Windows GUI 与安装包 | `UNVALIDATED` | 未生成或运行 EXE / portable ZIP |
 | macOS 安装包 | `UNVALIDATED` | 本次从源码运行，不是 DMG / ZIP packaged app |
@@ -118,8 +121,9 @@ untracked repository Key matches: 0
 
 ## 下一步
 
-1. 建立 fresh-build manifest，把 HEAD、lockfile、实际工具链、Preload、Renderer、Main、DSH Profile 和 Controller sidecar 绑定到同一发布候选。
-2. 在 macOS arm64 与 Windows x64 packaged app 中复跑无 Key preload smoke 和首次创作路径。
-3. 单独调用一次 Pro；没有通过前保持 `UNVALIDATED`。
-4. 进行 5 名非程序员安装与首创作测试，和本次 Computer Use 证据分开统计。
-5. 之后再接跨作品 finding、候选三评估、用户采用和一键回滚；在那之前不宣称应用已实现 RSI 闭环。
+1. 用当前固定 `32,768` 策略重新完成一次 Flash 实网 headless 与 GUI 验收；通过前保持 `UNVALIDATED`。
+2. 建立 fresh-build manifest，把 HEAD、lockfile、实际工具链、Preload、Renderer、Main、DSH Profile 和 Controller sidecar 绑定到同一发布候选。
+3. 在 macOS arm64 与 Windows x64 packaged app 中复跑无 Key preload smoke 和首次创作路径。
+4. 单独调用一次 Pro；没有通过前保持 `UNVALIDATED`。
+5. 进行 5 名非程序员安装与首创作测试，和本次 Computer Use 证据分开统计。
+6. 之后再接跨作品 finding、候选三评估、用户采用和一键回滚；在那之前不宣称应用已实现 RSI 闭环。

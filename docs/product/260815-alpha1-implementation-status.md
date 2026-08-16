@@ -2,7 +2,7 @@
 
 ## 结论
 
-当前仓库已经具备“从源码运行的首个创作闭环”和可复核的安全边界，但还不是可交付给普通用户下载安装的 v1。macOS arm64 当前 headless build 已完成一次真实 Flash API、封存、重启恢复与本地取消边界 PASS；当前源码 GUI 也完成一次 Computer Use + 真实 Flash operational PASS。两者都不等于安装包、真人验收或文学质量证明。`alpha.1` 现在是开发里程碑名称，不是已经发布的安装包。
+当前仓库已经具备“从源码运行的首个创作闭环”和可复核的安全边界，但还不是可交付给普通用户下载安装的 v1。macOS arm64 的真实 Flash API、封存、重启恢复和 GUI operational PASS 均来自历史 `max_tokens=16,384` epoch；当前固定 `32,768` 策略尚待本轮实网复验，不能沿用旧 PASS。历史结果也不等于安装包、真人验收或文学质量证明。`alpha.1` 现在是开发里程碑名称，不是已经发布的安装包。
 
 ## 已实现
 
@@ -11,11 +11,11 @@
 - DSH rc.6 受信 Profile、公开 SDK JSON-RPC Adapter、loopback capability 与 Worker 取消/退出处理。
 - Electron ESM 入口采用非阻塞 bootstrap；应用只允许单实例，重复实例聚焦已有窗口，关闭最多等待 15 秒。
 - live harness 在打开 Key 前先运行无 Key、零模型 fetch、零模型 lease 的独立 Electron 预检。
-- Flash 实网验收已验证 requested/returned model、fingerprint、usage、SSE 完成、harness 固定测试修订封存与跨进程恢复；本次 app-state 扫描未发现 Key 原文、已知 Session 文件或 raw reasoning 字段。
+- 历史 `16,384` epoch 的 Flash 实网验收已验证 requested/returned model、fingerprint、usage、SSE 完成、harness 固定测试修订封存与跨进程恢复；当前 `32,768` 策略尚未取得新的 live PASS。本次历史 app-state 扫描未发现 Key 原文、已知 Session 文件或 raw reasoning 字段。
 - Python Controller 应用协议：初始意图、作品 dispatch、完成、取消、反馈、封存和系统快照。
 - Key → 模型 → 创作方向 → 生成 → 编辑/保留/拒绝/重写反馈的界面与 Main 业务链路。
 - sandboxed Preload 采用单文件 CommonJS bundle；真实 hidden BrowserWindow smoke 验证凭证页、窄 IPC、默认 Session 零 HTTP/HTTPS 请求和无 Node 全局暴露。
-- Computer Use 已从 GUI 完成 Key 验证、Flash 选择、首次创作、直接编辑、反馈封存、四入口检查和跨进程恢复；见 [GUI 验收报告](260815-Computer-Use-GUI验收报告.md)。
+- Computer Use 曾在历史 `16,384` epoch 从 GUI 完成 Key 验证、Flash 选择、首次创作、直接编辑、反馈封存、四入口检查和跨进程恢复；当前 `32,768` 策略仍需复验，见 [GUI 验收报告](260815-Computer-Use-GUI验收报告.md)。
 - 反馈事务中断后由 Main 依据 Controller 已保存的 intent 自动恢复；恢复失败时界面保留明确状态，并阻止新反馈和新作品覆盖原编辑。
 - 三项独立作品出现规范化后完全相同的直接反馈时，应用会形成“暂时观察”；用户可生成声明式方法候选，完成 targeted、regression、held-out 三组 A/B/TIE 盲比，并明确采用、拒绝或回滚。
 - 新方法采用后，下一项作品会把 method version、指导摘要和 context SHA256 绑定进 Controller 证据；该最小闭环不改写正式 L0–L5 成熟度。
@@ -45,7 +45,7 @@
 | M0 规则与 Skill 基线 | 已完成 | 仍需在最终 commit 后重跑完整历史与 archive 审计 |
 | M1 Monorepo 与治理拆包 | 已实现 | Python 采用 facade-first；旧 Skill 脚本仍是唯一治理实现，尚未反转成薄 wrapper |
 | M2 安全运行骨架 | 已实现、部分未验证 | mock、真实 DSH 启停、无 Key且零模型 fetch/lease 的 Electron 预检和 sandboxed Preload 真实 smoke 通过；macOS/Windows 打包进程与 DSH OS 级出网隔离尚未验收 |
-| M3 首个可用闭环 | 源码 GUI operational PASS | macOS arm64 当前源码 build 的 Flash Chat、GUI 编辑反馈、封存和跨进程恢复 PASS；Pro、Windows、packaged app 与非程序员体验未验证。取消只证明本地 lease revoke，不证明供应商侧在途或零计费，见 [Headless 验收](260815-Flash真实验收报告.md) 与 [GUI 验收](260815-Computer-Use-GUI验收报告.md) |
+| M3 首个可用闭环 | 历史 16,384 epoch operational PASS；当前 32,768 待复验 | macOS arm64 的 Flash Chat、GUI 编辑反馈、封存和跨进程恢复 PASS 均属于旧 epoch；当前策略、Pro、Windows、packaged app 与非程序员体验未验证。取消只证明本地 lease revoke，不证明供应商侧在途或零计费，见 [Headless 验收](260815-Flash真实验收报告.md) 与 [GUI 验收](260815-Computer-Use-GUI验收报告.md) |
 | M4 个人创作系统 | 已实现最小切片、未前向验收 | 初始意图、作品、直接反馈、跨作品 exact-text 聚类和用户可见原则已接通；同义反馈聚类、正式 L2/L3 校准仍未实现 |
 | M5 可验证自我改进 | 已实现最小应用闭环、未前向验收 | DSH Candidate 生成、三组人类盲比、采用、下一作品生效和回滚已接通；没有独立模型 Judge，不满足正式 L4，也尚未由打包应用独立执行者验证 |
 | M6 系统实验室 | 协议原型 | 只能建立 `CANDIDATE_ONLY` 治理记录；应用没有生成维护者 patch 包，也不运行模型生成代码 |

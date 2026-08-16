@@ -141,7 +141,7 @@ describe("DeepSeekGateway fixed-host transport", () => {
   });
 
   it.each([
-    ["output token ceiling", { max_tokens: 16_385 }],
+    ["output token ceiling", { max_tokens: 32_769 }],
     ["disabled thinking", { thinking: { type: "disabled" } }],
     ["missing thinking", { thinking: undefined }],
     ["lower reasoning effort", { reasoning_effort: "medium" }],
@@ -157,16 +157,16 @@ describe("DeepSeekGateway fixed-host transport", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("accepts the exact 16384 output-token ceiling", async () => {
+  it("accepts the exact 32768 output-token ceiling", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse({ model: "deepseek-returned", choices: [] }),
     );
     const gateway = new DeepSeekGateway({ keyStore: keyStore(), fetch: fetchMock });
 
-    await gateway.createChatCompletion({ ...request(), max_tokens: 16_384 });
+    await gateway.createChatCompletion({ ...request(), max_tokens: 32_768 });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toMatchObject({
-      max_tokens: 16_384,
+      max_tokens: 32_768,
       thinking: { type: "enabled" },
       reasoning_effort: "high",
     });

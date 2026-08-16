@@ -34,6 +34,8 @@ describe('renderer user-facing decisions', () => {
     expect(actionableError(new Error('generic'), 'DEEPSEEK_FIRST_EVENT_TIMEOUT')).toContain('两分钟')
     expect(actionableError(new Error('generic'), 'DEEPSEEK_STREAM_IDLE_TIMEOUT')).toContain('九十秒')
     expect(actionableError(new Error('generic'), 'DEEPSEEK_TOTAL_TIMEOUT')).toContain('十分钟')
+    expect(actionableError(new Error('内容达到本次生成上限，未保存为完整版本'), 'OUTPUT_TRUNCATED'))
+      .toContain('缩短篇幅')
     expect(actionableError(new Error('generic'), 'WORK_TERMINATION_PENDING')).toContain('不会计为作品')
     expect(actionableError(new Error('生成已经停止，但失败记录还没有安全封存；本次不会计为作品或学习证据。')))
       .toContain('请重启应用恢复')

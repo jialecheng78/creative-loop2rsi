@@ -60,7 +60,7 @@ describe('LoopbackModelGateway', () => {
       messages: [{ role: 'user', content: '写一个场景' }],
       thinking: { type: 'enabled' },
       reasoning_effort: 'high',
-      max_tokens: 16_384,
+      max_tokens: 32_768,
     }])
     expect(lease.provenance()).toMatchObject({
       completedRequests: 1,

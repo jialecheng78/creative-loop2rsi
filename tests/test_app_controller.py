@@ -135,7 +135,7 @@ class AppControllerTests(unittest.TestCase):
             "parameters": {
                 "thinking": "enabled",
                 "reasoning_effort": "high",
-                "max_tokens": 16384,
+                "max_tokens": 32768,
             },
             "usage": usage,
             "request_count": 1,
@@ -190,6 +190,75 @@ class AppControllerTests(unittest.TestCase):
             }
         )
         return value
+
+    def seal_policy_feedback_work(
+        self,
+        project,
+        *,
+        prefix,
+        number,
+        max_tokens,
+        feedback_text="让开头更快建立可见风险。",
+    ):
+        run_id = f"{prefix}-run-{number}"
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": run_id,
+                "work_id": f"{prefix}-work-{number}",
+                "task": f"{prefix} 独立任务 {number}",
+            },
+        )
+        provenance = self.runtime_provenance(
+            context_sha256=begun["context_sha256"],
+            response_id=f"response-{prefix}-{number}",
+        )
+        provenance["parameters"] = dict(provenance["parameters"])
+        provenance["parameters"]["max_tokens"] = max_tokens
+        payload = {
+            "project": str(project),
+            "run_id": run_id,
+            "output": f"{prefix} 基线作品 {number}",
+            "runtime_provenance": provenance,
+        }
+        if max_tokens == app_service.LEGACY_MODEL_MAX_OUTPUT_TOKENS:
+            current_normalizer = app_service._runtime_provenance
+
+            def legacy_normalizer(core, value, normalized_run_id, **kwargs):
+                current_value = dict(value)
+                current_value["parameters"] = dict(value["parameters"])
+                current_value["parameters"]["max_tokens"] = (
+                    app_service.CURRENT_MODEL_MAX_OUTPUT_TOKENS
+                )
+                record = current_normalizer(
+                    core, current_value, normalized_run_id, **kwargs
+                )
+                record["parameters"] = dict(record["parameters"])
+                record["parameters"]["max_tokens"] = (
+                    app_service.LEGACY_MODEL_MAX_OUTPUT_TOKENS
+                )
+                record["content_hash"] = core.app_record_content_hash(record)
+                return record
+
+            with mock.patch.object(
+                app_service, "_runtime_provenance", side_effect=legacy_normalizer
+            ):
+                completed = self.request("complete_work", payload)
+        else:
+            self.assertEqual(max_tokens, app_service.CURRENT_MODEL_MAX_OUTPUT_TOKENS)
+            completed = self.request("complete_work", payload)
+        self.request(
+            "submit_feedback",
+            {
+                "project": str(project),
+                "run_id": run_id,
+                "action": "rewrite",
+                "feedback_at": completed["review_available_at"],
+                "feedback_text": feedback_text,
+                "machine_direction": "UNKNOWN",
+            },
+        )
 
     def open_review(self, project, run_id, machine_direction="PASS"):
         run = self.read_json(
@@ -350,6 +419,21 @@ class AppControllerTests(unittest.TestCase):
             )
         self.assertIn("固定模型策略", str(caught.exception))
 
+        legacy_ceiling = self.runtime_provenance()
+        legacy_ceiling["parameters"] = dict(legacy_ceiling["parameters"])
+        legacy_ceiling["parameters"]["max_tokens"] = 16384
+        with self.assertRaises(AppRequestError) as caught:
+            self.request(
+                "complete_work",
+                {
+                    "project": str(project),
+                    "run_id": "run-one",
+                    "output": "作品",
+                    "runtime_provenance": legacy_ceiling,
+                },
+            )
+        self.assertIn("固定模型策略", str(caught.exception))
+
         hidden = self.runtime_provenance()
         hidden["reasoning_content"] = "不得进入证据层"
         with self.assertRaises(AppRequestError) as caught:
@@ -363,6 +447,21 @@ class AppControllerTests(unittest.TestCase):
                 },
             )
         self.assertIn("不允许字段", str(caught.exception))
+
+    def test_method_epoch_keeps_legacy_ceiling_readable_but_distinct(self):
+        current = self.runtime_provenance()
+        legacy = self.runtime_provenance()
+        legacy["parameters"] = dict(legacy["parameters"])
+        legacy["parameters"]["max_tokens"] = 16384
+        run = {"app_method_version_at_start": "baseline-v1"}
+        core = load_controller()
+
+        current_epoch = app_service._method_epoch_value(core, run, current)
+        legacy_epoch = app_service._method_epoch_value(core, run, legacy)
+
+        self.assertEqual(current_epoch["value"]["parameters"]["max_tokens"], 32768)
+        self.assertEqual(legacy_epoch["value"]["parameters"]["max_tokens"], 16384)
+        self.assertNotEqual(current_epoch["sha256"], legacy_epoch["sha256"])
 
     def test_cancel_work_records_zero_file_stall_and_allows_local_redispatch(self):
         project, _ = self.bootstrap()
@@ -518,6 +617,75 @@ class AppControllerTests(unittest.TestCase):
             load_controller().finding_occurrences(project, "APP-FEEDBACK-NOT-THERE"),
             [],
         )
+
+    def test_legacy_pending_provenance_can_only_finish_termination_replay(self):
+        project, _ = self.bootstrap()
+        begun = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-legacy-pending",
+                "work_id": "work-legacy-pending",
+                "task": "升级前已经进入终止队列的任务",
+                "dispatch_id": "dispatch-legacy-pending",
+                "context_id": "context-legacy-pending",
+            },
+        )
+        legacy = self.runtime_provenance(context_sha256=begun["context_sha256"])
+        legacy["parameters"] = dict(legacy["parameters"])
+        legacy["parameters"]["max_tokens"] = 16384
+        payload = {
+            "project": str(project),
+            "run_id": "run-legacy-pending",
+            "dispatch_id": begun["dispatch_id"],
+            "outcome": "FAILED",
+            "reason": "runtime-failed-before-commit",
+            "error_code": "OUTPUT_TRUNCATED",
+            "runtime_provenance": legacy,
+        }
+
+        first = self.request("terminate_work", payload)
+        repeated = self.request("terminate_work", payload)
+
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(repeated["idempotent"])
+        provenance = self.read_json(
+            project
+            / "creative-system/runs/run-legacy-pending/attempts/attempt-001"
+            / "runtime-provenance-dispatch-legacy-pending.json"
+        )
+        self.assertEqual(provenance["parameters"]["max_tokens"], 16384)
+        self.assertEqual(
+            self.request("system_snapshot", {"project": str(project)})[
+                "interrupted_run"
+            ]["state"],
+            "TERMINATED_FAILED",
+        )
+
+        current = self.request(
+            "begin_work",
+            {
+                "project": str(project),
+                "run_id": "run-current-cancel",
+                "work_id": "work-current-cancel",
+                "task": "旧策略不能成为新的取消写入",
+                "recovery_of": "run-legacy-pending",
+            },
+        )
+        legacy_cancel = dict(legacy)
+        legacy_cancel["context_sha256"] = current["context_sha256"]
+        with self.assertRaises(AppRequestError) as caught:
+            self.request(
+                "cancel_work",
+                {
+                    "project": str(project),
+                    "run_id": "run-current-cancel",
+                    "dispatch_id": current["dispatch_id"],
+                    "reason": "user-cancelled",
+                    "runtime_provenance": legacy_cancel,
+                },
+            )
+        self.assertIn("固定模型策略", str(caught.exception))
 
     def test_terminate_work_rejects_semantic_drift(self):
         project, _ = self.bootstrap()
@@ -2030,6 +2198,77 @@ class AppControllerTests(unittest.TestCase):
         )
         audit = self.command("audit", project)
         self.assertNotEqual(audit["provable_maturity"], "L4")
+
+    def test_legacy_policy_three_works_stay_visible_but_cannot_start_builder(self):
+        project, _ = self.bootstrap()
+        for number in range(1, 4):
+            self.seal_policy_feedback_work(
+                project,
+                prefix="legacy-policy",
+                number=number,
+                max_tokens=app_service.LEGACY_MODEL_MAX_OUTPUT_TOKENS,
+            )
+
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        observations = snapshot["learning"]["observations"]
+        self.assertEqual(len(observations), 1)
+        legacy = observations[0]
+        self.assertEqual(legacy["independent_works"], 3)
+        self.assertEqual(
+            legacy["epoch"]["parameters"]["max_tokens"],
+            app_service.LEGACY_MODEL_MAX_OUTPUT_TOKENS,
+        )
+        self.assertFalse(legacy["ready_for_candidate"])
+        with self.assertRaisesRegex(
+            AppRequestError, "旧版 16384.*当前固定 32768"
+        ):
+            self.request(
+                "method_candidate_context",
+                {
+                    "project": str(project),
+                    "candidate_id": "legacy-policy-candidate",
+                    "observation_id": legacy["id"],
+                },
+            )
+        self.assertFalse(
+            (
+                project
+                / "creative-system/app-methods/candidates/legacy-policy-candidate"
+            ).exists()
+        )
+
+    def test_current_policy_three_works_remain_ready_for_builder_context(self):
+        project, _ = self.bootstrap()
+        for number in range(1, 4):
+            self.seal_policy_feedback_work(
+                project,
+                prefix="current-policy",
+                number=number,
+                max_tokens=app_service.CURRENT_MODEL_MAX_OUTPUT_TOKENS,
+            )
+
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        ready = [
+            item
+            for item in snapshot["learning"]["observations"]
+            if item["ready_for_candidate"]
+        ]
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0]["independent_works"], 3)
+        self.assertEqual(
+            ready[0]["epoch"]["parameters"]["max_tokens"],
+            app_service.CURRENT_MODEL_MAX_OUTPUT_TOKENS,
+        )
+        context = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": "current-policy-candidate",
+                "observation_id": ready[0]["id"],
+            },
+        )
+        self.assertEqual(context["status"], "PASS")
+        self.assertEqual(len(context["source_works"]), 3)
 
     def test_method_observations_are_partitioned_by_runtime_epoch(self):
         project, _ = self.bootstrap()

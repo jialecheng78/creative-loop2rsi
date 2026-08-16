@@ -26,6 +26,8 @@ Creative RSI Studio 帮助普通用户建立某一创意写作方向的、可验
 
 设置页只允许更换/删除 Key、选择模型、导出/删除系统和暂停学习。不得展示 Base URL、Token、Temperature、Thinking、Agent、Prompt、DAG、DSH 或插件配置。
 
+v1 的隐藏模型策略固定为 `thinking=enabled`、`reasoning_effort=high` 和单次最多 `32,768` 个总输出 token。达到该上限属于 `OUTPUT_TRUNCATED`，不是可封存的完整作品，也不能因为已有部分正文而转成成功。
+
 ## 用户对象模型
 
 ```text

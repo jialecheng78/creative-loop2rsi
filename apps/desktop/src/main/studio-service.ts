@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import {
   DeepSeekGateway,
   GatewayError,
+  MAX_DEEPSEEK_OUTPUT_TOKENS,
   type ApiKeyStore,
   type ModelListResponse,
 } from '@creative-loop2rsi/model-gateway'
@@ -49,7 +50,6 @@ import type { RuntimeWorkerManager } from './runtime-worker-manager.js'
 import type { DesktopSettings, SettingsStore } from './settings-store.js'
 
 const CONTROLLER_VERSION = '1'
-const MAX_MODEL_OUTPUT_TOKENS = 16_384
 const SYSTEM_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
 
 type JsonRecord = Readonly<Record<string, unknown>>
@@ -492,7 +492,7 @@ export class StudioService {
         role: 'production',
         model: settings.selectedModel,
         gateway: { url: lease.url, token: lease.token },
-        maxTokens: MAX_MODEL_OUTPUT_TOKENS,
+        maxTokens: MAX_DEEPSEEK_OUTPUT_TOKENS,
       })
       const profileSha256 = await this.profileDigest(spec)
       this.throwIfLaunchCancelled()
@@ -947,7 +947,7 @@ export class StudioService {
         role: input.role,
         model: input.model,
         gateway: { url: lease.url, token: lease.token },
-        maxTokens: MAX_MODEL_OUTPUT_TOKENS,
+        maxTokens: MAX_DEEPSEEK_OUTPUT_TOKENS,
       })
       profileSha256 = await this.profileDigest(spec)
       this.options.runtime.configure(spec)
@@ -1615,7 +1615,7 @@ function runtimeProvenancePayload(
     parameters: {
       thinking: 'enabled',
       reasoning_effort: 'high',
-      max_tokens: MAX_MODEL_OUTPUT_TOKENS,
+      max_tokens: MAX_DEEPSEEK_OUTPUT_TOKENS,
     },
     usage: { ...provenance.usage },
     request_count: provenance.requestCount,

@@ -1,5 +1,6 @@
 export const SUPPORTED_DSH_VERSION = '0.1.0-rc.6' as const
 export const SUPPORTED_DSH_SDK_VERSION = '0.1.0-rc.6' as const
+export const MAX_DSH_OUTPUT_TOKENS = 32_768 as const
 
 export const DSH_MODEL_IDS = ['deepseek-v4-pro', 'deepseek-v4-flash'] as const
 export type DshModelId = (typeof DSH_MODEL_IDS)[number]

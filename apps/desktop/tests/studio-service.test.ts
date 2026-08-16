@@ -225,7 +225,7 @@ describe('StudioService governed alpha loop', () => {
         returned_model: 'deepseek-v4-pro',
         system_fingerprint: 'fingerprint-one',
         response_id: 'response-one',
-        parameters: { thinking: 'enabled', reasoning_effort: 'high', max_tokens: 16_384 },
+        parameters: { thinking: 'enabled', reasoning_effort: 'high', max_tokens: 32_768 },
         request_count: 1,
         completed_requests: 1,
         failed_requests: 0,
@@ -626,6 +626,73 @@ describe('StudioService governed alpha loop', () => {
 
     releaseStop.resolve(undefined)
     await failing
+  })
+
+  it('replays a trusted legacy 16384 termination from the Main pending-work queue', async () => {
+    const fixture = await readyFixture()
+    const handle = await fixture.service.startWork('升级后只重放旧失败终态')
+    const pendingStore = new PendingWorkStore(fixture.userData)
+    const launching = await pendingStore.load()
+    expect(launching).not.toBeNull()
+    if (launching === null) throw new Error('expected durable LAUNCHING intent')
+
+    await pendingStore.requireTermination(launching, {
+      outcome: 'FAILED',
+      reason: '旧版本达到输出上限',
+      error_code: 'OUTPUT_TRUNCATED',
+      runtime_provenance: {
+        app_version: '1.0.0-alpha.1',
+        completed_at: '2026-08-15T00:30:00.000Z',
+        controller_version: '1',
+        context_sha256: launching.begin_payload.context_sha256,
+        dsh_version: '0.1.0-rc.6',
+        completed_requests: 1,
+        failed_requests: 0,
+        parameters: {
+          thinking: 'enabled',
+          reasoning_effort: 'high',
+          max_tokens: 16_384,
+        },
+        profile_sha256: 'a'.repeat(64),
+        request_count: 1,
+        requests: [{
+          request_number: 1,
+          started_at: '2026-08-15T00:20:00.000Z',
+          completed_at: '2026-08-15T00:30:00.000Z',
+          status: 'COMPLETED',
+          http_status: 200,
+          error_code: null,
+          response_id: 'response-legacy-output-truncated',
+          returned_model: 'deepseek-v4-flash',
+          system_fingerprint: 'fingerprint-legacy-output-truncated',
+          usage: { completion_tokens: 16_381 },
+        }],
+        requested_model: 'deepseek-v4-flash',
+        response_id: 'response-legacy-output-truncated',
+        returned_model: 'deepseek-v4-flash',
+        system_fingerprint: 'fingerprint-legacy-output-truncated',
+        usage: { completion_tokens: 16_381 },
+      },
+    })
+
+    const restarted = fixture.makeService()
+    const status = await restarted.getStatus()
+
+    expect(status.workRecoveryState).toBe('recovered')
+    expect(status.activeSystem?.interruptedRun).toMatchObject({
+      runId: handle.runId,
+      outcome: 'FAILED',
+      reasonCode: 'OUTPUT_TRUNCATED',
+    })
+    const termination = fixture.controller.requests.findLast(item => item.operation === 'terminate_work')
+    expect(termination?.payload).toMatchObject({
+      run_id: handle.runId,
+      outcome: 'FAILED',
+      error_code: 'OUTPUT_TRUNCATED',
+      runtime_provenance: { parameters: { max_tokens: 16_384 } },
+    })
+    await expect(access(join(fixture.userData, 'supervisor', 'pending-work.json')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('keeps an observed timeout FAILED before a hanging shutdown cancel and replays it after restart', async () => {
