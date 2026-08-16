@@ -698,6 +698,7 @@ export function LearningPage(props: {
   const status = props.status
   const observations = status?.learning?.observations ?? []
   const principles = status?.learning?.adoptedPrinciples ?? []
+  const methods = status?.newMethods ?? []
   const [busyId, setBusyId] = useState<string>()
   const [notice, setNotice] = useState('')
 
@@ -710,6 +711,11 @@ export function LearningPage(props: {
       props.onStatusChange(nextStatus)
       setNotice('三组盲比已准备好。请前往“新方式”，只按作品本身作选择。')
     } catch (caught) {
+      try {
+        props.onStatusChange(await getStudioStatus())
+      } catch {
+        // Keep the original actionable error when status refresh also fails.
+      }
       setNotice(actionableError(caught))
     } finally {
       setBusyId(undefined)
@@ -733,21 +739,64 @@ export function LearningPage(props: {
           </div>
           {observations.length === 0
             ? <EmptyState text="还没有重复观察。先完成作品并提交明确反馈；单个作品不会改变全局方法。" />
-            : <ul className="evidence-items">{observations.map(item => (
-                <li key={item.id}>
-                  <strong>{item.feedback}</strong>
-                  <span>{item.independentWorks}/3 项独立创作</span>
-                  {observations.some(other => other.id !== item.id && other.feedback === item.feedback)
-                    ? <span>生成基线已变化，这些证据会分开累计。</span>
-                    : null}
-                  <button
-                    className="secondary-button"
-                    disabled={!item.readyForCandidate || busyId !== undefined}
-                    onClick={() => void prepare(item.id)}
-                    type="button"
-                  >{busyId === item.id ? '正在准备盲比…' : item.readyForCandidate ? '提出并比较新方法' : '证据不足'}</button>
-                </li>
-              ))}</ul>}
+            : <ul className="evidence-items">{observations.map(item => {
+                const relatedMethods = methods.filter(method => method.observationId === item.id)
+                const awaitingDecision = relatedMethods.find(method => (
+                  method.status === 'READY_FOR_HUMAN'
+                  || (method.status === 'PROMOTED' && method.adoptionPending)
+                ))
+                const evaluating = relatedMethods.find(method => method.status === 'EVALUATING')
+                const preparation = relatedMethods.find(method => method.status === 'CANDIDATE')
+                const adopted = relatedMethods.find(method => (
+                  method.status === 'PROMOTED' && !method.rolledBack
+                ))
+                const hasTerminalAttempt = relatedMethods.some(method => (
+                  method.status === 'BLOCKED'
+                  || method.status === 'REJECTED'
+                  || (method.status === 'PROMOTED' && method.rolledBack)
+                ))
+                const preparationBlocked = preparation !== undefined && !preparation.resumable
+                const routedToNewMethods = awaitingDecision !== undefined
+                  || evaluating !== undefined
+                  || preparationBlocked
+                  || adopted !== undefined
+                const canPrepare = item.readyForCandidate
+                  && busyId === undefined
+                  && !routedToNewMethods
+                return (
+                  <li key={item.id}>
+                    <strong>{item.feedback}</strong>
+                    <span>{item.independentWorks}/3 项独立创作</span>
+                    {observations.some(other => other.id !== item.id && other.feedback === item.feedback)
+                      ? <span>生成基线已变化，这些证据会分开累计。</span>
+                      : null}
+                    <button
+                      className="secondary-button"
+                      disabled={!canPrepare}
+                      onClick={canPrepare ? () => void prepare(item.id) : undefined}
+                      type="button"
+                    >{busyId === item.id
+                        ? '正在准备盲比…'
+                        : awaitingDecision !== undefined
+                          ? awaitingDecision.adoptionPending
+                            ? '请到“新方式”完成采用'
+                            : '请到“新方式”作最终决定'
+                          : evaluating !== undefined
+                            ? '请到“新方式”完成比较'
+                            : preparationBlocked
+                              ? '请到“新方式”放弃本次准备'
+                              : preparation !== undefined
+                                ? `继续准备盲比（${preparation.completedGenerationCount}/${preparation.generationTotal}）`
+                                : adopted !== undefined
+                                  ? '新方式已采用'
+                                  : item.readyForCandidate
+                                    ? hasTerminalAttempt
+                                      ? '重新提出并比较新方法'
+                                      : '提出并比较新方法'
+                                    : '证据不足'}</button>
+                  </li>
+                )
+              })}</ul>}
         </section>
         <section className="evidence-card principle">
           <div className="card-heading">
@@ -813,6 +862,26 @@ export function NewMethodsPage(props: {
     }
   }
 
+  async function resumePreparation(observationId: string): Promise<void> {
+    if (busy) return
+    setBusy(true)
+    setNotice('正在从已封存的进度继续准备；不会重做已完成的生成…')
+    try {
+      const nextStatus = await prepareNewMethod(observationId)
+      props.onStatusChange(nextStatus)
+      setNotice('三组盲比已准备好。请只按作品本身作选择。')
+    } catch (caught) {
+      try {
+        props.onStatusChange(await getStudioStatus())
+      } catch {
+        // Keep the original actionable error when status refresh also fails.
+      }
+      setNotice(actionableError(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <section className="page-view">
       <header className="page-header prose-header">
@@ -836,36 +905,86 @@ export function NewMethodsPage(props: {
               const adoptionIncomplete = method.adoptionPending
               const rolledBack = method.rolledBack
               const decided = method.status === 'REJECTED'
+                || method.status === 'BLOCKED'
                 || (method.status === 'PROMOTED' && !adoptionIncomplete)
                 || rolledBack
+              const preparing = method.status === 'CANDIDATE'
+              const comparisonsComplete = method.comparisons.length === 3 && answered === 3
+              const statusLabel = rolledBack
+                ? '历史已回滚'
+                : adoptionIncomplete
+                  ? '等待完成采用'
+                  : preparing
+                    ? method.resumable
+                      ? `准备 ${method.completedGenerationCount}/${method.generationTotal}`
+                      : '准备已阻止'
+                    : method.status === 'PROMOTED'
+                      ? '已采用'
+                      : method.status === 'REJECTED'
+                        ? '已拒绝'
+                        : method.status === 'BLOCKED'
+                          ? '未通过比较'
+                          : method.ready
+                            ? '可以决定'
+                            : unanswered !== undefined
+                              ? `盲比 ${Math.min(answered + 1, 3)}/3`
+                              : comparisonsComplete
+                                ? '盲比 3/3'
+                                : '比较材料不完整'
               return (
                 <article className="method-card" key={method.id}>
-                  <span>{rolledBack ? '历史已回滚' : adoptionIncomplete ? '等待完成采用' : decided ? (method.status === 'PROMOTED' ? '已采用' : '已拒绝') : method.ready ? '可以决定' : `盲比 ${answered + 1}/3`}</span>
-                  {unanswered === undefined
+                  <span>{statusLabel}</span>
+                  {preparing
                     ? <>
+                        <h2>候选比较仍在准备</h2>
+                        <p>本次准备的不可变证据已经保留；系统不会自动重做可能已经发起或付费的调用。</p>
+                        {method.resumable
+                          ? <p>候选指导和已完成结果已封存；只会补安全缺项。已完成 {method.completedGenerationCount}/{method.generationTotal} 项生成，全部完成后才显示三组盲比。</p>
+                          : <p>{method.preparationBlockedReason ?? '冻结的生成基线已无法安全继续。'}</p>}
+                        <div>
+                          {method.resumable
+                            ? <button className="primary-button" disabled={busy} onClick={() => void resumePreparation(method.observationId)} type="button">继续准备</button>
+                            : null}
+                          <button className="secondary-button" disabled={busy} onClick={() => void decide(method.id, 'reject')} type="button">放弃本次准备</button>
+                        </div>
+                        <p className="tradeoff">放弃只会新增不可变的拒绝记录，不会删除候选目录或既有证据。</p>
+                      </>
+                    : unanswered !== undefined
+                      ? <>
+                          <h2>{comparisonLabel(unanswered.phase)}</h2>
+                          <p>只比较作品，不会告诉你哪一边使用了候选方法。你的选择保存后不能改写。</p>
+                          <div className="blind-comparison">
+                            <section><span>版本 A</span><p>{unanswered.left}</p></section>
+                            <section><span>版本 B</span><p>{unanswered.right}</p></section>
+                          </div>
+                          <div className="comparison-actions">
+                            <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'A')} type="button">A 更好</button>
+                            <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'TIE')} type="button">差不多</button>
+                            <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'B')} type="button">B 更好</button>
+                          </div>
+                        </>
+                      : comparisonsComplete || decided || adoptionIncomplete
+                        ? <>
                         <h2>{method.title}</h2>
                         <p>{method.summary}</p>
                         <p className="tradeoff">可能的代价：{method.tradeoff}</p>
                         {rolledBack
                           ? <p>这个方式已经回滚，历史证据仍然保留；它不能直接重新采用。</p>
-                          : <div>
+                          : method.status === 'BLOCKED'
+                            ? <p>三组选择已保存，但候选没有同时满足“目标改善、回归不差、留出不差”，因此不能采用。</p>
+                            : method.status === 'REJECTED'
+                              ? <p>这个候选已拒绝，没有影响当前创作方法。</p>
+                              : method.status === 'PROMOTED' && !adoptionIncomplete
+                                ? <p>这个方式已经采用，后续新作品会绑定该版本。</p>
+                                : <div>
                               <button className="primary-button" disabled={(!method.ready && !adoptionIncomplete) || busy || decided} onClick={() => void decide(method.id, 'adopt')} type="button">{adoptionIncomplete ? '完成采用' : '采用新方式'}</button>
                               {!adoptionIncomplete && <button className="secondary-button" disabled={busy || decided} onClick={() => void decide(method.id, 'reject')} type="button">拒绝</button>}
                             </div>}
                       </>
-                    : <>
-                        <h2>{comparisonLabel(unanswered.phase)}</h2>
-                        <p>只比较作品，不会告诉你哪一边使用了候选方法。你的选择保存后不能改写。</p>
-                        <div className="blind-comparison">
-                          <section><span>版本 A</span><p>{unanswered.left}</p></section>
-                          <section><span>版本 B</span><p>{unanswered.right}</p></section>
-                        </div>
-                        <div className="comparison-actions">
-                          <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'A')} type="button">A 更好</button>
-                          <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'TIE')} type="button">差不多</button>
-                          <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'B')} type="button">B 更好</button>
-                        </div>
-                      </>}
+                        : <>
+                            <h2>比较材料尚未完整</h2>
+                            <p>当前快照没有完整三组盲比，因此不会显示完成或采用入口。请重新打开应用刷新状态。</p>
+                          </>}
                 </article>
               )
             })}

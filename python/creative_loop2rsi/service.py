@@ -24,6 +24,8 @@ from ._legacy import load_controller
 APP_PROTOCOL_VERSION = "1"
 ALLOWED_OPERATIONS = {
     "begin_work",
+    "begin_method_candidate_preparation",
+    "begin_method_generation",
     "bootstrap_intent",
     "candidate_summary",
     "cancel_work",
@@ -34,6 +36,9 @@ ALLOWED_OPERATIONS = {
     "method_candidate_context",
     "production_context",
     "record_feedback",
+    "record_method_generation",
+    "record_method_generation_failure",
+    "record_method_builder_failure",
     "reject_method_candidate",
     "resume_feedback",
     "rollback_method",
@@ -68,6 +73,12 @@ SYSTEM_LAB_TARGETS = {
 }
 METHOD_PHASES = ("targeted", "regression", "heldout")
 METHOD_CHOICES = {"A", "B", "TIE"}
+METHOD_GENERATION_LABELS = (
+    "targeted_candidate",
+    "regression_candidate",
+    "heldout_baseline",
+    "heldout_candidate",
+)
 METHOD_REGISTRY_RELATIVE = "creative-system/app-methods/registry.json"
 TERMINATION_OUTCOMES = {"FAILED", "CANCELLED"}
 LEGACY_APP_TERMINATION_REASONS = {
@@ -2379,6 +2390,345 @@ def _candidate_root(project: Path, candidate_id: str) -> Path:
     return project / "creative-system" / "app-methods" / "candidates" / candidate_id
 
 
+def _candidate_pending_root(project: Path, candidate_id: str) -> Path:
+    return (
+        project
+        / "creative-system"
+        / "app-methods"
+        / "candidates"
+        / f".pending-{candidate_id}"
+    )
+
+
+def _method_builder_intent_path(project: Path, candidate_id: str) -> Path:
+    return (
+        project
+        / "creative-system"
+        / "app-methods"
+        / "builder-preparations"
+        / f"{candidate_id}.json"
+    )
+
+
+def _method_builder_failure_path(project: Path, candidate_id: str) -> Path:
+    return (
+        project
+        / "creative-system"
+        / "app-methods"
+        / "builder-failures"
+        / f"{candidate_id}.json"
+    )
+
+
+def _method_builder_rejection_path(project: Path, candidate_id: str) -> Path:
+    return (
+        project
+        / "creative-system"
+        / "app-methods"
+        / "builder-rejections"
+        / f"{candidate_id}.json"
+    )
+
+
+def _validated_method_builder_intent(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+    *,
+    required: bool = False,
+) -> Optional[tuple[Path, Dict[str, Any]]]:
+    path = _method_builder_intent_path(project, candidate_id)
+    if not os.path.lexists(str(path)):
+        if required:
+            raise AppRequestError("Candidate Builder 调用缺少不可变准备 intent")
+        return None
+    verified = core.regular_project_file(
+        project,
+        path.relative_to(project).as_posix(),
+        "AppMethodBuilderIntent",
+    )
+    intent = core.load_json(verified)
+    expected_keys = {
+        "builder_context_sha256",
+        "candidate_id",
+        "content_hash",
+        "created_at",
+        "expected_epoch_sha256",
+        "guidance_persisted",
+        "id",
+        "kind",
+        "observation_id",
+        "output_persisted",
+        "reasoning_persisted",
+        "runtime_provenance_persisted",
+        "schema_version",
+        "source_refs",
+    }
+    if (
+        not isinstance(intent, dict)
+        or set(intent) != expected_keys
+        or intent.get("kind") != "AppMethodBuilderIntent"
+        or intent.get("id") != f"builder-intent-{candidate_id}"
+        or intent.get("candidate_id") != candidate_id
+        or not isinstance(intent.get("observation_id"), str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(intent.get("builder_context_sha256", ""))
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(intent.get("expected_epoch_sha256", ""))
+        )
+        or intent.get("guidance_persisted") is not False
+        or intent.get("output_persisted") is not False
+        or intent.get("reasoning_persisted") is not False
+        or intent.get("runtime_provenance_persisted") is not False
+        or intent.get("source_refs") != []
+        or intent.get("content_hash") != core.app_record_content_hash(intent)
+    ):
+        raise AppRequestError("Candidate Builder 准备 intent 合同或摘要无效")
+    return verified, intent
+
+
+def _validated_method_builder_failure(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+    intent: Mapping[str, Any],
+) -> Optional[tuple[Path, Dict[str, Any]]]:
+    path = _method_builder_failure_path(project, candidate_id)
+    if not os.path.lexists(str(path)):
+        return None
+    verified = core.regular_project_file(
+        project,
+        path.relative_to(project).as_posix(),
+        "AppMethodBuilderFailure",
+    )
+    failure = core.load_json(verified)
+    expected_keys = {
+        "candidate_id",
+        "content_hash",
+        "created_at",
+        "error_code",
+        "expected_context_sha256",
+        "expected_epoch_sha256",
+        "id",
+        "kind",
+        "observed_evidence_sha256",
+        "observation_id",
+        "schema_version",
+        "source_refs",
+    }
+    if (
+        not isinstance(failure, dict)
+        or set(failure) != expected_keys
+        or failure.get("kind") != "AppMethodBuilderFailure"
+        or failure.get("id") != f"builder-failure-{candidate_id}"
+        or failure.get("candidate_id") != candidate_id
+        or failure.get("observation_id") != intent.get("observation_id")
+        or failure.get("error_code")
+        not in {"METHOD_EPOCH_CHANGED", "METHOD_EPOCH_UNVERIFIABLE"}
+        or failure.get("expected_context_sha256")
+        != intent.get("builder_context_sha256")
+        or failure.get("expected_epoch_sha256")
+        != intent.get("expected_epoch_sha256")
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(failure.get("observed_evidence_sha256", ""))
+        )
+        or failure.get("source_refs") != []
+        or failure.get("content_hash") != core.app_record_content_hash(failure)
+    ):
+        raise AppRequestError("Candidate Builder failure marker 合同或摘要无效")
+    return verified, failure
+
+
+def _write_method_builder_failure_marker_locked(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+    intent: Mapping[str, Any],
+    *,
+    error_code: str,
+    observed_evidence_sha256: str,
+) -> tuple[bool, Path, Dict[str, Any]]:
+    if error_code not in {"METHOD_EPOCH_CHANGED", "METHOD_EPOCH_UNVERIFIABLE"}:
+        raise AppRequestError("Candidate Builder failure error_code 无效")
+    existing = _validated_method_builder_failure(
+        core, project, candidate_id, intent
+    )
+    if existing is not None:
+        failure_path, failure = existing
+        if (
+            failure.get("error_code") != error_code
+            or failure.get("observed_evidence_sha256")
+            != observed_evidence_sha256
+        ):
+            raise AppRequestError("Candidate Builder 已绑定不同 failure 证据")
+        return True, failure_path, failure
+    failure = _record(
+        core,
+        "AppMethodBuilderFailure",
+        f"builder-failure-{candidate_id}",
+        {
+            "candidate_id": candidate_id,
+            "observation_id": intent.get("observation_id"),
+            "error_code": error_code,
+            "expected_context_sha256": intent.get("builder_context_sha256"),
+            "expected_epoch_sha256": intent.get("expected_epoch_sha256"),
+            "observed_evidence_sha256": observed_evidence_sha256,
+        },
+    )
+    failure_path = _method_builder_failure_path(project, candidate_id)
+    core.guarded_mkdir_project(
+        project, failure_path.parent, "method builder failure markers"
+    )
+    core.atomic_create_json(failure_path, failure)
+    validated_failure = _validated_method_builder_failure(
+        core, project, candidate_id, intent
+    )
+    if validated_failure is None:
+        raise AppRequestError("Candidate Builder failure marker 未成功封存")
+    failure_path, failure = validated_failure
+    return False, failure_path, failure
+
+
+def _validated_method_builder_rejection(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+    intent: Mapping[str, Any],
+) -> Optional[tuple[Path, Dict[str, Any]]]:
+    path = _method_builder_rejection_path(project, candidate_id)
+    if not os.path.lexists(str(path)):
+        return None
+    verified = core.regular_project_file(
+        project,
+        path.relative_to(project).as_posix(),
+        "AppMethodBuilderRejectionReceipt",
+    )
+    receipt = core.load_json(verified)
+    expected_keys = {
+        "active_method_unchanged",
+        "candidate_id",
+        "content_hash",
+        "created_at",
+        "id",
+        "intent_sha256",
+        "kind",
+        "rejected_by",
+        "schema_version",
+        "source_refs",
+    }
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != expected_keys
+        or receipt.get("kind") != "AppMethodBuilderRejectionReceipt"
+        or receipt.get("id") != f"builder-rejection-{candidate_id}"
+        or receipt.get("candidate_id") != candidate_id
+        or receipt.get("intent_sha256")
+        != core.sha256_file(_method_builder_intent_path(project, candidate_id))
+        or receipt.get("rejected_by") != "local-app-user"
+        or receipt.get("active_method_unchanged") is not True
+        or receipt.get("source_refs") != []
+        or receipt.get("content_hash") != core.app_record_content_hash(receipt)
+    ):
+        raise AppRequestError("Candidate Builder 拒绝 receipt 合同或摘要无效")
+    return verified, receipt
+
+
+def _active_method_builder_preparation(
+    core: Any, project: Path, observation_id: str
+) -> Optional[tuple[str, Dict[str, Any]]]:
+    root = (
+        project
+        / "creative-system"
+        / "app-methods"
+        / "builder-preparations"
+    )
+    if not os.path.lexists(str(root)):
+        return None
+    if root.is_symlink() or not root.is_dir():
+        raise AppRequestError("Candidate Builder 准备根目录无效")
+    matches: list[tuple[str, Dict[str, Any]]] = []
+    for item in sorted(root.iterdir(), key=lambda path: path.name):
+        if item.name == ".gitkeep":
+            continue
+        if item.is_symlink() or not item.is_file() or item.suffix != ".json":
+            raise AppRequestError("Candidate Builder 准备目录含未声明条目")
+        candidate_id = _id(item.stem, "builder preparation candidate_id")
+        validated = _validated_method_builder_intent(
+            core, project, candidate_id, required=True
+        )
+        if validated is None:
+            raise AppRequestError("Candidate Builder 准备 intent 缺失")
+        _, intent = validated
+        _validated_method_builder_failure(
+            core, project, candidate_id, intent
+        )
+        rejection = _validated_method_builder_rejection(
+            core, project, candidate_id, intent
+        )
+        if (
+            intent.get("observation_id") == observation_id
+            and rejection is None
+            and not os.path.lexists(str(_candidate_root(project, candidate_id)))
+        ):
+            matches.append((candidate_id, intent))
+    if len(matches) > 1:
+        raise AppRequestError(
+            "同一观察存在多个未完成 Candidate Builder 准备；请先放弃多余准备"
+        )
+    return matches[0] if matches else None
+
+
+def _reconcile_method_candidate_pending(core: Any, project: Path) -> None:
+    candidates_root = project / "creative-system" / "app-methods" / "candidates"
+    if not os.path.lexists(str(candidates_root)):
+        return
+    if candidates_root.is_symlink() or not candidates_root.is_dir():
+        raise AppRequestError("方法候选根目录不是普通目录")
+    pending_entries = [
+        item
+        for item in candidates_root.iterdir()
+        if item.name.startswith(".") and item.name != ".gitkeep"
+    ]
+    for pending in sorted(pending_entries, key=lambda item: item.name):
+        if not pending.name.startswith(".pending-"):
+            raise AppRequestError(
+                "方法候选存在旧版未治理的崩溃残留；为避免重复付费，拒绝新建候选"
+            )
+        candidate_id = pending.name.removeprefix(".pending-")
+        _id(candidate_id, "pending candidate_id")
+        builder_intent = _validated_method_builder_intent(
+            core, project, candidate_id, required=True
+        )
+        if builder_intent is None:
+            raise AppRequestError("pending 方法候选缺少 Builder intent")
+        if _validated_method_builder_rejection(
+            core, project, candidate_id, builder_intent[1]
+        ) is not None:
+            # The user explicitly abandoned this paid-result window.  Keep the
+            # immutable pending tree for audit, but do not let it lock a later
+            # candidate for the same observation.
+            continue
+        if pending.is_symlink() or not pending.is_dir():
+            raise AppRequestError("pending 方法候选不是普通目录")
+        if {item.name for item in pending.iterdir()} != {
+            "builder-provenance.json",
+            "proposal.json",
+            "status.json",
+        }:
+            raise AppRequestError(
+                "Candidate Builder 付费结果只完成部分持久化；不会重跑，请保留现场处理"
+            )
+        final = _candidate_root(project, candidate_id)
+        if os.path.lexists(str(final)):
+            raise AppRequestError("同一 candidate 同时存在 committed 与 pending 目录")
+        os.rename(str(pending), str(final))
+        _, proposal, _ = _load_method_candidate(core, project, candidate_id)
+        # A structurally complete tree is not recoverable until Builder
+        # provenance, frozen source context and epoch all bind back to proposal.
+        _candidate_evaluation_plan(core, project, proposal)
+
+
 def _load_method_candidate(
     core: Any, project: Path, candidate_id: str
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any]]:
@@ -2859,6 +3209,33 @@ def _validated_method_promotion_receipt(
     return promotion_file, promotion
 
 
+def _validated_method_rejection_receipt(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+) -> Optional[tuple[Path, Dict[str, Any]]]:
+    path = _candidate_root(project, candidate_id) / "rejection.json"
+    if not os.path.lexists(str(path)):
+        return None
+    verified = core.regular_project_file(
+        project,
+        path.relative_to(project).as_posix(),
+        "AppMethodRejectionReceipt",
+    )
+    receipt = core.load_json(verified)
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("kind") != "AppMethodRejectionReceipt"
+        or receipt.get("id") != f"rejection-{candidate_id}"
+        or receipt.get("candidate_id") != candidate_id
+        or receipt.get("rejected_by") != "local-app-user"
+        or receipt.get("active_method_unchanged") is not True
+        or receipt.get("content_hash") != core.app_record_content_hash(receipt)
+    ):
+        raise AppRequestError("方法候选 RejectionReceipt 合同或摘要无效")
+    return verified, receipt
+
+
 def _method_candidate_activation_projection(
     core: Any,
     project: Path,
@@ -2867,18 +3244,20 @@ def _method_candidate_activation_projection(
     status: Mapping[str, Any],
     registry: Mapping[str, Any],
 ) -> Dict[str, bool]:
+    validated_rejection = _validated_method_rejection_receipt(
+        core, project, candidate_id
+    )
     validated_promotion = _validated_method_promotion_receipt(
         core, project, candidate_id, proposal
     )
+    if validated_rejection is not None and validated_promotion is not None:
+        raise AppRequestError("方法候选同时存在采用与拒绝凭证")
     if validated_promotion is None:
         if status.get("lifecycle") == "PROMOTED":
             raise AppRequestError("PROMOTED 方法候选缺少 PromotionReceipt")
         return {"adoption_pending": False, "rolled_back": False}
     promotion_path, promotion = validated_promotion
-    rejection_path = _candidate_root(project, candidate_id) / "rejection.json"
-    if status.get("lifecycle") == "REJECTED" or os.path.lexists(
-        str(rejection_path)
-    ):
+    if status.get("lifecycle") == "REJECTED":
         raise AppRequestError("方法候选同时存在采用与拒绝凭证")
     promotion_relative = promotion_path.relative_to(project).as_posix()
     if status.get("lifecycle") == "PROMOTED" and status.get(
@@ -2928,6 +3307,71 @@ def _method_candidate_activation_projection(
     return {"adoption_pending": False, "rolled_back": True}
 
 
+def _method_builder_preparation_public_snapshots(
+    core: Any, project: Path
+) -> list[Dict[str, Any]]:
+    intents_root = (
+        project
+        / "creative-system"
+        / "app-methods"
+        / "builder-preparations"
+    )
+    if not os.path.lexists(str(intents_root)):
+        return []
+    if intents_root.is_symlink() or not intents_root.is_dir():
+        raise AppRequestError("Candidate Builder 准备根目录无效")
+    snapshots: list[Dict[str, Any]] = []
+    for item in sorted(intents_root.iterdir(), key=lambda path: path.name):
+        if item.name == ".gitkeep":
+            continue
+        if item.is_symlink() or not item.is_file() or item.suffix != ".json":
+            raise AppRequestError("Candidate Builder 准备目录含未声明条目")
+        candidate_id = _id(item.stem, "builder preparation candidate_id")
+        validated = _validated_method_builder_intent(
+            core, project, candidate_id, required=True
+        )
+        if validated is None:
+            raise AppRequestError("Candidate Builder 准备 intent 缺失")
+        _, intent = validated
+        failure = _validated_method_builder_failure(
+            core, project, candidate_id, intent
+        )
+        rejection = _validated_method_builder_rejection(
+            core, project, candidate_id, intent
+        )
+        if os.path.lexists(str(_candidate_root(project, candidate_id))):
+            continue
+        rejected = rejection is not None
+        blocked_reason = None if rejected else (
+            "Candidate Builder 的模型基线无法验真；"
+            "未保存指导正文，为避免重复付费，本次准备只能放弃"
+            if failure is not None
+            else
+            "Candidate Builder 可能正在调用或已在封存前中断；"
+            "本记录不会触发重复付费，重启后只能放弃"
+        )
+        snapshots.append(
+            {
+                "id": candidate_id,
+                "observation_id": intent.get("observation_id"),
+                "title": "未完成的新方式准备",
+                "summary": "此次准备未封存可用的创作指导。",
+                "tradeoff": "未改变当前方法，也未保存模型生成正文。",
+                "status": "REJECTED" if rejected else "CANDIDATE",
+                "ready": False,
+                "adoption_pending": False,
+                "rolled_back": False,
+                "preparation_completed": 0,
+                "preparation_total": len(METHOD_GENERATION_LABELS),
+                "preparation_resumable": False,
+                "preparation_blocked_reason": blocked_reason,
+                "comparisons": [],
+                "evaluation_summary": None,
+            }
+        )
+    return snapshots
+
+
 def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
     registry = _method_registry(core, project)
     active = _production_context_snapshot(core, project)
@@ -2935,11 +3379,18 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
     root = project / "creative-system" / "app-methods" / "candidates"
     if root.is_dir() and not root.is_symlink():
         for candidate_dir in sorted(root.iterdir(), key=lambda path: path.name):
+            if candidate_dir.name.startswith("."):
+                continue
             if not candidate_dir.is_dir() or candidate_dir.is_symlink():
                 continue
             _, proposal, status = _load_method_candidate(
                 core, project, candidate_dir.name
             )
+            rejection = _validated_method_rejection_receipt(
+                core, project, candidate_dir.name
+            )
+            if status.get("lifecycle") == "REJECTED" and rejection is None:
+                raise AppRequestError("REJECTED 方法候选缺少 RejectionReceipt")
             projected_lifecycle, projected_summary = _method_evaluation_projection(
                 core,
                 project,
@@ -2957,8 +3408,124 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
             )
             if activation["adoption_pending"]:
                 projected_lifecycle = "PROMOTED"
+            elif rejection is not None:
+                projected_lifecycle = "REJECTED"
+            preparation_valid = True
+            if status.get("lifecycle") == "CANDIDATE" and rejection is None:
+                preparation_completed = 0
+                try:
+                    preparation_plan = _candidate_evaluation_plan(
+                        core, project, proposal
+                    )
+                    preparation_completed = len(
+                        _method_generation_progress(
+                            core,
+                            project,
+                            candidate_dir,
+                            proposal,
+                            preparation_plan,
+                        )
+                    )
+                    _reconcile_method_generation_pending(
+                        core,
+                        project,
+                        candidate_dir,
+                        proposal,
+                        preparation_plan,
+                    )
+                    preparation_completed = len(
+                        _method_generation_progress(
+                            core,
+                            project,
+                            candidate_dir,
+                            proposal,
+                            preparation_plan,
+                        )
+                    )
+                    preparation_failure = _validated_method_generation_failure(
+                        core,
+                        project,
+                        candidate_dir,
+                        proposal,
+                        preparation_plan,
+                    )
+                    unresolved_generation = _unresolved_method_generation_intent(
+                        core,
+                        project,
+                        candidate_dir,
+                        proposal,
+                        preparation_plan,
+                    )
+                    if (
+                        preparation_failure is None
+                        and unresolved_generation is None
+                        and (
+                        os.path.lexists(
+                            str(_method_comparisons_pending_root(candidate_dir))
+                        )
+                        or os.path.lexists(str(candidate_dir / "comparisons"))
+                        )
+                    ):
+                        _finalize_method_comparisons_locked(
+                            core,
+                            project,
+                            candidate_dir.name,
+                            include_snapshot=False,
+                        )
+                        _, proposal, status = _load_method_candidate(
+                            core, project, candidate_dir.name
+                        )
+                        projected_lifecycle, projected_summary = (
+                            _method_evaluation_projection(
+                                core,
+                                project,
+                                candidate_dir,
+                                candidate_dir.name,
+                                status,
+                            )
+                        )
+                    preparation_resumable = (
+                        preparation_failure is None
+                        and unresolved_generation is None
+                        and status.get("lifecycle") == "CANDIDATE"
+                    )
+                    preparation_blocked_reason = (
+                        None
+                        if preparation_failure is None
+                        and unresolved_generation is None
+                        else (
+                            "模型、fingerprint、Profile 或固定参数已变化；"
+                            "为避免重复付费，本次准备只能放弃"
+                            if preparation_failure is not None
+                            else
+                            f"{unresolved_generation} 可能正在调用或已在付费后中断；"
+                            "为避免重复付费，重启后只能放弃"
+                        )
+                    )
+                except AppRequestError as exc:
+                    # A frozen candidate may become non-resumable after a method
+                    # epoch change or durable-receipt damage.  Keep it visible so
+                    # the renderer can offer the immutable rejection path instead
+                    # of making the entire system snapshot unavailable.
+                    preparation_valid = False
+                    preparation_resumable = False
+                    preparation_blocked_reason = str(exc)
+            else:
+                preparation_completed = (
+                    len(METHOD_GENERATION_LABELS)
+                    if (candidate_dir / "comparisons").is_dir()
+                    and not (candidate_dir / "comparisons").is_symlink()
+                    else 0
+                )
+                preparation_resumable = False
+                preparation_blocked_reason = None
             comparisons = []
-            for phase in METHOD_PHASES:
+            comparison_phases = (
+                METHOD_PHASES
+                if status.get("lifecycle") != "CANDIDATE" or preparation_valid
+                else ()
+            )
+            for phase in comparison_phases:
                 input_path = candidate_dir / "comparisons" / phase / "public.json"
                 if input_path.is_file() and not input_path.is_symlink():
                     _, _, public, _ = _validated_method_comparison(
@@ -2982,6 +3549,7 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
             candidates.append(
                 {
                     "id": candidate_dir.name,
+                    "observation_id": proposal.get("observation_id"),
                     "title": "针对重复反馈的新方式",
                     "summary": proposal.get("guidance"),
                     "tradeoff": "只改变后续作品的创作指导，不改写既有作品。",
@@ -2989,10 +3557,15 @@ def _method_public_snapshot(core: Any, project: Path) -> Dict[str, Any]:
                     "ready": projected_lifecycle == "READY_FOR_HUMAN",
                     "adoption_pending": activation["adoption_pending"],
                     "rolled_back": activation["rolled_back"],
+                    "preparation_completed": preparation_completed,
+                    "preparation_total": len(METHOD_GENERATION_LABELS),
+                    "preparation_resumable": preparation_resumable,
+                    "preparation_blocked_reason": preparation_blocked_reason,
                     "comparisons": comparisons,
                     "evaluation_summary": projected_summary,
                 }
             )
+    candidates.extend(_method_builder_preparation_public_snapshots(core, project))
     principles = [
         {
             "version": item.get("version"),
@@ -3103,6 +3676,15 @@ def _system_snapshot_request(payload: Mapping[str, Any]) -> Dict[str, Any]:
     with core.exclusive_controller_lock(project):
         _reconcile_terminated_attempts_locked(core, project)
         _reconcile_method_rollbacks_locked(core, project)
+        try:
+            _reconcile_method_candidate_pending(core, project)
+        except AppRequestError:
+            # An incomplete paid-result candidate tree is never deleted or
+            # guessed.  Its pre-call Builder intent remains public and
+            # rejectable, while method_candidate_context still fails closed.
+            pass
+        _reconcile_method_rejections_locked(core, project)
+        _reconcile_method_preparations_locked(core, project)
         return _system_snapshot({"project": str(project)})
 
 
@@ -4432,16 +5014,254 @@ def _candidate_context_value(
     }
 
 
+def _begin_method_candidate_preparation(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(
+        payload,
+        "payload",
+        {
+            "builder_context_sha256",
+            "candidate_id",
+            "expected_epoch_sha256",
+            "observation_id",
+            "project",
+        },
+    )
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    observation_id = _text(
+        payload.get("observation_id"), "observation_id", maximum=100
+    )
+    builder_context_sha256 = _text(
+        payload.get("builder_context_sha256"),
+        "builder_context_sha256",
+        maximum=64,
+    )
+    expected_epoch_sha256 = _text(
+        payload.get("expected_epoch_sha256"),
+        "expected_epoch_sha256",
+        maximum=64,
+    )
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (builder_context_sha256, expected_epoch_sha256)
+    ):
+        raise AppRequestError("Candidate Builder 准备 SHA256 无效")
+    with core.exclusive_controller_lock(project):
+        _reconcile_method_candidate_pending(core, project)
+        context = _candidate_context_value(
+            core, project, observation_id, candidate_id
+        )
+        if (
+            context["builder_context_sha256"] != builder_context_sha256
+            or context["method_epoch_sha256"] != expected_epoch_sha256
+        ):
+            raise AppRequestError("Candidate Builder 准备未绑定当前观察与模型基线")
+        existing_candidate = _resumable_method_candidate(
+            core, project, observation_id
+        )
+        if existing_candidate is not None:
+            raise AppRequestError("同一观察已有未完成方法候选")
+        active_preparation = _active_method_builder_preparation(
+            core, project, observation_id
+        )
+        if (
+            active_preparation is not None
+            and active_preparation[0] != candidate_id
+        ):
+            raise AppRequestError(
+                "同一观察已有未完成 Candidate Builder 准备；请先放弃"
+            )
+        existing = _validated_method_builder_intent(
+            core, project, candidate_id
+        )
+        idempotent = existing is not None
+        if existing is not None:
+            _, intent = existing
+            if (
+                intent.get("observation_id") != observation_id
+                or intent.get("builder_context_sha256")
+                != builder_context_sha256
+                or intent.get("expected_epoch_sha256")
+                != expected_epoch_sha256
+            ):
+                raise AppRequestError(
+                    "同一 candidate_id 已绑定不同 Builder 准备 intent"
+                )
+            if _validated_method_builder_rejection(
+                core, project, candidate_id, intent
+            ) is not None:
+                raise AppRequestError("这次 Candidate Builder 准备已被用户放弃")
+        else:
+            intent = _record(
+                core,
+                "AppMethodBuilderIntent",
+                f"builder-intent-{candidate_id}",
+                {
+                    "candidate_id": candidate_id,
+                    "observation_id": observation_id,
+                    "builder_context_sha256": builder_context_sha256,
+                    "expected_epoch_sha256": expected_epoch_sha256,
+                    "guidance_persisted": False,
+                    "output_persisted": False,
+                    "reasoning_persisted": False,
+                    "runtime_provenance_persisted": False,
+                },
+            )
+            intent_path = _method_builder_intent_path(project, candidate_id)
+            core.guarded_mkdir_project(
+                project, intent_path.parent, "method builder preparation intents"
+            )
+            core.atomic_create_json(intent_path, intent)
+            validated = _validated_method_builder_intent(
+                core, project, candidate_id, required=True
+            )
+            if validated is None:
+                raise AppRequestError("Candidate Builder 准备 intent 未成功封存")
+            _, intent = validated
+        intent_path = _method_builder_intent_path(project, candidate_id)
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "observation_id": observation_id,
+        "builder_context_sha256": builder_context_sha256,
+        "expected_epoch_sha256": expected_epoch_sha256,
+        "intent_sha256": core.sha256_file(intent_path),
+        "idempotent": idempotent,
+    }
+
+
+def _record_method_builder_failure(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(
+        payload,
+        "payload",
+        {
+            "builder_context_sha256",
+            "candidate_id",
+            "error_code",
+            "expected_epoch_sha256",
+            "observed_evidence_sha256",
+            "observation_id",
+            "project",
+        },
+    )
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    observation_id = _text(
+        payload.get("observation_id"), "observation_id", maximum=100
+    )
+    builder_context_sha256 = _text(
+        payload.get("builder_context_sha256"),
+        "builder_context_sha256",
+        maximum=64,
+    )
+    expected_epoch_sha256 = _text(
+        payload.get("expected_epoch_sha256"),
+        "expected_epoch_sha256",
+        maximum=64,
+    )
+    observed_evidence_sha256 = _text(
+        payload.get("observed_evidence_sha256"),
+        "observed_evidence_sha256",
+        maximum=64,
+    )
+    error_code = _text(payload.get("error_code"), "error_code", maximum=80)
+    if error_code != "METHOD_EPOCH_UNVERIFIABLE" or any(
+        re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (
+            builder_context_sha256,
+            expected_epoch_sha256,
+            observed_evidence_sha256,
+        )
+    ):
+        raise AppRequestError("Candidate Builder failure 合同无效")
+    with core.exclusive_controller_lock(project):
+        validated = _validated_method_builder_intent(
+            core, project, candidate_id, required=True
+        )
+        if validated is None:
+            raise AppRequestError("Candidate Builder 准备 intent 缺失")
+        _, intent = validated
+        if (
+            intent.get("observation_id") != observation_id
+            or intent.get("builder_context_sha256")
+            != builder_context_sha256
+            or intent.get("expected_epoch_sha256")
+            != expected_epoch_sha256
+        ):
+            raise AppRequestError("Candidate Builder failure 未绑定不可变 intent")
+        if os.path.lexists(str(_candidate_root(project, candidate_id))):
+            raise AppRequestError("方法候选已完整封存，不能追加 Builder failure")
+        if _validated_method_builder_rejection(
+            core, project, candidate_id, intent
+        ) is not None:
+            raise AppRequestError("已放弃的 Builder 准备不能追加 failure")
+        idempotent, failure_path, failure = (
+            _write_method_builder_failure_marker_locked(
+                core,
+                project,
+                candidate_id,
+                intent,
+                error_code=error_code,
+                observed_evidence_sha256=observed_evidence_sha256,
+            )
+        )
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "observation_id": observation_id,
+        "error_code": error_code,
+        "failure_marker_sha256": core.sha256_file(failure_path),
+        "idempotent": idempotent,
+    }
+
+
 def _method_candidate_context(payload: Mapping[str, Any]) -> Dict[str, Any]:
     _exact_keys(payload, "payload", {"candidate_id", "observation_id", "project"})
     core = load_controller()
     project = _project_path(payload.get("project"))
-    return _candidate_context_value(
+    with core.exclusive_controller_lock(project):
+        _reconcile_method_candidate_pending(core, project)
+        return _method_candidate_context_locked(core, project, payload)
+
+
+def _method_candidate_context_locked(
+    core: Any, project: Path, payload: Mapping[str, Any]
+) -> Dict[str, Any]:
+    observation_id = _text(
+        payload.get("observation_id"), "observation_id", maximum=100
+    )
+    proposed_candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    resumable = _resumable_method_candidate(
+        core, project, observation_id
+    )
+    if resumable is not None:
+        return _method_candidate_preparation_context_value(
+            core, project, resumable
+        )
+    active_builder = _active_method_builder_preparation(
+        core, project, observation_id
+    )
+    if active_builder is not None:
+        raise AppRequestError(
+            "Candidate Builder 可能已经调用，但结果未完整封存；"
+            "为避免重复付费，请在新方式中放弃本次准备"
+        )
+    context = _candidate_context_value(
         core,
         project,
-        _text(payload.get("observation_id"), "observation_id", maximum=100),
-        _id(payload.get("candidate_id"), "candidate_id"),
+        observation_id,
+        proposed_candidate_id,
     )
+    return {
+        **context,
+        "builder_required": True,
+        "guidance": None,
+        "evaluation_plan": None,
+        "completed_generation_labels": [],
+        "generation_total": len(METHOD_GENERATION_LABELS),
+    }
 
 
 def _method_generation_context_sha256(
@@ -4466,6 +5286,92 @@ def _method_generation_context_sha256(
     )
 
 
+def _validated_method_candidate_builder(
+    core: Any,
+    project: Path,
+    proposal: Mapping[str, Any],
+    *,
+    expected_context_sha256: str,
+) -> Dict[str, Any]:
+    candidate_id = _id(proposal.get("id"), "method candidate id")
+    root = _candidate_root(project, candidate_id)
+    builder_path = core.regular_project_file(
+        project,
+        (root / "builder-provenance.json").relative_to(project).as_posix(),
+        "method candidate builder provenance",
+    )
+    provenance = core.load_json(builder_path)
+    builder = proposal.get("builder")
+    expected_builder_keys = {
+        "attested_by",
+        "context_id",
+        "heldout_included",
+        "input_context_sha256",
+        "role_id",
+        "task_id",
+    }
+    source_epoch = proposal.get("source_epoch")
+    source_epoch_sha256 = proposal.get("source_epoch_sha256")
+    validated_intent = _validated_method_builder_intent(
+        core, project, candidate_id, required=True
+    )
+    if validated_intent is None:
+        raise AppRequestError("方法候选缺少 Builder intent")
+    _, builder_intent = validated_intent
+    if (
+        not isinstance(builder, dict)
+        or set(builder) != expected_builder_keys
+        or _id(builder.get("role_id"), "builder.role_id")
+        != "method-candidate-builder"
+        or not isinstance(builder.get("context_id"), str)
+        or not isinstance(builder.get("task_id"), str)
+        or builder.get("attested_by") != "local-main-supervisor"
+        or builder.get("heldout_included") is not False
+        or builder.get("input_context_sha256") != expected_context_sha256
+        or proposal.get("builder_provenance") != "builder-provenance.json"
+        or not isinstance(provenance, dict)
+        or provenance.get("kind") != "RuntimeProvenance"
+        or provenance.get("run_id") != f"builder-{candidate_id}"
+        or provenance.get("context_sha256") != expected_context_sha256
+        or provenance.get("authority") != "main-observed-model-gateway"
+        or provenance.get("reasoning_content_persisted") is not False
+        or provenance.get("content_hash")
+        != core.app_record_content_hash(provenance)
+        or not isinstance(source_epoch, dict)
+        or not isinstance(source_epoch_sha256, str)
+        or source_epoch_sha256
+        != core.sha256_bytes(core.canonical_json_bytes(source_epoch))
+        or builder_intent.get("observation_id")
+        != proposal.get("observation_id")
+        or builder_intent.get("builder_context_sha256")
+        != expected_context_sha256
+        or builder_intent.get("expected_epoch_sha256")
+        != source_epoch_sha256
+    ):
+        raise AppRequestError("Candidate Builder provenance 与 proposal 绑定无效")
+    if (
+        _validated_method_builder_failure(
+            core, project, candidate_id, builder_intent
+        )
+        is not None
+        or _validated_method_builder_rejection(
+            core, project, candidate_id, builder_intent
+        )
+        is not None
+    ):
+        raise AppRequestError("完整候选不能同时绑定 Builder failure 或 rejection")
+    observed_epoch = _method_epoch_value(
+        core,
+        {"app_method_version_at_start": source_epoch.get("method_version")},
+        provenance,
+    )
+    if observed_epoch["sha256"] != source_epoch_sha256:
+        raise AppRequestError(
+            "Candidate Builder provenance 与候选冻结的模型基线不一致"
+        )
+    return provenance
+
+
 def _candidate_evaluation_plan(
     core: Any, project: Path, proposal: Mapping[str, Any]
 ) -> Dict[str, Any]:
@@ -4488,6 +5394,12 @@ def _candidate_evaluation_plan(
         != context["method_epoch_sha256"]
     ):
         raise AppRequestError("方法候选冻结的三项来源或模型基线已漂移")
+    _validated_method_candidate_builder(
+        core,
+        project,
+        proposal,
+        expected_context_sha256=context["builder_context_sha256"],
+    )
     heldout_task = proposal.get("heldout_task")
     guidance_sha256 = proposal.get("guidance_sha256")
     if not isinstance(heldout_task, str) or not isinstance(guidance_sha256, str):
@@ -4547,7 +5459,167 @@ def _candidate_evaluation_plan(
     }
 
 
+def _resumable_method_candidate(
+    core: Any, project: Path, observation_id: str
+) -> Optional[str]:
+    candidates_root = project / "creative-system" / "app-methods" / "candidates"
+    if not os.path.lexists(str(candidates_root)):
+        return None
+    if candidates_root.is_symlink() or not candidates_root.is_dir():
+        raise AppRequestError("方法候选根目录不是普通目录")
+    matches: list[str] = []
+    for candidate_dir in sorted(candidates_root.iterdir(), key=lambda item: item.name):
+        if candidate_dir.name.startswith("."):
+            continue
+        if candidate_dir.is_symlink() or not candidate_dir.is_dir():
+            raise AppRequestError("方法候选路径不是普通目录")
+        _, proposal, status = _load_method_candidate(
+            core, project, candidate_dir.name
+        )
+        if (
+            proposal.get("observation_id") == observation_id
+            and status.get("lifecycle") == "CANDIDATE"
+            and _validated_method_rejection_receipt(
+                core, project, candidate_dir.name
+            )
+            is None
+        ):
+            matches.append(candidate_dir.name)
+    if len(matches) > 1:
+        raise AppRequestError(
+            "同一观察存在多个未完成方法候选；请先在新方式中处理多余候选"
+        )
+    return matches[0] if matches else None
+
+
+def _method_candidate_preparation_context_value(
+    core: Any, project: Path, candidate_id: str
+) -> Dict[str, Any]:
+    root, proposal, status = _load_method_candidate(core, project, candidate_id)
+    if _validated_method_rejection_receipt(core, project, candidate_id) is not None:
+        raise AppRequestError("这次候选准备已被用户放弃，不能继续调用模型")
+    if status.get("lifecycle") != "CANDIDATE":
+        raise AppRequestError("当前候选不在可恢复的准备阶段")
+    context = _candidate_context_value(
+        core,
+        project,
+        str(proposal.get("observation_id")),
+        candidate_id,
+        frozen_sources=proposal.get("source_works"),
+    )
+    plan = _candidate_evaluation_plan(core, project, proposal)
+    _reconcile_method_generation_pending(core, project, root, proposal, plan)
+    if _method_comparisons_state_exists(root):
+        _finalize_method_comparisons_locked(
+            core, project, candidate_id, include_snapshot=False
+        )
+        raise AppRequestError("候选已进入盲比阶段，不能继续调用模型")
+    failure = _validated_method_generation_failure(
+        core, project, root, proposal, plan
+    )
+    if failure is not None:
+        raise AppRequestError(
+            "这次候选准备已因模型基线变化永久停止；"
+            "为避免重复付费，请在新方式中放弃本次准备"
+        )
+    unresolved_intent = _unresolved_method_generation_intent(
+        core, project, root, proposal, plan
+    )
+    if unresolved_intent is not None:
+        raise AppRequestError(
+            f"{unresolved_intent} 可能正在调用或已在付费后、receipt 封存前中断；"
+            "为避免重复付费，请放弃本次准备"
+        )
+    completed = _method_generation_progress(
+        core, project, root, proposal, plan
+    )
+    return {
+        **context,
+        "candidate_id": candidate_id,
+        "builder_required": False,
+        "guidance": proposal.get("guidance"),
+        "evaluation_plan": plan,
+        "completed_generation_labels": list(completed),
+        "generation_total": len(METHOD_GENERATION_LABELS),
+    }
+
+
+def _method_candidate_creation_result(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    status: Mapping[str, Any],
+    builder_provenance: Mapping[str, Any],
+    *,
+    builder_role_id: str,
+    builder_context_id: str,
+    builder_task_id: str,
+    builder_attested_by: str,
+    idempotent: bool,
+) -> Dict[str, Any]:
+    stored_builder_provenance = _validated_method_candidate_builder(
+        core,
+        project,
+        proposal,
+        expected_context_sha256=str(builder_provenance.get("context_sha256")),
+    )
+    builder_path = core.regular_project_file(
+        project,
+        (root / "builder-provenance.json").relative_to(project).as_posix(),
+        "method candidate builder provenance",
+    )
+    expected_builder = {
+        "role_id": builder_role_id,
+        "context_id": builder_context_id,
+        "task_id": builder_task_id,
+        "attested_by": builder_attested_by,
+        "input_context_sha256": builder_provenance.get("context_sha256"),
+        "heldout_included": False,
+    }
+    if (
+        stored_builder_provenance != builder_provenance
+        or proposal.get("builder") != expected_builder
+        or proposal.get("builder_provenance") != "builder-provenance.json"
+    ):
+        raise AppRequestError(
+            "同一 candidate_id 已绑定不同 Builder 身份、上下文或 RuntimeProvenance"
+        )
+    plan = _candidate_evaluation_plan(core, project, proposal)
+    _reconcile_method_generation_pending(core, project, root, proposal, plan)
+    if _method_comparisons_state_exists(root):
+        raise AppRequestError("候选 comparisons 已存在，不能重放 Builder 创建结果")
+    completed = _method_generation_progress(
+        core, project, root, proposal, plan
+    )
+    return {
+        "status": "PASS",
+        "candidate_id": proposal.get("id"),
+        "observation_id": proposal.get("observation_id"),
+        "lifecycle": status.get("lifecycle"),
+        "guidance": proposal.get("guidance"),
+        "guidance_sha256": proposal.get("guidance_sha256"),
+        "builder_context_sha256": builder_provenance.get("context_sha256"),
+        "builder_provenance_sha256": core.sha256_file(builder_path),
+        "proposal_sha256": core.sha256_file(root / "proposal.json"),
+        "source_epoch_sha256": proposal.get("source_epoch_sha256"),
+        "evaluation_plan": plan,
+        "completed_generation_labels": list(completed),
+        "generation_total": len(METHOD_GENERATION_LABELS),
+        "idempotent": idempotent,
+    }
+
+
 def _create_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    with core.exclusive_controller_lock(project):
+        return _create_method_candidate_locked(core, project, payload)
+
+
+def _create_method_candidate_locked(
+    core: Any, project: Path, payload: Mapping[str, Any]
+) -> Dict[str, Any]:
     _exact_keys(
         payload,
         "payload",
@@ -4563,11 +5635,44 @@ def _create_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
             "project",
         },
     )
-    core = load_controller()
-    project = _project_path(payload.get("project"))
+    _reconcile_method_candidate_pending(core, project)
     candidate_id = _id(payload.get("candidate_id"), "candidate_id")
     observation_id = _text(payload.get("observation_id"), "observation_id", maximum=100)
+    existing_candidate_id = _resumable_method_candidate(
+        core, project, observation_id
+    )
+    if (
+        existing_candidate_id is not None
+        and existing_candidate_id != candidate_id
+    ):
+        raise AppRequestError(
+            "同一观察已有未完成方法候选；请继续准备或先放弃本次准备"
+        )
     context = _candidate_context_value(core, project, observation_id, candidate_id)
+    builder_intent_value = _validated_method_builder_intent(
+        core, project, candidate_id, required=True
+    )
+    if builder_intent_value is None:
+        raise AppRequestError("Candidate Builder 准备 intent 缺失")
+    _, builder_intent = builder_intent_value
+    if (
+        builder_intent.get("observation_id") != observation_id
+        or builder_intent.get("builder_context_sha256")
+        != context["builder_context_sha256"]
+        or builder_intent.get("expected_epoch_sha256")
+        != context["method_epoch_sha256"]
+    ):
+        raise AppRequestError("Candidate Builder 准备 intent 与当前冻结上下文不一致")
+    if _validated_method_builder_rejection(
+        core, project, candidate_id, builder_intent
+    ) is not None:
+        raise AppRequestError("已放弃的 Candidate Builder 准备不能建立候选")
+    if _validated_method_builder_failure(
+        core, project, candidate_id, builder_intent
+    ) is not None:
+        raise AppRequestError(
+            "Candidate Builder 模型基线无法验真；为避免重复付费，只能放弃本次准备"
+        )
     guidance = _text(payload.get("guidance"), "guidance", maximum=2000, multiline=True)
     if "```" in guidance or "<script" in guidance.casefold():
         raise AppRequestError("方法候选只能是声明式创作指导，不接受代码块或脚本")
@@ -4583,10 +5688,33 @@ def _create_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
         builder_provenance,
     )
     if builder_epoch["sha256"] != context["method_epoch_sha256"]:
+        if not os.path.lexists(str(_candidate_root(project, candidate_id))):
+            _write_method_builder_failure_marker_locked(
+                core,
+                project,
+                candidate_id,
+                builder_intent,
+                error_code="METHOD_EPOCH_CHANGED",
+                observed_evidence_sha256=str(builder_epoch["sha256"]),
+            )
         raise AppRequestError("Candidate Builder 与三项来源不属于同一模型基线")
+    builder_role_id = _id(payload.get("builder_role_id"), "builder_role_id")
+    builder_context_id = _text(
+        payload.get("builder_context_id"), "builder_context_id", maximum=300
+    )
+    builder_task_id = _text(
+        payload.get("builder_task_id"), "builder_task_id", maximum=300
+    )
+    builder_attested_by = _text(
+        payload.get("builder_attested_by"), "builder_attested_by", maximum=300
+    )
     root = _candidate_root(project, candidate_id)
     if os.path.lexists(str(root)):
         _, proposal, status = _load_method_candidate(core, project, candidate_id)
+        if _validated_method_rejection_receipt(
+            core, project, candidate_id
+        ) is not None:
+            raise AppRequestError("已放弃的方法候选不能继续创建")
         if (
             proposal.get("guidance") != guidance
             or proposal.get("observation_id") != observation_id
@@ -4594,13 +5722,19 @@ def _create_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
             != context["method_epoch_sha256"]
         ):
             raise AppRequestError("同一 candidate_id 已绑定不同观察、基线或指导")
-        return {
-            "status": "PASS",
-            "candidate_id": candidate_id,
-            "lifecycle": status.get("lifecycle"),
-            "evaluation_plan": _candidate_evaluation_plan(core, project, proposal),
-            "idempotent": True,
-        }
+        return _method_candidate_creation_result(
+            core,
+            project,
+            root,
+            proposal,
+            status,
+            builder_provenance,
+            builder_role_id=builder_role_id,
+            builder_context_id=builder_context_id,
+            builder_task_id=builder_task_id,
+            builder_attested_by=builder_attested_by,
+            idempotent=True,
+        )
     current = _production_context_snapshot(core, project)
     heldout_task = (
         f"围绕这个创作方向完成一项全新的代表性作品，人物、情节或表达不得复用前三项："
@@ -4623,10 +5757,10 @@ def _create_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 for item in context["source_works"]
             ],
             "builder": {
-                "role_id": _id(payload.get("builder_role_id"), "builder_role_id"),
-                "context_id": _text(payload.get("builder_context_id"), "builder_context_id", maximum=300),
-                "task_id": _text(payload.get("builder_task_id"), "builder_task_id", maximum=300),
-                "attested_by": _text(payload.get("builder_attested_by"), "builder_attested_by", maximum=300),
+                "role_id": builder_role_id,
+                "context_id": builder_context_id,
+                "task_id": builder_task_id,
+                "attested_by": builder_attested_by,
                 "input_context_sha256": context["builder_context_sha256"],
                 "heldout_included": False,
             },
@@ -4653,25 +5787,32 @@ def _create_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
         },
     )
     core.guarded_mkdir_project(project, root.parent, "app method candidates root")
-    staging = Path(tempfile.mkdtemp(prefix=f".{candidate_id}.", dir=str(root.parent)))
-    try:
-        core.atomic_create_json(staging / "proposal.json", proposal)
-        core.atomic_create_json(staging / "builder-provenance.json", builder_provenance)
-        status["proposal_sha256"] = core.sha256_file(staging / "proposal.json")
-        status["content_hash"] = core.app_record_content_hash(status)
-        core.atomic_create_json(staging / "status.json", status)
-        os.rename(str(staging), str(root))
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-    return {
-        "status": "PASS",
-        "candidate_id": candidate_id,
-        "lifecycle": "CANDIDATE",
-        "guidance": guidance,
-        "evaluation_plan": _candidate_evaluation_plan(core, project, proposal),
-        "idempotent": False,
-    }
+    staging = _candidate_pending_root(project, candidate_id)
+    if os.path.lexists(str(staging)):
+        raise AppRequestError("pending 方法候选已存在，拒绝覆盖")
+    staging.mkdir()
+    core.atomic_create_json(staging / "proposal.json", proposal)
+    core.atomic_create_json(staging / "builder-provenance.json", builder_provenance)
+    status["proposal_sha256"] = core.sha256_file(staging / "proposal.json")
+    status["content_hash"] = core.app_record_content_hash(status)
+    core.atomic_create_json(staging / "status.json", status)
+    os.rename(str(staging), str(root))
+    loaded_root, loaded_proposal, loaded_status = _load_method_candidate(
+        core, project, candidate_id
+    )
+    return _method_candidate_creation_result(
+        core,
+        project,
+        loaded_root,
+        loaded_proposal,
+        loaded_status,
+        builder_provenance,
+        builder_role_id=builder_role_id,
+        builder_context_id=builder_context_id,
+        builder_task_id=builder_task_id,
+        builder_attested_by=builder_attested_by,
+        idempotent=False,
+    )
 
 
 def _candidate_status_update(
@@ -4707,56 +5848,1103 @@ def _normalize_method_generation(
     }
 
 
-def _stage_method_comparisons(payload: Mapping[str, Any]) -> Dict[str, Any]:
-    _exact_keys(payload, "payload", {"candidate_id", "generations", "project"})
+def _method_generation_expected_context(
+    plan: Mapping[str, Any], label: str
+) -> str:
+    locations = {
+        "targeted_candidate": ("targeted", "candidate_context_sha256"),
+        "regression_candidate": ("regression", "candidate_context_sha256"),
+        "heldout_baseline": ("heldout", "baseline_context_sha256"),
+        "heldout_candidate": ("heldout", "candidate_context_sha256"),
+    }
+    location = locations.get(label)
+    if location is None:
+        raise AppRequestError("候选准备 generation label 无效")
+    phase = _mapping(plan.get(location[0]), f"evaluation_plan.{location[0]}")
+    context_sha256 = phase.get(location[1])
+    if not isinstance(context_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", context_sha256
+    ):
+        raise AppRequestError("候选准备 context SHA256 无效")
+    return context_sha256
+
+
+def _method_generation_epoch_hashes(
+    core: Any,
+    proposal: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> tuple[str, str]:
+    source_epoch = proposal.get("source_epoch")
+    source_epoch_sha256 = proposal.get("source_epoch_sha256")
+    if (
+        not isinstance(source_epoch, Mapping)
+        or not isinstance(source_epoch_sha256, str)
+        or source_epoch_sha256
+        != core.sha256_bytes(core.canonical_json_bytes(source_epoch))
+    ):
+        raise AppRequestError("候选冻结的模型基线无效")
+    observed = _method_epoch_value(
+        core,
+        {"app_method_version_at_start": source_epoch.get("method_version")},
+        provenance,
+    )
+    return source_epoch_sha256, str(observed["sha256"])
+
+
+def _assert_method_generation_epoch(
+    core: Any,
+    proposal: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> None:
+    expected_epoch_sha256, observed_epoch_sha256 = _method_generation_epoch_hashes(
+        core, proposal, provenance
+    )
+    if observed_epoch_sha256 != expected_epoch_sha256:
+        raise AppRequestError(
+            "候选比较的模型、fingerprint、Profile 或参数已变化；"
+            "本项未封存，后续模型调用已阻止"
+        )
+
+
+def _method_generation_slot_root(root: Path, label: str) -> Path:
+    return root / "preparation" / "generations" / label
+
+
+def _method_generation_pending_root(root: Path, label: str) -> Path:
+    return root / "preparation" / "generations" / f".pending-{label}"
+
+
+def _method_generation_intent_path(root: Path, label: str) -> Path:
+    return root / "preparation" / "intents" / f"{label}.json"
+
+
+def _validated_method_generation_intent(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    label: str,
+    *,
+    required: bool = False,
+) -> Optional[tuple[Path, Dict[str, Any]]]:
+    path = _method_generation_intent_path(root, label)
+    if not os.path.lexists(str(path)):
+        if required:
+            raise AppRequestError(f"{label} 缺少模型调用前的不可变 intent")
+        return None
+    verified = core.regular_project_file(
+        project,
+        path.relative_to(project).as_posix(),
+        f"{label} method generation intent",
+    )
+    intent = core.load_json(verified)
+    expected_keys = {
+        "candidate_id",
+        "content_hash",
+        "context_sha256",
+        "created_at",
+        "expected_epoch_sha256",
+        "id",
+        "kind",
+        "label",
+        "output_persisted",
+        "reasoning_persisted",
+        "runtime_provenance_persisted",
+        "schema_version",
+        "source_refs",
+    }
+    if (
+        not isinstance(intent, dict)
+        or set(intent) != expected_keys
+        or intent.get("kind") != "AppMethodGenerationIntent"
+        or intent.get("id")
+        != f"generation-intent-{proposal.get('id')}-{label.replace('_', '-')}"
+        or intent.get("candidate_id") != proposal.get("id")
+        or intent.get("label") != label
+        or intent.get("context_sha256")
+        != _method_generation_expected_context(plan, label)
+        or intent.get("expected_epoch_sha256")
+        != proposal.get("source_epoch_sha256")
+        or intent.get("output_persisted") is not False
+        or intent.get("reasoning_persisted") is not False
+        or intent.get("runtime_provenance_persisted") is not False
+        or intent.get("source_refs") != []
+        or intent.get("content_hash") != core.app_record_content_hash(intent)
+    ):
+        raise AppRequestError(f"{label} generation intent 合同或摘要无效")
+    return verified, intent
+
+
+def _unresolved_method_generation_intent(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> Optional[str]:
+    intents_root = root / "preparation" / "intents"
+    if not os.path.lexists(str(intents_root)):
+        return None
+    if intents_root.is_symlink() or not intents_root.is_dir():
+        raise AppRequestError("候选 generation intents 根目录无效")
+    allowed = {f"{label}.json" for label in METHOD_GENERATION_LABELS}
+    observed = {item.name for item in intents_root.iterdir()}
+    if not observed.issubset(allowed):
+        raise AppRequestError("候选 generation intents 目录含未声明条目")
+    for label in METHOD_GENERATION_LABELS:
+        intent = _validated_method_generation_intent(
+            core, project, root, proposal, plan, label
+        )
+        if intent is None:
+            continue
+        slot = _validated_staged_method_generation(
+            core, project, root, proposal, plan, label
+        )
+        if slot is None:
+            return label
+    return None
+
+
+def _method_generation_failures_root(root: Path) -> Path:
+    return root / "preparation" / "failures"
+
+
+def _validated_method_generation_failure(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    failures_root = _method_generation_failures_root(root)
+    if not os.path.lexists(str(failures_root)):
+        return None
+    if failures_root.is_symlink() or not failures_root.is_dir():
+        raise AppRequestError("候选准备 failure marker 根目录无效")
+    entries = sorted(failures_root.iterdir(), key=lambda item: item.name)
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise AppRequestError("候选准备只能有一个终止性 failure marker")
+    path = entries[0]
+    if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+        raise AppRequestError("候选准备 failure marker 不是普通 JSON 文件")
+    marker_path = core.regular_project_file(
+        project,
+        path.relative_to(project).as_posix(),
+        "method generation failure marker",
+    )
+    marker = core.load_json(marker_path)
+    label = marker.get("label") if isinstance(marker, dict) else None
+    expected_keys = {
+        "candidate_id",
+        "content_hash",
+        "context_sha256",
+        "created_at",
+        "error_code",
+        "expected_epoch_sha256",
+        "id",
+        "kind",
+        "label",
+        "observed_evidence_sha256",
+        "observed_epoch_sha256",
+        "schema_version",
+        "source_refs",
+    }
+    observed_epoch_sha256 = (
+        marker.get("observed_epoch_sha256") if isinstance(marker, dict) else None
+    )
+    observed_evidence_sha256 = (
+        marker.get("observed_evidence_sha256") if isinstance(marker, dict) else None
+    )
+    error_code = marker.get("error_code") if isinstance(marker, dict) else None
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != expected_keys
+        or label not in METHOD_GENERATION_LABELS
+        or path.name != f"{label}.json"
+        or marker.get("kind") != "AppMethodGenerationFailure"
+        or marker.get("id")
+        != f"generation-failure-{proposal.get('id')}-{str(label).replace('_', '-')}"
+        or marker.get("candidate_id") != proposal.get("id")
+        or error_code not in {"METHOD_EPOCH_CHANGED", "METHOD_EPOCH_UNVERIFIABLE"}
+        or marker.get("context_sha256")
+        != _method_generation_expected_context(plan, str(label))
+        or marker.get("expected_epoch_sha256")
+        != proposal.get("source_epoch_sha256")
+        or not isinstance(observed_evidence_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", observed_evidence_sha256)
+        or (
+            error_code == "METHOD_EPOCH_CHANGED"
+            and (
+                not isinstance(observed_epoch_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", observed_epoch_sha256)
+                or observed_epoch_sha256 == proposal.get("source_epoch_sha256")
+            )
+        )
+        or (
+            error_code == "METHOD_EPOCH_UNVERIFIABLE"
+            and observed_epoch_sha256 is not None
+        )
+        or marker.get("source_refs") != []
+        or marker.get("content_hash") != core.app_record_content_hash(marker)
+    ):
+        raise AppRequestError("候选准备 failure marker 合同或摘要无效")
+    return marker
+
+
+def _write_method_generation_failure_marker(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    label: str,
+    *,
+    error_code: str,
+    observed_epoch_sha256: Optional[str],
+    observed_evidence_sha256: str,
+) -> Dict[str, Any]:
+    existing = _validated_method_generation_failure(
+        core, project, root, proposal, plan
+    )
+    if existing is not None:
+        if (
+            existing.get("label") != label
+            or existing.get("error_code") != error_code
+            or existing.get("observed_epoch_sha256") != observed_epoch_sha256
+            or existing.get("observed_evidence_sha256")
+            != observed_evidence_sha256
+        ):
+            raise AppRequestError("候选准备已绑定不同终止性 failure marker")
+        return existing
+    failures_root = _method_generation_failures_root(root)
+    core.guarded_mkdir_project(
+        project, failures_root, "method generation failure markers"
+    )
+    marker = _record(
+        core,
+        "AppMethodGenerationFailure",
+        f"generation-failure-{proposal.get('id')}-{label.replace('_', '-')}",
+        {
+            "candidate_id": proposal.get("id"),
+            "label": label,
+            "error_code": error_code,
+            "context_sha256": _method_generation_expected_context(plan, label),
+            "expected_epoch_sha256": proposal.get("source_epoch_sha256"),
+            "observed_epoch_sha256": observed_epoch_sha256,
+            "observed_evidence_sha256": observed_evidence_sha256,
+        },
+    )
+    core.atomic_create_json(failures_root / f"{label}.json", marker)
+    validated = _validated_method_generation_failure(
+        core, project, root, proposal, plan
+    )
+    if validated is None:
+        raise AppRequestError("候选准备 failure marker 未成功封存")
+    return validated
+
+
+def _validated_staged_method_generation(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    label: str,
+) -> Optional[Dict[str, Any]]:
+    slot_root = _method_generation_slot_root(root, label)
+    if not os.path.lexists(str(slot_root)):
+        return None
+    if slot_root.is_symlink() or not slot_root.is_dir():
+        raise AppRequestError(f"{label} 候选准备 slot 不是普通目录")
+    _validated_method_generation_intent(
+        core,
+        project,
+        root,
+        proposal,
+        plan,
+        label,
+        required=True,
+    )
+    if {item.name for item in slot_root.iterdir()} != {
+        "output.md",
+        "receipt.json",
+        "runtime-provenance.json",
+    }:
+        raise AppRequestError(f"{label} generation slot 清单不是 exact-three")
+    output_path = core.regular_project_file(
+        project,
+        (slot_root / "output.md").relative_to(project).as_posix(),
+        f"{label} generation output",
+    )
+    provenance_path = core.regular_project_file(
+        project,
+        (slot_root / "runtime-provenance.json").relative_to(project).as_posix(),
+        f"{label} generation provenance",
+    )
+    receipt_path = core.regular_project_file(
+        project,
+        (slot_root / "receipt.json").relative_to(project).as_posix(),
+        f"{label} generation receipt",
+    )
+    try:
+        output = output_path.read_bytes().decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise AppRequestError(f"{label} generation output 不是 UTF-8") from exc
+    _text(output, f"{label}.output", maximum=500000, multiline=True)
+    provenance = core.load_json(provenance_path)
+    receipt = core.load_json(receipt_path)
+    expected_context_sha256 = _method_generation_expected_context(plan, label)
+    expected_output_sha256 = core.sha256_bytes(output.encode("utf-8"))
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("kind") != "RuntimeProvenance"
+        or provenance.get("content_hash") != core.app_record_content_hash(provenance)
+        or provenance.get("context_sha256") != expected_context_sha256
+    ):
+        raise AppRequestError(f"{label} generation RuntimeProvenance 无效")
+    _assert_method_generation_epoch(core, proposal, provenance)
+    output_ref = receipt.get("output") if isinstance(receipt, dict) else None
+    provenance_ref = (
+        receipt.get("runtime_provenance") if isinstance(receipt, dict) else None
+    )
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("kind") != "AppMethodGenerationReceipt"
+        or receipt.get("id") != f"generation-{proposal.get('id')}-{label.replace('_', '-')}"
+        or receipt.get("candidate_id") != proposal.get("id")
+        or receipt.get("label") != label
+        or receipt.get("context_sha256") != expected_context_sha256
+        or receipt.get("source_epoch_sha256")
+        != proposal.get("source_epoch_sha256")
+        or not isinstance(output_ref, dict)
+        or output_ref.get("path") != output_path.relative_to(project).as_posix()
+        or output_ref.get("sha256") != expected_output_sha256
+        or output_ref.get("bytes") != output_path.stat().st_size
+        or not isinstance(provenance_ref, dict)
+        or provenance_ref.get("path")
+        != provenance_path.relative_to(project).as_posix()
+        or provenance_ref.get("sha256") != core.sha256_file(provenance_path)
+        or receipt.get("content_hash") != core.app_record_content_hash(receipt)
+    ):
+        raise AppRequestError(f"{label} generation receipt 无效")
+    return {
+        "output": output,
+        "output_sha256": expected_output_sha256,
+        "provenance": provenance,
+        "receipt": receipt,
+    }
+
+
+def _method_generation_progress(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> tuple[str, ...]:
+    return tuple(
+        label
+        for label in METHOD_GENERATION_LABELS
+        if _validated_staged_method_generation(
+            core, project, root, proposal, plan, label
+        )
+        is not None
+    )
+
+
+def _reconcile_method_generation_pending(
+    core: Any,
+    project: Path,
+    root: Path,
+    proposal: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> None:
+    generations_root = root / "preparation" / "generations"
+    if not os.path.lexists(str(generations_root)):
+        return
+    if generations_root.is_symlink() or not generations_root.is_dir():
+        raise AppRequestError("候选 preparation/generations 不是普通目录")
+    allowed_entries = set(METHOD_GENERATION_LABELS) | {
+        f".pending-{label}" for label in METHOD_GENERATION_LABELS
+    }
+    unexpected = sorted(
+        item.name for item in generations_root.iterdir()
+        if item.name not in allowed_entries
+    )
+    if unexpected:
+        raise AppRequestError(
+            "候选 generation 存在未治理的崩溃残留；为避免重复付费，只能放弃本次准备"
+        )
+    for label in METHOD_GENERATION_LABELS:
+        pending = _method_generation_pending_root(root, label)
+        if not os.path.lexists(str(pending)):
+            continue
+        if pending.is_symlink() or not pending.is_dir():
+            raise AppRequestError(
+                f"{label} pending slot 无效；为避免重复付费，只能放弃本次准备"
+            )
+        final = _method_generation_slot_root(root, label)
+        if os.path.lexists(str(final)):
+            raise AppRequestError(
+                f"{label} 同时存在 committed 与 pending slot；只能放弃本次准备"
+            )
+        if {item.name for item in pending.iterdir()} != {
+            "output.md",
+            "receipt.json",
+            "runtime-provenance.json",
+        }:
+            raise AppRequestError(
+                f"{label} 付费结果只完成部分持久化；不会重跑，只能放弃本次准备"
+            )
+        _validated_method_generation_intent(
+            core,
+            project,
+            root,
+            proposal,
+            plan,
+            label,
+            required=True,
+        )
+        os.rename(str(pending), str(final))
+        _validated_staged_method_generation(
+            core, project, root, proposal, plan, label
+        )
+
+
+def _begin_method_generation_locked(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+    label: str,
+    context_sha256: str,
+    expected_epoch_sha256: str,
+) -> tuple[bool, Path]:
+    if label not in METHOD_GENERATION_LABELS:
+        raise AppRequestError("候选准备 generation label 无效")
+    root, proposal, status = _load_method_candidate(core, project, candidate_id)
+    if _validated_method_rejection_receipt(core, project, candidate_id) is not None:
+        raise AppRequestError("已放弃的方法候选不能开始 generation")
+    if status.get("lifecycle") != "CANDIDATE":
+        raise AppRequestError("当前候选已经离开可恢复的准备阶段")
+    plan = _candidate_evaluation_plan(core, project, proposal)
+    _reconcile_method_generation_pending(core, project, root, proposal, plan)
+    if _method_comparisons_state_exists(root):
+        raise AppRequestError("候选 comparisons 已存在，不能发起新的模型调用")
+    if _validated_method_generation_failure(
+        core, project, root, proposal, plan
+    ) is not None:
+        raise AppRequestError("这次候选准备已终止；请放弃本次准备")
+    _method_generation_progress(core, project, root, proposal, plan)
+    if (
+        context_sha256 != _method_generation_expected_context(plan, label)
+        or expected_epoch_sha256 != proposal.get("source_epoch_sha256")
+    ):
+        raise AppRequestError("generation intent 未绑定候选冻结上下文")
+    if _validated_staged_method_generation(
+        core, project, root, proposal, plan, label
+    ) is not None:
+        raise AppRequestError(f"{label} 已封存，不能重新开始模型调用")
+    unresolved = _unresolved_method_generation_intent(
+        core, project, root, proposal, plan
+    )
+    if unresolved is not None and unresolved != label:
+        raise AppRequestError(
+            f"{unresolved} 可能已经调用模型但未完整封存；"
+            "为避免重复付费，只能放弃本次准备"
+        )
+    existing = _validated_method_generation_intent(
+        core, project, root, proposal, plan, label
+    )
+    idempotent = existing is not None
+    if existing is None:
+        intent = _record(
+            core,
+            "AppMethodGenerationIntent",
+            f"generation-intent-{candidate_id}-{label.replace('_', '-')}",
+            {
+                "candidate_id": candidate_id,
+                "label": label,
+                "context_sha256": context_sha256,
+                "expected_epoch_sha256": expected_epoch_sha256,
+                "output_persisted": False,
+                "reasoning_persisted": False,
+                "runtime_provenance_persisted": False,
+            },
+        )
+        intent_path = _method_generation_intent_path(root, label)
+        core.guarded_mkdir_project(
+            project, intent_path.parent, "method generation intents"
+        )
+        core.atomic_create_json(intent_path, intent)
+        existing = _validated_method_generation_intent(
+            core, project, root, proposal, plan, label, required=True
+        )
+    if existing is None:
+        raise AppRequestError(f"{label} generation intent 未成功封存")
+    return idempotent, existing[0]
+
+
+def _begin_method_generation(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(
+        payload,
+        "payload",
+        {
+            "candidate_id",
+            "context_sha256",
+            "expected_epoch_sha256",
+            "label",
+            "project",
+        },
+    )
     core = load_controller()
     project = _project_path(payload.get("project"))
     candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    label = _text(payload.get("label"), "label", maximum=40)
+    context_sha256 = _text(
+        payload.get("context_sha256"), "context_sha256", maximum=64
+    )
+    expected_epoch_sha256 = _text(
+        payload.get("expected_epoch_sha256"),
+        "expected_epoch_sha256",
+        maximum=64,
+    )
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (context_sha256, expected_epoch_sha256)
+    ):
+        raise AppRequestError("generation intent SHA256 无效")
+    with core.exclusive_controller_lock(project):
+        idempotent, intent_path = _begin_method_generation_locked(
+            core,
+            project,
+            candidate_id,
+            label,
+            context_sha256,
+            expected_epoch_sha256,
+        )
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "label": label,
+        "context_sha256": context_sha256,
+        "expected_epoch_sha256": expected_epoch_sha256,
+        "intent_sha256": core.sha256_file(intent_path),
+        "idempotent": idempotent,
+    }
+
+
+def _record_method_generation_locked(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+    label: str,
+    generation: Any,
+) -> tuple[bool, tuple[str, ...]]:
+    if label not in METHOD_GENERATION_LABELS:
+        raise AppRequestError("候选准备 generation label 无效")
     root, proposal, status = _load_method_candidate(core, project, candidate_id)
-    if status.get("lifecycle") not in {"CANDIDATE", "EVALUATING", "READY_FOR_HUMAN"}:
-        raise AppRequestError("当前方法候选不能建立盲比")
-    generations = _mapping(payload.get("generations"), "generations")
+    if _validated_method_rejection_receipt(core, project, candidate_id) is not None:
+        raise AppRequestError("已放弃的方法候选不能继续封存 generation")
+    if status.get("lifecycle") != "CANDIDATE":
+        raise AppRequestError("当前候选已经离开可恢复的准备阶段")
+    plan = _candidate_evaluation_plan(core, project, proposal)
+    _reconcile_method_generation_pending(core, project, root, proposal, plan)
+    if _method_comparisons_state_exists(root):
+        raise AppRequestError("候选 comparisons 已存在，不能追加 generation")
+    if _validated_method_generation_failure(
+        core, project, root, proposal, plan
+    ) is not None:
+        raise AppRequestError(
+            "这次候选准备已因模型基线变化永久停止；请放弃本次准备"
+        )
+    _method_generation_progress(core, project, root, proposal, plan)
+    expected_context_sha256 = _method_generation_expected_context(plan, label)
+    _validated_method_generation_intent(
+        core,
+        project,
+        root,
+        proposal,
+        plan,
+        label,
+        required=True,
+    )
+    existing = _validated_staged_method_generation(
+        core, project, root, proposal, plan, label
+    )
+    normalized = _normalize_method_generation(
+        core,
+        generation,
+        candidate_id=candidate_id,
+        label=label,
+        expected_context_sha256=expected_context_sha256,
+    )
+    idempotent = existing is not None
+    if existing is not None:
+        if (
+            existing["output"] != normalized["output"]
+            or existing["provenance"] != normalized["provenance"]
+        ):
+            raise AppRequestError(f"{label} 已绑定不同生成结果，拒绝覆盖")
+    else:
+        expected_epoch_sha256, observed_epoch_sha256 = (
+            _method_generation_epoch_hashes(
+                core, proposal, normalized["provenance"]
+            )
+        )
+        if observed_epoch_sha256 != expected_epoch_sha256:
+            _write_method_generation_failure_marker(
+                core,
+                project,
+                root,
+                proposal,
+                plan,
+                label,
+                error_code="METHOD_EPOCH_CHANGED",
+                observed_epoch_sha256=observed_epoch_sha256,
+                observed_evidence_sha256=observed_epoch_sha256,
+            )
+            raise AppRequestError(
+                "候选比较的模型、fingerprint、Profile 或参数已变化；"
+                "未保存生成正文，后续模型调用已永久阻止"
+            )
+        slot_root = _method_generation_slot_root(root, label)
+        parent = slot_root.parent
+        core.guarded_mkdir_project(project, parent, "method generation slots")
+        staging = _method_generation_pending_root(root, label)
+        if os.path.lexists(str(staging)):
+            raise AppRequestError(f"{label} pending slot 已存在，拒绝覆盖")
+        staging.mkdir()
+        output_path = staging / "output.md"
+        provenance_path = staging / "runtime-provenance.json"
+        receipt_path = staging / "receipt.json"
+        core.atomic_create_bytes(output_path, normalized["output"].encode("utf-8"))
+        core.atomic_create_json(provenance_path, normalized["provenance"])
+        final_output = slot_root / "output.md"
+        final_provenance = slot_root / "runtime-provenance.json"
+        receipt = _record(
+            core,
+            "AppMethodGenerationReceipt",
+            f"generation-{candidate_id}-{label.replace('_', '-')}",
+            {
+                "candidate_id": candidate_id,
+                "label": label,
+                "context_sha256": expected_context_sha256,
+                "source_epoch_sha256": proposal.get("source_epoch_sha256"),
+                "output": {
+                    "path": final_output.relative_to(project).as_posix(),
+                    "sha256": normalized["output_sha256"],
+                    "bytes": output_path.stat().st_size,
+                },
+                "runtime_provenance": {
+                    "path": final_provenance.relative_to(project).as_posix(),
+                    "sha256": core.sha256_file(provenance_path),
+                },
+            },
+        )
+        core.atomic_create_json(receipt_path, receipt)
+        os.rename(str(staging), str(slot_root))
+        _validated_staged_method_generation(
+            core, project, root, proposal, plan, label
+        )
+    return idempotent, _method_generation_progress(
+        core, project, root, proposal, plan
+    )
+
+
+def _record_method_generation(payload: Mapping[str, Any]) -> Dict[str, Any]:
     _exact_keys(
-        generations,
-        "generations",
+        payload, "payload", {"candidate_id", "generation", "label", "project"}
+    )
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    label = _text(payload.get("label"), "label", maximum=40)
+    with core.exclusive_controller_lock(project):
+        idempotent, completed = _record_method_generation_locked(
+            core, project, candidate_id, label, payload.get("generation")
+        )
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "label": label,
+        "completed_generation_labels": list(completed),
+        "generation_total": len(METHOD_GENERATION_LABELS),
+        "idempotent": idempotent,
+    }
+
+
+def _record_method_generation_failure(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(
+        payload,
+        "payload",
         {
-            "heldout_baseline",
-            "heldout_candidate",
-            "regression_candidate",
-            "targeted_candidate",
+            "candidate_id",
+            "context_sha256",
+            "error_code",
+            "expected_epoch_sha256",
+            "label",
+            "observed_evidence_sha256",
+            "project",
         },
     )
-    plan = _candidate_evaluation_plan(core, project, proposal)
-    normalized = {
-        "targeted_candidate": _normalize_method_generation(
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    label = _text(payload.get("label"), "label", maximum=40)
+    if label not in METHOD_GENERATION_LABELS:
+        raise AppRequestError("候选准备 generation label 无效")
+    error_code = _text(payload.get("error_code"), "error_code", maximum=80)
+    if error_code != "METHOD_EPOCH_UNVERIFIABLE":
+        raise AppRequestError("generation failure error_code 无效")
+    context_sha256 = _text(
+        payload.get("context_sha256"), "context_sha256", maximum=64
+    )
+    expected_epoch_sha256 = _text(
+        payload.get("expected_epoch_sha256"),
+        "expected_epoch_sha256",
+        maximum=64,
+    )
+    observed_evidence_sha256 = _text(
+        payload.get("observed_evidence_sha256"),
+        "observed_evidence_sha256",
+        maximum=64,
+    )
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (
+            context_sha256,
+            expected_epoch_sha256,
+            observed_evidence_sha256,
+        )
+    ):
+        raise AppRequestError("generation failure SHA256 无效")
+    with core.exclusive_controller_lock(project):
+        root, proposal, status = _load_method_candidate(
+            core, project, candidate_id
+        )
+        if _validated_method_rejection_receipt(
+            core, project, candidate_id
+        ) is not None or status.get("lifecycle") != "CANDIDATE":
+            raise AppRequestError("当前候选不能封存 generation failure")
+        plan = _candidate_evaluation_plan(core, project, proposal)
+        _reconcile_method_generation_pending(core, project, root, proposal, plan)
+        if _method_comparisons_state_exists(root):
+            raise AppRequestError("候选 comparisons 已存在，不能追加 generation failure")
+        if (
+            context_sha256 != _method_generation_expected_context(plan, label)
+            or expected_epoch_sha256 != proposal.get("source_epoch_sha256")
+        ):
+            raise AppRequestError("generation failure 未绑定候选冻结上下文")
+        _validated_method_generation_intent(
             core,
-            generations.get("targeted_candidate"),
-            candidate_id=candidate_id,
-            label="targeted_candidate",
-            expected_context_sha256=plan["targeted"]["candidate_context_sha256"],
-        ),
-        "regression_candidate": _normalize_method_generation(
+            project,
+            root,
+            proposal,
+            plan,
+            label,
+            required=True,
+        )
+        if _validated_staged_method_generation(
+            core, project, root, proposal, plan, label
+        ) is not None:
+            raise AppRequestError("generation 已成功封存，不能追加 failure marker")
+        marker = _write_method_generation_failure_marker(
             core,
-            generations.get("regression_candidate"),
-            candidate_id=candidate_id,
-            label="regression_candidate",
-            expected_context_sha256=plan["regression"]["candidate_context_sha256"],
-        ),
-        "heldout_baseline": _normalize_method_generation(
-            core,
-            generations.get("heldout_baseline"),
-            candidate_id=candidate_id,
-            label="heldout_baseline",
-            expected_context_sha256=plan["heldout"]["baseline_context_sha256"],
-        ),
-        "heldout_candidate": _normalize_method_generation(
-            core,
-            generations.get("heldout_candidate"),
-            candidate_id=candidate_id,
-            label="heldout_candidate",
-            expected_context_sha256=plan["heldout"]["candidate_context_sha256"],
+            project,
+            root,
+            proposal,
+            plan,
+            label,
+            error_code=error_code,
+            observed_epoch_sha256=None,
+            observed_evidence_sha256=observed_evidence_sha256,
+        )
+    return {
+        "status": "PASS",
+        "candidate_id": candidate_id,
+        "label": label,
+        "error_code": marker.get("error_code"),
+        "failure_marker_sha256": core.sha256_file(
+            _method_generation_failures_root(root) / f"{label}.json"
         ),
     }
+
+
+def _stage_method_comparisons(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    _exact_keys(payload, "payload", {"candidate_id", "generations", "project"})
+    keys = set(payload)
+    if keys not in (
+        {"candidate_id", "project"},
+        {"candidate_id", "generations", "project"},
+    ):
+        raise AppRequestError("stage_method_comparisons payload 字段无效")
+    core = load_controller()
+    project = _project_path(payload.get("project"))
+    candidate_id = _id(payload.get("candidate_id"), "candidate_id")
+    with core.exclusive_controller_lock(project):
+        if "generations" in payload:
+            generations = _mapping(payload.get("generations"), "generations")
+            _exact_keys(generations, "generations", set(METHOD_GENERATION_LABELS))
+            if set(generations) != set(METHOD_GENERATION_LABELS):
+                raise AppRequestError("generations 必须精确包含四个候选准备 slot")
+            _, proposal, _ = _load_method_candidate(
+                core, project, candidate_id
+            )
+            plan = _candidate_evaluation_plan(core, project, proposal)
+            for label in METHOD_GENERATION_LABELS:
+                _begin_method_generation_locked(
+                    core,
+                    project,
+                    candidate_id,
+                    label,
+                    _method_generation_expected_context(plan, label),
+                    str(proposal.get("source_epoch_sha256")),
+                )
+                _record_method_generation_locked(
+                    core, project, candidate_id, label, generations.get(label)
+                )
+        result = _finalize_method_comparisons_locked(
+            core, project, candidate_id
+        )
+    return result
+
+
+def _write_method_comparisons_tree(
+    core: Any,
+    project: Path,
+    comparisons_root: Path,
+    candidate_id: str,
+    pairs: Mapping[str, tuple[str, str]],
+    generations: Mapping[str, Mapping[str, Any]],
+    model: str,
+    fingerprint: str,
+) -> None:
+    for phase in METHOD_PHASES:
+        baseline, candidate = pairs[phase]
+        candidate_left = int(
+            hashlib.sha256(f"{candidate_id}:{phase}".encode("utf-8")).hexdigest()[:2],
+            16,
+        ) % 2 == 0
+        left = candidate if candidate_left else baseline
+        right = baseline if candidate_left else candidate
+        mapping = _record(
+            core,
+            "AppMethodBlindMapping",
+            f"mapping-{candidate_id}-{phase}",
+            {
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "candidate_label": "A" if candidate_left else "B",
+                "baseline_label": "B" if candidate_left else "A",
+                "hidden_from_renderer_until_decision": True,
+            },
+        )
+        public = _record(
+            core,
+            "AppMethodBlindComparison",
+            f"comparison-{candidate_id}-{phase}",
+            {
+                "candidate_id": candidate_id,
+                "phase": phase,
+                "left": left,
+                "left_sha256": core.sha256_bytes(left.encode("utf-8")),
+                "right": right,
+                "right_sha256": core.sha256_bytes(right.encode("utf-8")),
+                "model": model,
+                "system_fingerprint": fingerprint,
+                "mapping_disclosed": False,
+            },
+        )
+        phase_root = comparisons_root / phase
+        generation_root = phase_root / "generation"
+        generation_root.mkdir(parents=True)
+        core.atomic_create_json(phase_root / "mapping.json", mapping)
+        core.atomic_create_json(phase_root / "public.json", public)
+        if phase == "heldout":
+            phase_generations = {
+                "baseline": generations["heldout_baseline"],
+                "candidate": generations["heldout_candidate"],
+            }
+        else:
+            phase_generations = {
+                "candidate": generations[f"{phase}_candidate"],
+            }
+        for name, item in phase_generations.items():
+            core.atomic_create_json(
+                generation_root / f"{name}-provenance.json", item["provenance"]
+            )
+
+
+def _method_comparisons_pending_root(root: Path) -> Path:
+    return root / ".pending-comparisons"
+
+
+def _method_comparisons_state_exists(root: Path) -> bool:
+    return (
+        os.path.lexists(str(root / "comparisons"))
+        or os.path.lexists(str(_method_comparisons_pending_root(root)))
+        or any(item.name.startswith(".comparisons.") for item in root.iterdir())
+    )
+
+
+def _reconcile_method_comparisons_pending(root: Path) -> None:
+    legacy_pending = [
+        item for item in root.iterdir()
+        if item.name.startswith(".comparisons.")
+    ]
+    if legacy_pending:
+        raise AppRequestError(
+            "候选 comparisons 存在旧版崩溃残留；不会重复生成，只能放弃本次准备"
+        )
+    pending = _method_comparisons_pending_root(root)
+    if not os.path.lexists(str(pending)):
+        return
+    if pending.is_symlink() or not pending.is_dir():
+        raise AppRequestError("候选 pending comparisons 无效；只能放弃本次准备")
+    final = root / "comparisons"
+    if os.path.lexists(str(final)):
+        raise AppRequestError(
+            "候选同时存在 committed 与 pending comparisons；只能放弃本次准备"
+        )
+    phases = {item.name: item for item in pending.iterdir()}
+    if set(phases) != set(METHOD_PHASES):
+        raise AppRequestError(
+            "候选 comparisons 只完成部分持久化；不会重跑，只能放弃本次准备"
+        )
+    for phase, phase_root in phases.items():
+        if phase_root.is_symlink() or not phase_root.is_dir():
+            raise AppRequestError("候选 pending comparison phase 无效")
+        entries = {item.name: item for item in phase_root.iterdir()}
+        if set(entries) != {"generation", "mapping.json", "public.json"}:
+            raise AppRequestError(
+                "候选 comparison phase 只完成部分持久化；只能放弃本次准备"
+            )
+        generation_root = entries["generation"]
+        if generation_root.is_symlink() or not generation_root.is_dir():
+            raise AppRequestError("候选 pending comparison generation 无效")
+        expected_generation_files = (
+            {"baseline-provenance.json", "candidate-provenance.json"}
+            if phase == "heldout"
+            else {"candidate-provenance.json"}
+        )
+        if {item.name for item in generation_root.iterdir()} != expected_generation_files:
+            raise AppRequestError(
+                "候选 comparison provenance 只完成部分持久化；只能放弃本次准备"
+            )
+    os.rename(str(pending), str(final))
+
+
+def _validate_final_method_comparisons(
+    core: Any,
+    project: Path,
+    root: Path,
+    candidate_id: str,
+    pairs: Mapping[str, tuple[str, str]],
+    generations: Mapping[str, Mapping[str, Any]],
+    model: str,
+    fingerprint: str,
+) -> None:
+    comparisons_root = root / "comparisons"
+    if comparisons_root.is_symlink() or not comparisons_root.is_dir():
+        raise AppRequestError("候选 comparisons 不是普通目录")
+    observed_phases = {
+        item.name
+        for item in comparisons_root.iterdir()
+        if item.name != ".gitkeep"
+    }
+    if observed_phases != set(METHOD_PHASES):
+        raise AppRequestError("候选 comparisons 不是完整 exact-three")
+    for phase in METHOD_PHASES:
+        baseline, candidate = pairs[phase]
+        public_path, mapping_path, public, mapping = _validated_method_comparison(
+            core, project, root, candidate_id, phase
+        )
+        candidate_left = int(
+            hashlib.sha256(f"{candidate_id}:{phase}".encode("utf-8")).hexdigest()[:2],
+            16,
+        ) % 2 == 0
+        expected_left = candidate if candidate_left else baseline
+        expected_right = baseline if candidate_left else candidate
+        if (
+            mapping.get("candidate_label") != ("A" if candidate_left else "B")
+            or mapping.get("baseline_label") != ("B" if candidate_left else "A")
+            or public.get("left") != expected_left
+            or public.get("right") != expected_right
+            or public.get("model") != model
+            or public.get("system_fingerprint") != fingerprint
+        ):
+            raise AppRequestError("候选 comparisons 与已封存 generation 不一致")
+        if not public_path.is_file() or not mapping_path.is_file():
+            raise AppRequestError("候选 comparisons 公开文本或映射缺失")
+        generation_root = comparisons_root / phase / "generation"
+        if generation_root.is_symlink() or not generation_root.is_dir():
+            raise AppRequestError("候选 comparison generation 不是普通目录")
+        expected_generations = (
+            {
+                "baseline": generations["heldout_baseline"],
+                "candidate": generations["heldout_candidate"],
+            }
+            if phase == "heldout"
+            else {"candidate": generations[f"{phase}_candidate"]}
+        )
+        observed_files = {item.name for item in generation_root.iterdir()}
+        expected_files = {
+            f"{name}-provenance.json" for name in expected_generations
+        }
+        if observed_files != expected_files:
+            raise AppRequestError("候选 comparison generation 清单无效")
+        for name, item in expected_generations.items():
+            provenance_path = core.regular_project_file(
+                project,
+                (generation_root / f"{name}-provenance.json")
+                .relative_to(project)
+                .as_posix(),
+                f"{phase} {name} comparison provenance",
+            )
+            if core.load_json(provenance_path) != item["provenance"]:
+                raise AppRequestError("候选 comparison provenance 与准备 receipt 不一致")
+
+
+def _finalize_method_comparisons_locked(
+    core: Any,
+    project: Path,
+    candidate_id: str,
+    *,
+    include_snapshot: bool = True,
+) -> Dict[str, Any]:
+    root, proposal, status = _load_method_candidate(core, project, candidate_id)
+    if _validated_method_rejection_receipt(core, project, candidate_id) is not None:
+        raise AppRequestError("已放弃的方法候选不能建立或继续盲比")
+    if status.get("lifecycle") not in {"CANDIDATE", "EVALUATING", "READY_FOR_HUMAN"}:
+        raise AppRequestError("当前方法候选不能建立盲比")
+    plan = _candidate_evaluation_plan(core, project, proposal)
+    _reconcile_method_generation_pending(core, project, root, proposal, plan)
+    if _validated_method_generation_failure(
+        core, project, root, proposal, plan
+    ) is not None:
+        raise AppRequestError(
+            "这次候选准备已因模型基线变化永久停止；请放弃本次准备"
+        )
+    unresolved_intent = _unresolved_method_generation_intent(
+        core, project, root, proposal, plan
+    )
+    if unresolved_intent is not None:
+        raise AppRequestError(
+            f"{unresolved_intent} 可能已在付费后中断；为避免重复付费，请放弃本次准备"
+        )
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for label in METHOD_GENERATION_LABELS:
+        item = _validated_staged_method_generation(
+            core, project, root, proposal, plan, label
+        )
+        if item is None:
+            raise AppRequestError(
+                f"候选准备尚未完成 {label}；已封存结果会保留，请继续准备"
+            )
+        normalized[label] = item
     context = _candidate_context_value(
         core,
         project,
@@ -4819,80 +7007,140 @@ def _stage_method_comparisons(payload: Mapping[str, Any]) -> Dict[str, Any]:
             normalized["heldout_candidate"]["output"],
         ),
     }
-    for phase, (baseline, candidate) in pairs.items():
-        phase_root = root / "comparisons" / phase
-        if os.path.lexists(str(phase_root)):
-            public = core.load_json(phase_root / "public.json")
-            if not isinstance(public, dict):
-                raise AppRequestError("既有盲比合同无效")
-            continue
-        candidate_left = int(
-            hashlib.sha256(f"{candidate_id}:{phase}".encode("utf-8")).hexdigest()[:2],
-            16,
-        ) % 2 == 0
-        left = candidate if candidate_left else baseline
-        right = baseline if candidate_left else candidate
-        mapping = _record(
+    comparisons_root = root / "comparisons"
+    _reconcile_method_comparisons_pending(root)
+    if os.path.lexists(str(comparisons_root)):
+        _validate_final_method_comparisons(
             core,
-            "AppMethodBlindMapping",
-            f"mapping-{candidate_id}-{phase}",
-            {
-                "candidate_id": candidate_id,
-                "phase": phase,
-                "candidate_label": "A" if candidate_left else "B",
-                "baseline_label": "B" if candidate_left else "A",
-                "hidden_from_renderer_until_decision": True,
-            },
+            project,
+            root,
+            candidate_id,
+            pairs,
+            normalized,
+            model,
+            fingerprint,
         )
-        public = _record(
+    else:
+        staging = _method_comparisons_pending_root(root)
+        if os.path.lexists(str(staging)):
+            raise AppRequestError("候选 pending comparisons 已存在，拒绝覆盖")
+        staging.mkdir()
+        _write_method_comparisons_tree(
             core,
-            "AppMethodBlindComparison",
-            f"comparison-{candidate_id}-{phase}",
-            {
-                "candidate_id": candidate_id,
-                "phase": phase,
-                "left": left,
-                "left_sha256": core.sha256_bytes(left.encode("utf-8")),
-                "right": right,
-                "right_sha256": core.sha256_bytes(right.encode("utf-8")),
-                "model": model,
-                "system_fingerprint": fingerprint,
-                "mapping_disclosed": False,
-            },
+            project,
+            staging,
+            candidate_id,
+            pairs,
+            normalized,
+            model,
+            fingerprint,
         )
-        core.guarded_mkdir_project(project, phase_root, "app method comparison")
-        core.atomic_create_json(phase_root / "mapping.json", mapping)
-        core.atomic_create_json(phase_root / "public.json", public)
-        generation_root = phase_root / "generation"
-        core.guarded_mkdir_project(project, generation_root, "comparison generation")
-        if phase == "heldout":
-            phase_generations = {
-                "baseline": normalized["heldout_baseline"],
-                "candidate": normalized["heldout_candidate"],
-            }
-        else:
-            phase_generations = {
-                "candidate": normalized[f"{phase}_candidate"],
-            }
-        for name, item in phase_generations.items():
-            core.atomic_create_json(
-                generation_root / f"{name}-provenance.json", item["provenance"]
-            )
+        os.rename(str(staging), str(comparisons_root))
+        _validate_final_method_comparisons(
+            core,
+            project,
+            root,
+            candidate_id,
+            pairs,
+            normalized,
+            model,
+            fingerprint,
+        )
+    lifecycle = (
+        "EVALUATING" if status.get("lifecycle") == "CANDIDATE" else str(status.get("lifecycle"))
+    )
     _candidate_status_update(
         core,
         root,
         status,
-        lifecycle="EVALUATING",
+        lifecycle=lifecycle,
         model=model,
         system_fingerprint=fingerprint,
         source_epoch_sha256=source_epoch_sha256,
     )
-    return {
+    result = {
         "status": "PASS",
         "candidate_id": candidate_id,
-        "lifecycle": "EVALUATING",
-        "snapshot": _system_snapshot({"project": str(project)}),
+        "lifecycle": lifecycle,
     }
+    if include_snapshot:
+        result["snapshot"] = _system_snapshot({"project": str(project)})
+    return result
+
+
+def _reconcile_method_preparations_locked(core: Any, project: Path) -> None:
+    candidates_root = project / "creative-system" / "app-methods" / "candidates"
+    if not os.path.lexists(str(candidates_root)):
+        return
+    if candidates_root.is_symlink() or not candidates_root.is_dir():
+        raise AppRequestError("方法候选根目录不是普通目录")
+    for candidate_dir in sorted(candidates_root.iterdir(), key=lambda item: item.name):
+        if candidate_dir.name.startswith("."):
+            continue
+        if candidate_dir.is_symlink() or not candidate_dir.is_dir():
+            raise AppRequestError("方法候选路径不是普通目录")
+        _, _, status = _load_method_candidate(core, project, candidate_dir.name)
+        comparisons_root = candidate_dir / "comparisons"
+        pending_comparisons = _method_comparisons_pending_root(candidate_dir)
+        if status.get("lifecycle") != "CANDIDATE" or not (
+            os.path.lexists(str(comparisons_root))
+            or os.path.lexists(str(pending_comparisons))
+        ):
+            continue
+        try:
+            _finalize_method_comparisons_locked(
+                core,
+                project,
+                candidate_dir.name,
+                include_snapshot=False,
+            )
+        except AppRequestError:
+            # Public projection will keep this candidate visible with a precise
+            # non-resumable reason and only the immutable rejection action.
+            continue
+
+
+def _reconcile_method_rejections_locked(core: Any, project: Path) -> None:
+    candidates_root = project / "creative-system" / "app-methods" / "candidates"
+    if not os.path.lexists(str(candidates_root)):
+        return
+    if candidates_root.is_symlink() or not candidates_root.is_dir():
+        raise AppRequestError("方法候选根目录不是普通目录")
+    for candidate_dir in sorted(candidates_root.iterdir(), key=lambda item: item.name):
+        if candidate_dir.name.startswith("."):
+            continue
+        if candidate_dir.is_symlink() or not candidate_dir.is_dir():
+            raise AppRequestError("方法候选路径不是普通目录")
+        root, proposal, status = _load_method_candidate(
+            core, project, candidate_dir.name
+        )
+        rejection = _validated_method_rejection_receipt(
+            core, project, candidate_dir.name
+        )
+        if rejection is None:
+            if status.get("lifecycle") == "REJECTED":
+                raise AppRequestError("REJECTED 方法候选缺少 RejectionReceipt")
+            continue
+        if (
+            status.get("lifecycle") == "PROMOTED"
+            or _validated_method_promotion_receipt(
+                core, project, candidate_dir.name, proposal
+            )
+            is not None
+        ):
+            raise AppRequestError("方法候选同时存在采用与拒绝凭证")
+        relative = rejection[0].relative_to(project).as_posix()
+        if (
+            status.get("lifecycle") != "REJECTED"
+            or status.get("rejection_receipt") != relative
+        ):
+            _candidate_status_update(
+                core,
+                root,
+                status,
+                lifecycle="REJECTED",
+                rejection_receipt=relative,
+            )
 
 
 def _submit_method_comparison(payload: Mapping[str, Any]) -> Dict[str, Any]:
@@ -4905,6 +7153,10 @@ def _submit_method_comparison(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if phase not in METHOD_PHASES or choice not in METHOD_CHOICES:
         raise AppRequestError("盲比 phase 或 choice 无效")
     root, _, status = _load_method_candidate(core, project, candidate_id)
+    if _validated_method_rejection_receipt(
+        core, project, candidate_id
+    ) is not None:
+        raise AppRequestError("已放弃的方法候选不能继续提交盲比")
     if status.get("lifecycle") not in {"EVALUATING", "READY_FOR_HUMAN", "BLOCKED"}:
         raise AppRequestError("当前候选不能提交盲比")
     phase_root = root / "comparisons" / phase
@@ -5116,6 +7368,10 @@ def _adopt_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
     candidate_id = _id(payload.get("candidate_id"), "candidate_id")
     with core.exclusive_controller_lock(project):
         root, proposal, status = _load_method_candidate(core, project, candidate_id)
+        if _validated_method_rejection_receipt(
+            core, project, candidate_id
+        ) is not None:
+            raise AppRequestError("已放弃的方法候选不能采用")
         projected_lifecycle, projected_summary = _method_evaluation_projection(
             core, project, root, candidate_id, status
         )
@@ -5258,6 +7514,51 @@ def _reject_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
     project = _project_path(payload.get("project"))
     candidate_id = _id(payload.get("candidate_id"), "candidate_id")
     with core.exclusive_controller_lock(project):
+        if not os.path.lexists(str(_candidate_root(project, candidate_id))):
+            validated_intent = _validated_method_builder_intent(
+                core, project, candidate_id, required=True
+            )
+            if validated_intent is None:
+                raise AppRequestError("Candidate Builder 准备 intent 缺失")
+            intent_path, intent = validated_intent
+            existing_builder_rejection = _validated_method_builder_rejection(
+                core, project, candidate_id, intent
+            )
+            if existing_builder_rejection is None:
+                builder_rejection = _record(
+                    core,
+                    "AppMethodBuilderRejectionReceipt",
+                    f"builder-rejection-{candidate_id}",
+                    {
+                        "candidate_id": candidate_id,
+                        "intent_sha256": core.sha256_file(intent_path),
+                        "rejected_by": "local-app-user",
+                        "active_method_unchanged": True,
+                    },
+                )
+                builder_rejection_path = _method_builder_rejection_path(
+                    project, candidate_id
+                )
+                core.guarded_mkdir_project(
+                    project,
+                    builder_rejection_path.parent,
+                    "method builder rejection receipts",
+                )
+                core.atomic_create_json(
+                    builder_rejection_path, builder_rejection
+                )
+                existing_builder_rejection = (
+                    _validated_method_builder_rejection(
+                        core, project, candidate_id, intent
+                    )
+                )
+            if existing_builder_rejection is None:
+                raise AppRequestError("Candidate Builder 拒绝 receipt 未成功封存")
+            return {
+                "status": "PASS",
+                "candidate_id": candidate_id,
+                "snapshot": _system_snapshot({"project": str(project)}),
+            }
         root, proposal, status = _load_method_candidate(core, project, candidate_id)
         if (
             status.get("lifecycle") == "PROMOTED"
@@ -5268,7 +7569,10 @@ def _reject_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
         ):
             raise AppRequestError("已采用方法不能改写为拒绝；请使用回滚")
         receipt_path = root / "rejection.json"
-        if not os.path.lexists(str(receipt_path)):
+        validated_rejection = _validated_method_rejection_receipt(
+            core, project, candidate_id
+        )
+        if validated_rejection is None:
             receipt = _record(
                 core,
                 "AppMethodRejectionReceipt",
@@ -5280,6 +7584,11 @@ def _reject_method_candidate(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 },
             )
             core.atomic_create_json(receipt_path, receipt)
+            validated_rejection = _validated_method_rejection_receipt(
+                core, project, candidate_id
+            )
+        if validated_rejection is None:
+            raise AppRequestError("RejectionReceipt 未成功封存")
         _candidate_status_update(
             core,
             root,
@@ -5480,10 +7789,15 @@ def handle_request(request: Mapping[str, Any]) -> Dict[str, Any]:
     handlers = {
         "bootstrap_intent": _bootstrap_intent,
         "begin_work": _begin_work,
+        "begin_method_candidate_preparation": _begin_method_candidate_preparation,
+        "begin_method_generation": _begin_method_generation,
         "cancel_work": _cancel_work,
         "complete_work": _complete_work,
         "create_method_candidate": _create_method_candidate,
         "record_feedback": _record_feedback,
+        "record_method_generation": _record_method_generation,
+        "record_method_generation_failure": _record_method_generation_failure,
+        "record_method_builder_failure": _record_method_builder_failure,
         "adopt_method_candidate": _adopt_method_candidate,
         "method_candidate_context": _method_candidate_context,
         "production_context": _production_context,

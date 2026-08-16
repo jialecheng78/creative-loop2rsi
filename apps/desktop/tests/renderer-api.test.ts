@@ -60,6 +60,7 @@ const STATUS: StudioStatus = {
     },
     methodCandidates: [{
       id: 'method-one',
+      observationId: 'app-feedback-one',
       title: '针对重复反馈的新方式',
       summary: '用可见行动推进。',
       tradeoff: '可能减少必要解释。',
@@ -67,6 +68,10 @@ const STATUS: StudioStatus = {
       ready: false,
       adoptionPending: false,
       rolledBack: false,
+      completedGenerationCount: 4,
+      generationTotal: 4,
+      resumable: false,
+      preparationBlockedReason: null,
       comparisons: [{ phase: 'targeted', left: 'A', right: 'B', choice: 'A' }],
     }],
   },

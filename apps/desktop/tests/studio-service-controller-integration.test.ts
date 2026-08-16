@@ -260,10 +260,163 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(fixture.credentials.readAttempts).toBe(0)
   }, 60_000)
+
+  it('persists an epoch mismatch marker and blocks restart before another model call', async () => {
+    const fetchSpy = vi.fn(async () => {
+      throw new Error('network is forbidden in this contract integration test')
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+    const fixture = await createFixture()
+    const firstService = fixture.makeService()
+    let snapshot = await firstService.createSystem({
+      intent: '写克制的近未来悬疑短篇',
+      displayName: '漂移恢复合成系统',
+    })
+    for (const [index, task] of [
+      '漂移证据作品一',
+      '漂移证据作品二',
+      '漂移证据作品三',
+    ].entries()) {
+      const run = await completeWork(
+        firstService,
+        fixture.runtime,
+        task,
+        `旁白解释危险与人物决定（漂移证据 ${index + 1}）。`,
+      )
+      const feedback = await firstService.submitFeedback({
+        runId: run.runId,
+        action: 'rewrite',
+        feedbackText: REPEATED_FEEDBACK,
+      })
+      snapshot = feedback.snapshot
+    }
+    const observation = snapshot.observations[0]
+    expect(observation?.readyForCandidate).toBe(true)
+
+    const preparing = firstService.prepareMethodCandidate(observation!.id)
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(4))
+    const builder = fixture.runtime.handles[3]!
+    // Builder still belongs to the source epoch. Only the next paid generation
+    // observes the drift, which must become a durable non-content marker.
+    fixture.loopback.systemFingerprint = 'integration-fingerprint-v2'
+    await firstService.acceptRuntimeEvent({
+      type: 'output', runId: builder.runId, text: '用可见动作和后果推进情节。',
+    })
+    await firstService.acceptRuntimeEvent({
+      type: 'state', runId: builder.runId, state: 'completed',
+    })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(5))
+    const mismatchedGeneration = fixture.runtime.handles[4]!
+    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'CONTROLLER_BLOCK' })
+    await firstService.acceptRuntimeEvent({
+      type: 'output', runId: mismatchedGeneration.runId, text: '这段付费正文不得进入 failure marker。',
+    })
+    await firstService.acceptRuntimeEvent({
+      type: 'state', runId: mismatchedGeneration.runId, state: 'completed',
+    })
+    await firstFailure
+
+    const blocked = await firstService.getStatus()
+    const candidate = blocked.activeSystem?.methodCandidates[0]
+    expect(candidate).toMatchObject({
+      status: 'CANDIDATE',
+      resumable: false,
+      completedGenerationCount: 0,
+    })
+    expect(candidate?.preparationBlockedReason).toContain('重复付费')
+    const handlesBeforeRestart = fixture.runtime.handles.length
+    await firstService.shutdown()
+
+    const restartedService = fixture.makeService()
+    await expect(restartedService.prepareMethodCandidate(observation!.id)).rejects.toMatchObject({
+      code: 'CONTROLLER_BLOCK',
+    })
+    expect(fixture.runtime.handles).toHaveLength(handlesBeforeRestart)
+    expect(operationCount(fixture.traces, 'method_candidate_context')).toBe(2)
+    expect(operationCount(fixture.traces, 'record_method_generation')).toBe(1)
+
+    const rejected = await restartedService.rejectMethodCandidate(candidate!.id)
+    expect(rejected.methodCandidates[0]).toMatchObject({
+      status: 'REJECTED', resumable: false,
+    })
+    await restartedService.shutdown()
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(fixture.credentials.readAttempts).toBe(0)
+  }, 60_000)
+
+  it('persists a Builder epoch mismatch and restarts without rebilling Builder', async () => {
+    const fetchSpy = vi.fn(async () => {
+      throw new Error('network is forbidden in this contract integration test')
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+    const fixture = await createFixture()
+    const firstService = fixture.makeService()
+    let snapshot = await firstService.createSystem({
+      intent: '写克制的近未来悬疑短篇',
+      displayName: 'Builder 漂移恢复合成系统',
+    })
+    for (const [index, task] of [
+      'Builder 漂移证据作品一',
+      'Builder 漂移证据作品二',
+      'Builder 漂移证据作品三',
+    ].entries()) {
+      const run = await completeWork(
+        firstService,
+        fixture.runtime,
+        task,
+        `旁白解释危险与人物决定（Builder 漂移证据 ${index + 1}）。`,
+      )
+      const feedback = await firstService.submitFeedback({
+        runId: run.runId,
+        action: 'rewrite',
+        feedbackText: REPEATED_FEEDBACK,
+      })
+      snapshot = feedback.snapshot
+    }
+    const observation = snapshot.observations[0]
+    expect(observation?.readyForCandidate).toBe(true)
+
+    fixture.loopback.systemFingerprint = 'integration-builder-fingerprint-v2'
+    const preparing = firstService.prepareMethodCandidate(observation!.id)
+    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'CONTROLLER_BLOCK' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(4))
+    const builder = fixture.runtime.handles[3]!
+    await firstService.acceptRuntimeEvent({
+      type: 'output', runId: builder.runId, text: '这段已付费 Builder 指导不得进入 failure marker。',
+    })
+    await firstService.acceptRuntimeEvent({
+      type: 'state', runId: builder.runId, state: 'completed',
+    })
+    await firstFailure
+
+    const blocked = await firstService.getStatus()
+    const candidate = blocked.activeSystem?.methodCandidates[0]
+    expect(candidate).toMatchObject({
+      status: 'CANDIDATE',
+      resumable: false,
+      completedGenerationCount: 0,
+    })
+    const handlesBeforeRestart = fixture.runtime.handles.length
+    await firstService.shutdown()
+
+    const restartedService = fixture.makeService()
+    await expect(restartedService.prepareMethodCandidate(observation!.id)).rejects.toMatchObject({
+      code: 'CONTROLLER_BLOCK',
+    })
+    expect(fixture.runtime.handles).toHaveLength(handlesBeforeRestart)
+    const rejected = await restartedService.rejectMethodCandidate(candidate!.id)
+    expect(rejected.methodCandidates[0]).toMatchObject({
+      status: 'REJECTED', resumable: false,
+    })
+    await restartedService.shutdown()
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(fixture.credentials.readAttempts).toBe(0)
+  }, 60_000)
 })
 
 interface Fixture {
   readonly credentials: SyntheticCredentials
+  readonly loopback: SyntheticLoopback
   readonly runtime: SyntheticRuntime
   readonly traces: ControllerTrace[]
   makeService(): StudioService
@@ -283,6 +436,7 @@ async function createFixture(): Promise<Fixture> {
 
   return {
     credentials,
+    loopback,
     runtime,
     traces,
     makeService: () => {
@@ -433,6 +587,7 @@ class SyntheticLease implements LoopbackGatewayLease {
     readonly role: RuntimeRole,
     readonly model: DshModelId,
     private readonly sequence: number,
+    private readonly systemFingerprint: string,
   ) {}
 
   provenance(): LoopbackLeaseProvenance {
@@ -448,7 +603,7 @@ class SyntheticLease implements LoopbackGatewayLease {
       requestedModel: this.model,
       responseId,
       returnedModels: [this.model],
-      systemFingerprints: [SYSTEM_FINGERPRINT],
+      systemFingerprints: [this.systemFingerprint],
       usage,
       requests: [{
         requestNumber: 1,
@@ -457,7 +612,7 @@ class SyntheticLease implements LoopbackGatewayLease {
         status: 'COMPLETED',
         responseId,
         returnedModel: this.model,
-        systemFingerprint: SYSTEM_FINGERPRINT,
+        systemFingerprint: this.systemFingerprint,
         usage,
       }],
     }
@@ -468,10 +623,16 @@ class SyntheticLease implements LoopbackGatewayLease {
 
 class SyntheticLoopback implements LoopbackGatewayPort {
   private sequence = 0
+  systemFingerprint = SYSTEM_FINGERPRINT
 
   async start(): Promise<void> {}
   issueLease(role: RuntimeRole, model: DshModelId): LoopbackGatewayLease {
-    return new SyntheticLease(role, model, ++this.sequence)
+    return new SyntheticLease(
+      role,
+      model,
+      ++this.sequence,
+      this.systemFingerprint,
+    )
   }
   async close(): Promise<void> {}
 }

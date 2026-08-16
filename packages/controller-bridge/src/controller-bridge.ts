@@ -412,6 +412,48 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
       requiredId(payload, "candidate_id");
       requiredText(payload, "observation_id", 100);
       return;
+    case "begin_method_candidate_preparation":
+      exactKeys(payload, "payload", [
+        "project",
+        "candidate_id",
+        "observation_id",
+        "builder_context_sha256",
+        "expected_epoch_sha256",
+      ]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredText(payload, "observation_id", 100);
+      for (const key of [
+        "builder_context_sha256",
+        "expected_epoch_sha256",
+      ] as const) {
+        if (!/^[0-9a-f]{64}$/u.test(requiredText(payload, key, 64))) {
+          requestError(`${key} 必须是 SHA256`);
+        }
+      }
+      return;
+    case "begin_method_generation":
+      exactKeys(payload, "payload", [
+        "project",
+        "candidate_id",
+        "label",
+        "context_sha256",
+        "expected_epoch_sha256",
+      ]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredEnum(payload, "label", [
+        "targeted_candidate",
+        "regression_candidate",
+        "heldout_baseline",
+        "heldout_candidate",
+      ]);
+      for (const key of ["context_sha256", "expected_epoch_sha256"] as const) {
+        if (!/^[0-9a-f]{64}$/u.test(requiredText(payload, key, 64))) {
+          requestError(`${key} 必须是 SHA256`);
+        }
+      }
+      return;
     case "create_method_candidate":
       exactKeys(payload, "payload", [
         "project",
@@ -434,10 +476,76 @@ function validatePayload(operation: ControllerOperation, rawPayload: unknown): v
       requiredText(payload, "builder_attested_by", 300);
       validateRuntimeProvenance(payload.builder_provenance, true);
       return;
+    case "record_method_generation":
+      exactKeys(payload, "payload", ["project", "candidate_id", "label", "generation"]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredEnum(payload, "label", [
+        "targeted_candidate",
+        "regression_candidate",
+        "heldout_baseline",
+        "heldout_candidate",
+      ]);
+      validateMethodGeneration(payload.generation, "generation");
+      return;
+    case "record_method_generation_failure":
+      exactKeys(payload, "payload", [
+        "project",
+        "candidate_id",
+        "label",
+        "context_sha256",
+        "expected_epoch_sha256",
+        "observed_evidence_sha256",
+        "error_code",
+      ]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredEnum(payload, "label", [
+        "targeted_candidate",
+        "regression_candidate",
+        "heldout_baseline",
+        "heldout_candidate",
+      ]);
+      requiredEnum(payload, "error_code", ["METHOD_EPOCH_UNVERIFIABLE"]);
+      for (const key of [
+        "context_sha256",
+        "expected_epoch_sha256",
+        "observed_evidence_sha256",
+      ] as const) {
+        if (!/^[0-9a-f]{64}$/u.test(requiredText(payload, key, 64))) {
+          requestError(`${key} 必须是 SHA256`);
+        }
+      }
+      return;
+    case "record_method_builder_failure":
+      exactKeys(payload, "payload", [
+        "project",
+        "candidate_id",
+        "observation_id",
+        "builder_context_sha256",
+        "expected_epoch_sha256",
+        "observed_evidence_sha256",
+        "error_code",
+      ]);
+      projectPath(payload);
+      requiredId(payload, "candidate_id");
+      requiredText(payload, "observation_id", 100);
+      requiredEnum(payload, "error_code", ["METHOD_EPOCH_UNVERIFIABLE"]);
+      for (const key of [
+        "builder_context_sha256",
+        "expected_epoch_sha256",
+        "observed_evidence_sha256",
+      ] as const) {
+        if (!/^[0-9a-f]{64}$/u.test(requiredText(payload, key, 64))) {
+          requestError(`${key} 必须是 SHA256`);
+        }
+      }
+      return;
     case "stage_method_comparisons": {
       exactKeys(payload, "payload", ["project", "candidate_id", "generations"]);
       projectPath(payload);
       requiredId(payload, "candidate_id");
+      if (payload.generations === undefined) return;
       const generations = asRecord(payload.generations, "generations");
       exactKeys(generations, "generations", [
         "targeted_candidate",

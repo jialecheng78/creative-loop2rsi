@@ -86,6 +86,8 @@ function mockBridge(mode: string, options: { maxOutputBytes?: number; maxRequest
 describe("buildControllerWireRequest", () => {
   it("exports the exact Python app-service operation set", () => {
     expect(CONTROLLER_OPERATIONS).toEqual([
+      "begin_method_candidate_preparation",
+      "begin_method_generation",
       "begin_work",
       "bootstrap_intent",
       "candidate_summary",
@@ -97,6 +99,9 @@ describe("buildControllerWireRequest", () => {
       "method_candidate_context",
       "production_context",
       "record_feedback",
+      "record_method_generation",
+      "record_method_generation_failure",
+      "record_method_builder_failure",
       "reject_method_candidate",
       "resume_feedback",
       "rollback_method",
@@ -186,6 +191,101 @@ describe("buildControllerWireRequest", () => {
       operation: "system_snapshot",
       payload: { project: projectPath },
     });
+  });
+
+  it("seals one method generation at a time and finalizes without resending paid outputs", () => {
+    const source = completeWorkRequest();
+    if (source.operation !== "complete_work") throw new Error("fixture operation mismatch");
+    expect(buildControllerWireRequest({
+      request_id: "request-method-generation",
+      operation: "record_method_generation",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        label: "targeted_candidate",
+        generation: {
+          output: "durable targeted candidate",
+          runtime_provenance: {
+            ...source.payload.runtime_provenance,
+            context_sha256: "c".repeat(64),
+          },
+        },
+      },
+    })).toMatchObject({
+      operation: "record_method_generation",
+      payload: { label: "targeted_candidate" },
+    });
+    expect(buildControllerWireRequest({
+      request_id: "request-stage-method",
+      operation: "stage_method_comparisons",
+      payload: { project: projectPath, candidate_id: "method-one" },
+    })).toMatchObject({
+      operation: "stage_method_comparisons",
+      payload: { candidate_id: "method-one" },
+    });
+    expect(() => buildControllerWireRequest({
+      request_id: "request-invalid-method-generation",
+      operation: "record_method_generation",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        label: "unknown_slot",
+        generation: {
+          output: "invalid",
+          runtime_provenance: source.payload.runtime_provenance,
+        },
+      },
+    } as unknown as ControllerRequest)).toThrowError(/label/u);
+  });
+
+  it("binds Builder and each paid generation to a durable pre-call intent", () => {
+    const sha = "a".repeat(64);
+    expect(buildControllerWireRequest({
+      request_id: "request-builder-intent",
+      operation: "begin_method_candidate_preparation",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        observation_id: "observation-one",
+        builder_context_sha256: sha,
+        expected_epoch_sha256: sha,
+      },
+    })).toMatchObject({ operation: "begin_method_candidate_preparation" });
+    expect(buildControllerWireRequest({
+      request_id: "request-generation-intent",
+      operation: "begin_method_generation",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        label: "heldout_candidate",
+        context_sha256: sha,
+        expected_epoch_sha256: sha,
+      },
+    })).toMatchObject({ operation: "begin_method_generation" });
+    expect(buildControllerWireRequest({
+      request_id: "request-builder-failure",
+      operation: "record_method_builder_failure",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        observation_id: "observation-one",
+        builder_context_sha256: sha,
+        expected_epoch_sha256: sha,
+        observed_evidence_sha256: sha,
+        error_code: "METHOD_EPOCH_UNVERIFIABLE",
+      },
+    })).toMatchObject({ operation: "record_method_builder_failure" });
+    expect(() => buildControllerWireRequest({
+      request_id: "request-invalid-generation-intent",
+      operation: "begin_method_generation",
+      payload: {
+        project: projectPath,
+        candidate_id: "method-one",
+        label: "targeted_candidate",
+        context_sha256: "not-a-sha",
+        expected_epoch_sha256: sha,
+      },
+    })).toThrowError(/context_sha256/u);
   });
 
   it("accepts explicit dispatch identity and the bounded cancel operation", () => {

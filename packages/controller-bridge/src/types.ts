@@ -9,6 +9,8 @@ export interface JsonObject {
 }
 
 export const CONTROLLER_OPERATIONS = [
+  "begin_method_candidate_preparation",
+  "begin_method_generation",
   "begin_work",
   "bootstrap_intent",
   "candidate_summary",
@@ -20,6 +22,9 @@ export const CONTROLLER_OPERATIONS = [
   "method_candidate_context",
   "production_context",
   "record_feedback",
+  "record_method_generation",
+  "record_method_generation_failure",
+  "record_method_builder_failure",
   "reject_method_candidate",
   "resume_feedback",
   "rollback_method",
@@ -158,6 +163,14 @@ export interface MethodCandidateContextPayload {
   readonly observation_id: string;
 }
 
+export interface BeginMethodCandidatePreparationPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly observation_id: string;
+  readonly builder_context_sha256: string;
+  readonly expected_epoch_sha256: string;
+}
+
 export interface CreateMethodCandidatePayload {
   readonly project: string;
   readonly candidate_id: string;
@@ -175,10 +188,52 @@ export interface MethodGeneration {
   readonly runtime_provenance: CompleteWorkRuntimeProvenance;
 }
 
+export type MethodGenerationLabel =
+  | "targeted_candidate"
+  | "regression_candidate"
+  | "heldout_baseline"
+  | "heldout_candidate";
+
+export interface RecordMethodGenerationPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly label: MethodGenerationLabel;
+  readonly generation: MethodGeneration;
+}
+
+export interface BeginMethodGenerationPayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly label: MethodGenerationLabel;
+  readonly context_sha256: string;
+  readonly expected_epoch_sha256: string;
+}
+
+export interface RecordMethodGenerationFailurePayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly label: MethodGenerationLabel;
+  readonly context_sha256: string;
+  readonly expected_epoch_sha256: string;
+  readonly observed_evidence_sha256: string;
+  readonly error_code: "METHOD_EPOCH_UNVERIFIABLE";
+}
+
+export interface RecordMethodBuilderFailurePayload {
+  readonly project: string;
+  readonly candidate_id: string;
+  readonly observation_id: string;
+  readonly builder_context_sha256: string;
+  readonly expected_epoch_sha256: string;
+  readonly observed_evidence_sha256: string;
+  readonly error_code: "METHOD_EPOCH_UNVERIFIABLE";
+}
+
 export interface StageMethodComparisonsPayload {
   readonly project: string;
   readonly candidate_id: string;
-  readonly generations: {
+  /** Legacy all-at-once callers may still submit this; Main seals slots one by one. */
+  readonly generations?: {
     readonly targeted_candidate: MethodGeneration;
     readonly regression_candidate: MethodGeneration;
     readonly heldout_baseline: MethodGeneration;
@@ -288,6 +343,8 @@ interface ControllerRequestBase<
 }
 
 export type ControllerRequest =
+  | ControllerRequestBase<"begin_method_candidate_preparation", BeginMethodCandidatePreparationPayload>
+  | ControllerRequestBase<"begin_method_generation", BeginMethodGenerationPayload>
   | ControllerRequestBase<"begin_work", BeginWorkPayload>
   | ControllerRequestBase<"bootstrap_intent", BootstrapIntentPayload>
   | ControllerRequestBase<"candidate_summary", CandidateSummaryPayload>
@@ -299,6 +356,9 @@ export type ControllerRequest =
   | ControllerRequestBase<"method_candidate_context", MethodCandidateContextPayload>
   | ControllerRequestBase<"production_context", ProductionContextPayload>
   | ControllerRequestBase<"record_feedback", RecordFeedbackPayload>
+  | ControllerRequestBase<"record_method_generation", RecordMethodGenerationPayload>
+  | ControllerRequestBase<"record_method_generation_failure", RecordMethodGenerationFailurePayload>
+  | ControllerRequestBase<"record_method_builder_failure", RecordMethodBuilderFailurePayload>
   | ControllerRequestBase<"reject_method_candidate", MethodCandidateDecisionPayload>
   | ControllerRequestBase<"resume_feedback", ResumeFeedbackPayload>
   | ControllerRequestBase<"rollback_method", RollbackMethodPayload>

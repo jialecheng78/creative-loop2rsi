@@ -89,19 +89,142 @@ describe('App shell', () => {
     )
     expect(html.match(/生成基线已变化，这些证据会分开累计。/gu)).toHaveLength(2)
   })
+
+  it('continues only a resumable preparation and routes later active states to New Methods', () => {
+    const resumable = learningAction({
+      status: 'CANDIDATE',
+      completedGenerationCount: 2,
+      resumable: true,
+    })
+    expect(resumable).toContain('继续准备盲比（2/4）')
+    expect(resumable).not.toContain('disabled=""')
+
+    const blockedPreparation = learningAction({
+      status: 'CANDIDATE',
+      completedGenerationCount: 2,
+      resumable: false,
+    })
+    expect(blockedPreparation).toContain('请到“新方式”放弃本次准备')
+    expect(blockedPreparation).toContain('disabled=""')
+
+    const evaluating = learningAction({ status: 'EVALUATING' })
+    expect(evaluating).toContain('请到“新方式”完成比较')
+    expect(evaluating).toContain('disabled=""')
+
+    const ready = learningAction({ status: 'READY_FOR_HUMAN', ready: true })
+    expect(ready).toContain('请到“新方式”作最终决定')
+    expect(ready).toContain('disabled=""')
+
+    const adoptionPending = learningAction({
+      status: 'PROMOTED',
+      adoptionPending: true,
+    })
+    expect(adoptionPending).toContain('请到“新方式”完成采用')
+    expect(adoptionPending).toContain('disabled=""')
+  })
+
+  it('starts a fresh candidate after terminal attempts but never restarts an adopted method', () => {
+    for (const terminal of [
+      { status: 'BLOCKED' as const },
+      { status: 'REJECTED' as const },
+      { status: 'PROMOTED' as const, rolledBack: true },
+    ]) {
+      const action = learningAction(terminal)
+      expect(action).toContain('重新提出并比较新方法')
+      expect(action).not.toContain('disabled=""')
+      expect(action).not.toContain('继续准备盲比')
+    }
+
+    const adopted = learningAction({ status: 'PROMOTED', rolledBack: false })
+    expect(adopted).toContain('新方式已采用')
+    expect(adopted).toContain('disabled=""')
+  })
+
+  it('offers durable preparation resume and immutable abandonment before blind comparison', () => {
+    const html = renderCandidate({
+      status: 'CANDIDATE',
+      ready: false,
+      completedGenerationCount: 2,
+      resumable: true,
+      comparisons: [],
+    })
+    expect(html).toContain('准备 2/4')
+    expect(html).toContain('候选指导和已完成结果已封存；只会补安全缺项')
+    expect(html).toContain('已完成 2/4 项生成')
+    expect(html).toContain('>继续准备</button>')
+    expect(html).toContain('>放弃本次准备</button>')
+    expect(html).not.toContain('盲比 1/3')
+    expect(html).not.toContain('>采用新方式</button>')
+  })
+
+  it('keeps an irrecoverable preparation actionable without calling it complete', () => {
+    const html = renderCandidate({
+      status: 'CANDIDATE',
+      ready: false,
+      completedGenerationCount: 0,
+      resumable: false,
+      preparationBlockedReason: '冻结的模型 epoch 已变化。',
+      comparisons: [],
+    })
+    expect(html).toContain('准备已阻止')
+    expect(html).toContain('本次准备的不可变证据已经保留')
+    expect(html).toContain('冻结的模型 epoch 已变化。')
+    expect(html).toContain('>放弃本次准备</button>')
+    expect(html).not.toContain('>继续准备</button>')
+    expect(html).not.toContain('候选指导和已完成结果已封存')
+  })
+
+  it('never turns zero comparisons or a blocked decision into blind comparison 4/3', () => {
+    const empty = renderCandidate({
+      status: 'EVALUATING',
+      ready: false,
+      comparisons: [],
+    })
+    expect(empty).toContain('比较材料不完整')
+    expect(empty).not.toContain('可以决定')
+    expect(empty).not.toContain('>采用新方式</button>')
+
+    const blocked = renderCandidate({
+      status: 'BLOCKED',
+      ready: false,
+      comparisons: [
+        { phase: 'targeted', left: 'A1', right: 'B1', choice: 'B' },
+        { phase: 'regression', left: 'A2', right: 'B2', choice: 'A' },
+        { phase: 'heldout', left: 'A3', right: 'B3', choice: 'TIE' },
+      ],
+    })
+    expect(blocked).toContain('未通过比较')
+    expect(blocked).not.toContain('盲比 4/3')
+    expect(blocked).not.toContain('>采用新方式</button>')
+  })
 })
 
 function renderNewMethod(flags: Pick<MethodCandidateSnapshot, 'adoptionPending' | 'rolledBack'>): string {
-  const candidate: MethodCandidateSnapshot = {
+  return renderCandidate({ ...flags })
+}
+
+function candidateSnapshot(overrides: Partial<MethodCandidateSnapshot>): MethodCandidateSnapshot {
+  return {
     id: 'method-one',
+    observationId: 'observation-one',
     title: '减少解释的新方式',
     summary: '更早用行动建立冲突。',
     tradeoff: '可能减少必要说明。',
     status: 'PROMOTED',
     ready: false,
+    completedGenerationCount: 4,
+    generationTotal: 4,
+    resumable: false,
+    preparationBlockedReason: null,
     comparisons: [],
-    ...flags,
+    adoptionPending: false,
+    rolledBack: false,
+    ...overrides,
   }
+}
+
+function renderCandidate(overrides: Partial<MethodCandidateSnapshot>): string {
+  const candidate = candidateSnapshot(overrides)
   const status = {
     newMethods: [candidate],
     method: {
@@ -113,4 +236,29 @@ function renderNewMethod(flags: Pick<MethodCandidateSnapshot, 'adoptionPending' 
     },
   } as unknown as StudioViewStatus
   return renderToStaticMarkup(<NewMethodsPage onStatusChange={() => undefined} status={status} />)
+}
+
+function learningAction(overrides: Partial<MethodCandidateSnapshot>): string {
+  const observationId = 'observation-one'
+  const status = {
+    learning: {
+      observations: [{
+        id: observationId,
+        findingCode: 'APP-FEEDBACK-ONE',
+        feedback: '更早建立风险。',
+        independentWorks: 3,
+        independentRuns: 3,
+        independentTasks: 3,
+        readyForCandidate: true,
+      }],
+      adoptedPrinciples: [],
+    },
+    newMethods: [candidateSnapshot({ observationId, ...overrides })],
+  } as unknown as StudioViewStatus
+  const html = renderToStaticMarkup(
+    <LearningPage onStatusChange={() => undefined} status={status} />,
+  )
+  const action = html.match(/<button class="secondary-button"[^>]*>[^<]+<\/button>/u)?.[0]
+  if (action === undefined) throw new Error('Learning action button was not rendered')
+  return action
 }

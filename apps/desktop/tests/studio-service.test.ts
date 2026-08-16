@@ -271,6 +271,15 @@ describe('StudioService governed alpha loop', () => {
     expect(snapshot.methodCandidates[0]?.comparisons).toHaveLength(3)
     expect(snapshot.methodCandidates[0]?.status).toBe('EVALUATING')
     expect(snapshot.methodCandidates[0]).toMatchObject({ adoptionPending: false, rolledBack: false })
+    expect(fixture.controller.requests.filter(item => item.operation === 'record_method_generation')
+      .map(item => item.payload.label)).toEqual([
+      'targeted_candidate', 'regression_candidate', 'heldout_baseline', 'heldout_candidate',
+    ])
+    expect(fixture.controller.requests.find(item => item.operation === 'stage_method_comparisons')?.payload)
+      .toEqual({
+        project: join(fixture.userData, 'systems', snapshot.systemId),
+        candidate_id: snapshot.methodCandidates[0]?.id,
+      })
 
     const candidateId = snapshot.methodCandidates[0]!.id
     for (const phase of ['targeted', 'regression', 'heldout'] as const) {
@@ -294,6 +303,272 @@ describe('StudioService governed alpha loop', () => {
     expect(snapshot.methodCandidates[0]).toMatchObject({ adoptionPending: false, rolledBack: true })
   })
 
+  it('resumes an interrupted method preparation without rerunning Builder or completed generations', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+    fixture.controller.failBeginMethodGenerationLabel = 'heldout_baseline'
+
+    const firstPreparation = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    for (const [index, output] of [
+      '优先用人物可见的动作推进情节。',
+      '第一次已保存生成',
+      '第二次已保存生成',
+    ].entries()) {
+      await vi.waitFor(() => expect(fixture.runtime.handles.length).toBe(index + 1))
+      const handle = fixture.runtime.handles[index]!
+      await fixture.service.acceptRuntimeEvent({ type: 'output', runId: handle.runId, text: output })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    await expect(firstPreparation).rejects.toThrow(/intent unavailable before commit/u)
+    fixture.controller.failBeginMethodGenerationLabel = null
+
+    expect(fixture.runtime.inputs).toHaveLength(3)
+    expect(fixture.controller.requests.filter(item => item.operation === 'create_method_candidate')).toHaveLength(1)
+    expect(fixture.controller.requests.filter(item => item.operation === 'record_method_generation')
+      .map(item => item.payload.label)).toEqual(['targeted_candidate', 'regression_candidate'])
+
+    const restartedService = fixture.makeService()
+    const resumed = restartedService.prepareMethodCandidate('app-feedback-synthetic')
+    for (const [offset, output] of ['重试后补齐留出基线', '重试后补齐留出候选'].entries()) {
+      await vi.waitFor(() => expect(fixture.runtime.handles.length).toBe(4 + offset))
+      const handle = fixture.runtime.handles[3 + offset]!
+      await restartedService.acceptRuntimeEvent({ type: 'output', runId: handle.runId, text: output })
+      await restartedService.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    const snapshot = await resumed
+
+    expect(fixture.runtime.inputs).toHaveLength(5)
+    expect(fixture.controller.requests.filter(item => item.operation === 'method_candidate_context')).toHaveLength(2)
+    expect(fixture.controller.requests.filter(item => item.operation === 'create_method_candidate')).toHaveLength(1)
+    expect(fixture.controller.requests.filter(item => item.operation === 'record_method_generation')
+      .map(item => item.payload.label)).toEqual([
+      'targeted_candidate', 'regression_candidate', 'heldout_baseline', 'heldout_candidate',
+    ])
+    expect(snapshot.methodCandidates[0]).toMatchObject({ status: 'EVALUATING' })
+  })
+
+  it('does not turn a live Builder intent into a persistent failure during concurrent status reads', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const live = await fixture.service.systemSnapshot()
+    if (live === null) throw new Error('synthetic live method snapshot missing')
+    const liveCandidate = live.methodCandidates[0]
+    if (liveCandidate === undefined) throw new Error('synthetic live method candidate missing')
+    expect(liveCandidate).toMatchObject({
+      status: 'CANDIDATE',
+      resumable: false,
+      completedGenerationCount: 0,
+    })
+    expect(fixture.controller.requests.some(item =>
+      item.operation === 'record_method_builder_failure'
+      || item.operation === 'reject_method_candidate')).toBe(false)
+
+    for (let index = 0; index < 5; index += 1) {
+      await vi.waitFor(() => expect(fixture.runtime.handles.length).toBe(index + 1))
+      const handle = fixture.runtime.handles[index]!
+      await fixture.service.acceptRuntimeEvent({
+        type: 'output', runId: handle.runId, text: index === 0 ? '用动作推进情节。' : `live 生成 ${index}`,
+      })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    await expect(preparing).resolves.toMatchObject({
+      methodCandidates: [{ status: 'EVALUATING' }],
+    })
+  })
+
+  it('retries the exact Builder create payload after a committed response is lost without rebilling Builder', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+    fixture.controller.loseFirstMethodCreateResponse = true
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    for (let index = 0; index < 5; index += 1) {
+      await vi.waitFor(() => expect(fixture.runtime.handles.length).toBe(index + 1))
+      const handle = fixture.runtime.handles[index]!
+      await fixture.service.acceptRuntimeEvent({
+        type: 'output', runId: handle.runId, text: index === 0 ? '用动作推进。' : `create retry 生成 ${index}`,
+      })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    await expect(preparing).resolves.toMatchObject({
+      methodCandidates: [{ status: 'EVALUATING' }],
+    })
+    expect(fixture.runtime.handles).toHaveLength(5)
+    const creates = fixture.controller.requests.filter(item => item.operation === 'create_method_candidate')
+    expect(creates).toHaveLength(2)
+    expect(creates[0]?.payload).toEqual(creates[1]?.payload)
+  })
+
+  it('does not open the first generation intent when shutdown wins after Builder create commits', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+    const createResponse = deferred<void>()
+    fixture.controller.methodCreateResponseGate = createResponse.promise
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const preparationStopped = expect(preparing).rejects.toMatchObject({ code: 'APPLICATION_CLOSED' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const builder = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: builder.runId, text: '用动作推进。' })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: builder.runId, state: 'completed' })
+    await vi.waitFor(() => expect(fixture.controller.requests
+      .filter(item => item.operation === 'create_method_candidate')).toHaveLength(1))
+
+    const shuttingDown = fixture.service.shutdown()
+    createResponse.resolve(undefined)
+    await preparationStopped
+    await shuttingDown
+    expect(fixture.controller.requests.some(item => item.operation === 'begin_method_generation')).toBe(false)
+  })
+
+  it('does not open the next generation intent when shutdown wins after a slot receipt commits', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+    const recordResponse = deferred<void>()
+    fixture.controller.methodGenerationRecordResponseGate = {
+      label: 'targeted_candidate',
+      promise: recordResponse.promise,
+    }
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const preparationStopped = expect(preparing).rejects.toMatchObject({ code: 'APPLICATION_CLOSED' })
+    for (let index = 0; index < 2; index += 1) {
+      await vi.waitFor(() => expect(fixture.runtime.handles.length).toBe(index + 1))
+      const handle = fixture.runtime.handles[index]!
+      await fixture.service.acceptRuntimeEvent({
+        type: 'output', runId: handle.runId, text: index === 0 ? '用动作推进。' : '目标候选已完成',
+      })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    await vi.waitFor(() => expect(fixture.controller.requests
+      .filter(item => item.operation === 'record_method_generation')).toHaveLength(1))
+
+    const shuttingDown = fixture.service.shutdown()
+    recordResponse.resolve(undefined)
+    await preparationStopped
+    await shuttingDown
+    expect(fixture.controller.requests.filter(item => item.operation === 'begin_method_generation')
+      .map(item => item.payload.label)).toEqual(['targeted_candidate'])
+  })
+
+  it('blocks restart after Builder returns but create never commits instead of rebilling Builder', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+    fixture.controller.failMethodCreateBeforeCommit = true
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toThrow(/create unavailable before commit/u)
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const builder = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: builder.runId, text: '已付费但未封存的 Builder 指导' })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: builder.runId, state: 'completed' })
+    await rejected
+    expect(fixture.controller.requests.filter(item => item.operation === 'create_method_candidate')).toHaveLength(2)
+
+    const snapshot = await fixture.service.systemSnapshot()
+    if (snapshot === null) throw new Error('synthetic blocked method snapshot missing')
+    const candidate = snapshot.methodCandidates[0]
+    if (candidate === undefined) throw new Error('synthetic blocked method candidate missing')
+    expect(candidate).toMatchObject({ status: 'CANDIDATE', resumable: false })
+    const restartedService = fixture.makeService()
+    await expect(restartedService.prepareMethodCandidate('app-feedback-synthetic'))
+      .rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(1)
+    await expect(restartedService.rejectMethodCandidate(candidate.id))
+      .resolves.toMatchObject({ methodCandidates: [{ status: 'REJECTED' }] })
+  })
+
+  it.each([
+    ['targeted_candidate', 1],
+    ['regression_candidate', 2],
+    ['heldout_baseline', 3],
+    ['heldout_candidate', 4],
+  ] as const)('never rebills %s after paid output returns before its receipt commits', async (label, generationIndex) => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation()
+    fixture.controller.failRecordMethodGenerationLabel = label
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toThrow(/after paid output/u)
+    for (let index = 0; index <= generationIndex; index += 1) {
+      await vi.waitFor(() => expect(fixture.runtime.handles.length).toBe(index + 1))
+      const handle = fixture.runtime.handles[index]!
+      await fixture.service.acceptRuntimeEvent({
+        type: 'output', runId: handle.runId, text: index === 0 ? '用动作推进。' : `${label} 已付费输出`,
+      })
+      await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    }
+    await rejected
+
+    const paidHandleCount = fixture.runtime.handles.length
+    const snapshot = await fixture.service.systemSnapshot()
+    if (snapshot === null) throw new Error('synthetic paid-window snapshot missing')
+    const candidate = snapshot.methodCandidates[0]
+    if (candidate === undefined) throw new Error('synthetic paid-window candidate missing')
+    expect(candidate).toMatchObject({
+      status: 'CANDIDATE',
+      resumable: false,
+      completedGenerationCount: generationIndex - 1,
+    })
+    const restartedService = fixture.makeService()
+    await expect(restartedService.prepareMethodCandidate('app-feedback-synthetic'))
+      .rejects.toThrow(/duplicate|repeat|重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(paidHandleCount)
+    expect(fixture.controller.requests.filter(item => item.operation === 'record_method_generation'
+      && item.payload.label === label)).toHaveLength(1)
+
+    await expect(restartedService.rejectMethodCandidate(candidate.id)).resolves.toMatchObject({
+      methodCandidates: [{ status: 'REJECTED' }],
+    })
+  })
+
+  it.each([
+    ['returned model mismatch', { returnedModels: ['deepseek-v4-flash'] }],
+    ['multiple fingerprints', { systemFingerprints: ['fingerprint-one', 'fingerprint-two'] }],
+  ] as const)('persists a hash-only Builder stop for %s and restarts with zero model calls', async (_name, provenance) => {
+    const fixture = await readyFixture({ provenance })
+    fixture.controller.primeMethodObservation()
+
+    const preparing = fixture.service.prepareMethodCandidate('app-feedback-synthetic')
+    const rejected = expect(preparing).rejects.toMatchObject({ code: 'PROVENANCE_INCOMPLETE' })
+    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(1))
+    const handle = fixture.runtime.handles[0]!
+    await fixture.service.acceptRuntimeEvent({ type: 'output', runId: handle.runId, text: '不应持久的 Builder 指导' })
+    await fixture.service.acceptRuntimeEvent({ type: 'state', runId: handle.runId, state: 'completed' })
+    await rejected
+
+    expect(fixture.controller.requests.some(item => item.operation === 'record_method_builder_failure')).toBe(true)
+    expect(fixture.controller.requests.some(item => item.operation === 'create_method_candidate')).toBe(false)
+    const snapshot = await fixture.service.systemSnapshot()
+    if (snapshot === null) throw new Error('synthetic Builder failure snapshot missing')
+    const candidate = snapshot.methodCandidates[0]
+    if (candidate === undefined) throw new Error('synthetic Builder failure candidate missing')
+    expect(candidate).toMatchObject({ status: 'CANDIDATE', resumable: false })
+    const restartedService = fixture.makeService()
+    await expect(restartedService.prepareMethodCandidate('app-feedback-synthetic'))
+      .rejects.toThrow(/重复付费/u)
+    expect(fixture.runtime.handles).toHaveLength(1)
+  })
+
+  it('blocks a method epoch Profile mismatch before configuring or starting the runtime', async () => {
+    const fixture = await readyFixture()
+    fixture.controller.primeMethodObservation('b'.repeat(64))
+
+    await expect(fixture.service.prepareMethodCandidate('app-feedback-synthetic')).rejects.toMatchObject({
+      code: 'METHOD_EPOCH_CHANGED',
+    })
+
+    expect(fixture.runtime.inputs).toHaveLength(0)
+    expect(fixture.runtime.spec).toBeUndefined()
+    expect(fixture.timeline).not.toContain('runtime:stop')
+    expect(fixture.loopback.lastLease?.revoked).toBe(true)
+    expect(fixture.controller.requests.some(item => item.operation === 'create_method_candidate')).toBe(false)
+    expect(fixture.controller.requests.some(item => item.operation === 'record_method_generation')).toBe(false)
+  })
+
   it('requires explicit and mutually exclusive method adoption projection flags', async () => {
     const fixture = await readyFixture()
     const candidate = {
@@ -303,7 +578,11 @@ describe('StudioService governed alpha loop', () => {
       tradeoff: '可能减少解释。',
       status: 'PROMOTED',
       ready: false,
-      comparisons: [],
+      comparisons: [
+        { phase: 'targeted', left: '目标 A', right: '目标 B', choice: 'A' },
+        { phase: 'regression', left: '回归 A', right: '回归 B', choice: 'B' },
+        { phase: 'heldout', left: '留出 A', right: '留出 B', choice: 'A' },
+      ],
     }
 
     fixture.controller.primeMethodCandidate({ ...candidate, rolled_back: false })
@@ -1259,8 +1538,8 @@ class FakeLease implements LoopbackGatewayLease {
 
 class FakeLoopback implements LoopbackGatewayPort {
   lastLease: FakeLease | undefined
-  private readonly provenance: LoopbackLeaseProvenance
-  private readonly hasReturnedModelOverride: boolean
+  private provenance: LoopbackLeaseProvenance
+  private hasReturnedModelOverride: boolean
 
   constructor(timeline: string[], overrides: Partial<LoopbackLeaseProvenance> = {}) {
     this.timeline = timeline
@@ -1289,6 +1568,10 @@ class FakeLoopback implements LoopbackGatewayPort {
     }
   }
   private readonly timeline: string[]
+  setProvenanceOverrides(overrides: Partial<LoopbackLeaseProvenance>): void {
+    this.hasReturnedModelOverride = overrides.returnedModels !== undefined
+    this.provenance = { ...this.provenance, ...overrides }
+  }
   async start(): Promise<void> {}
   issueLease(
     role: RuntimeRole = 'production',
@@ -1318,6 +1601,12 @@ class FakeController implements ControllerPort {
   failResumeFeedback = false
   failTerminateWork = false
   loseFirstBeginResponse = false
+  loseFirstMethodCreateResponse = false
+  failMethodCreateBeforeCommit = false
+  failBeginMethodGenerationLabel: string | null = null
+  failRecordMethodGenerationLabel: string | null = null
+  methodCreateResponseGate: Promise<void> | null = null
+  methodGenerationRecordResponseGate: { readonly label: string; readonly promise: Promise<void> } | null = null
   uniqueBeginOpenCount = 0
   private systemId: string | undefined
   private displayName = ''
@@ -1332,6 +1621,14 @@ class FakeController implements ControllerPort {
   private methodHistory: Record<string, unknown>[] = []
   private activeMethodVersion = 'baseline-v1'
   private activeGuidance: string | null = null
+  private methodCandidateId: string | null = null
+  private methodCandidateObservationId: string | null = null
+  private methodCandidateGuidance: string | null = null
+  private methodEvaluationPlan: Record<string, unknown> | null = null
+  private methodBuilderIntentId: string | null = null
+  private readonly completedMethodGenerations = new Set<string>()
+  private readonly methodGenerationIntents = new Set<string>()
+  private methodEpochProfileSha256 = 'a'.repeat(64)
 
   constructor(private readonly timeline: string[]) {}
 
@@ -1372,7 +1669,8 @@ class FakeController implements ControllerPort {
     }
   }
 
-  primeMethodObservation(): void {
+  primeMethodObservation(profileSha256 = 'a'.repeat(64)): void {
+    this.methodEpochProfileSha256 = profileSha256
     this.observations = [{
       id: 'app-feedback-synthetic',
       finding_code: 'APP-FEEDBACK-SYNTHETIC',
@@ -1385,7 +1683,15 @@ class FakeController implements ControllerPort {
   }
 
   primeMethodCandidate(value: Record<string, unknown>): void {
-    this.methodCandidates = [{ ...value }]
+    const resumable = value.status === 'CANDIDATE'
+    this.methodCandidates = [{
+      observation_id: 'app-feedback-synthetic',
+      preparation_completed: resumable ? 0 : 4,
+      preparation_total: 4,
+      preparation_resumable: resumable,
+      preparation_blocked_reason: null,
+      ...value,
+    }]
   }
 
   async invoke(request: ControllerRequestLike): Promise<{ exitCode: number; payload: unknown }> {
@@ -1438,32 +1744,109 @@ class FakeController implements ControllerPort {
         }
         break
       case 'method_candidate_context':
-        result = {
-          candidate_id: payload.candidate_id,
-          observation_id: payload.observation_id,
-          finding_code: 'APP-FEEDBACK-SYNTHETIC',
-          feedback: '减少解释，让人物用动作推进情节。',
-          initial_intent: this.initialIntent,
-          current_method_version: this.activeMethodVersion,
-          current_guidance: this.activeGuidance,
-          builder_context_sha256: 'b'.repeat(64),
-          heldout_included: false,
-          source_works: [1, 2, 3].map(number => ({
-            run_id: `run-source-${number}`,
-            work_id: `work-source-${number}`,
-            task: `独立创作任务 ${number}`,
-            task_sha256: String(number).repeat(64),
-            output: `基线作品 ${number}，人物解释了原因。`,
-            artifact_sha256: String(number).repeat(64),
-            provenance: {},
-            provenance_path: `run-${number}/runtime-provenance.json`,
-            provenance_sha256: String(number).repeat(64),
-          })),
+        {
+          if (this.methodCandidateId === null && this.methodBuilderIntentId !== null) {
+            throw new Error('Candidate Builder 可能已调用；为避免重复付费，请放弃本次准备')
+          }
+          const unresolvedGeneration = [...this.methodGenerationIntents]
+            .find(label => !this.completedMethodGenerations.has(label))
+          if (this.methodCandidateId !== null && unresolvedGeneration !== undefined) {
+            throw new Error(`${unresolvedGeneration} 可能已在付费后中断；为避免重复付费，请放弃`)
+          }
+          const candidateId = this.methodCandidateId ?? String(payload.candidate_id)
+          const builderRequired = this.methodCandidateId === null
+          const methodEpoch = syntheticMethodEpoch(this.methodEpochProfileSha256)
+          result = {
+            candidate_id: candidateId,
+            observation_id: this.methodCandidateObservationId ?? payload.observation_id,
+            finding_code: 'APP-FEEDBACK-SYNTHETIC',
+            feedback: '减少解释，让人物用动作推进情节。',
+            initial_intent: this.initialIntent,
+            current_method_version: this.activeMethodVersion,
+            current_guidance: this.activeGuidance,
+            builder_context_sha256: 'b'.repeat(64),
+            heldout_included: false,
+            method_epoch: methodEpoch,
+            method_epoch_sha256: sha256CanonicalJson(methodEpoch),
+            builder_required: builderRequired,
+            guidance: builderRequired ? null : this.methodCandidateGuidance,
+            evaluation_plan: builderRequired ? null : this.methodEvaluationPlan,
+            completed_generation_labels: [...this.completedMethodGenerations],
+            generation_total: 4,
+            source_works: [1, 2, 3].map(number => ({
+              run_id: `run-source-${number}`,
+              work_id: `work-source-${number}`,
+              task: `独立创作任务 ${number}`,
+              task_sha256: String(number).repeat(64),
+              output: `基线作品 ${number}，人物解释了原因。`,
+              artifact_sha256: String(number).repeat(64),
+              provenance: {},
+              provenance_path: `run-${number}/runtime-provenance.json`,
+              provenance_sha256: String(number).repeat(64),
+            })),
+          }
+        }
+        break
+      case 'begin_method_candidate_preparation':
+        if (this.methodBuilderIntentId !== null
+          && this.methodBuilderIntentId !== String(payload.candidate_id)) {
+          throw new Error('synthetic competing builder intent')
+        }
+        {
+          const idempotent = this.methodBuilderIntentId === String(payload.candidate_id)
+          this.methodBuilderIntentId = String(payload.candidate_id)
+          if (this.methodCandidateId === null) {
+            this.methodCandidates = [{
+              id: payload.candidate_id,
+              observation_id: payload.observation_id,
+              title: '未完成的新方式准备',
+              summary: '此次准备未封存可用的创作指导。',
+              tradeoff: '未改变当前方法，也未保存模型生成正文。',
+              status: 'CANDIDATE',
+              ready: false,
+              adoption_pending: false,
+              rolled_back: false,
+              preparation_completed: 0,
+              preparation_total: 4,
+              preparation_resumable: false,
+              preparation_blocked_reason: 'Candidate Builder 正在调用或已在付费后中断。',
+              comparisons: [],
+            }]
+          }
+          result = {
+            candidate_id: payload.candidate_id,
+            observation_id: payload.observation_id,
+            builder_context_sha256: payload.builder_context_sha256,
+            expected_epoch_sha256: payload.expected_epoch_sha256,
+            intent_sha256: '5'.repeat(64),
+            idempotent,
+          }
         }
         break
       case 'create_method_candidate':
+        {
+        if (this.failMethodCreateBeforeCommit) {
+          throw new Error('synthetic method create unavailable before commit')
+        }
+        if (this.methodBuilderIntentId !== String(payload.candidate_id)) {
+          throw new Error('synthetic missing builder intent')
+        }
+        const idempotent = this.methodCandidateId === String(payload.candidate_id)
+        this.methodCandidateId = String(payload.candidate_id)
+        this.methodCandidateObservationId = String(payload.observation_id)
+        this.methodCandidateGuidance = String(payload.guidance)
+        this.methodEvaluationPlan = {
+          targeted: { task: '目标任务', baseline_output: '目标基线', candidate_context_sha256: 'c'.repeat(64) },
+          regression: { task: '回归任务', baseline_output: '回归基线', candidate_context_sha256: 'd'.repeat(64) },
+          heldout: {
+            task: '全新留出任务',
+            baseline_context_sha256: 'e'.repeat(64),
+            candidate_context_sha256: 'f'.repeat(64),
+          },
+        }
         this.methodCandidates = [{
           id: payload.candidate_id,
+          observation_id: payload.observation_id,
           title: '针对重复反馈的新方式',
           summary: payload.guidance,
           tradeoff: '只改变后续作品的创作指导，不改写既有作品。',
@@ -1471,28 +1854,150 @@ class FakeController implements ControllerPort {
           ready: false,
           adoption_pending: false,
           rolled_back: false,
+          preparation_completed: 0,
+          preparation_total: 4,
+          preparation_resumable: true,
+          preparation_blocked_reason: null,
           comparisons: [],
         }]
         result = {
           candidate_id: payload.candidate_id,
+          observation_id: payload.observation_id,
           lifecycle: 'CANDIDATE',
-          evaluation_plan: {
-            targeted: { task: '目标任务', baseline_output: '目标基线', candidate_context_sha256: 'c'.repeat(64) },
-            regression: { task: '回归任务', baseline_output: '回归基线', candidate_context_sha256: 'd'.repeat(64) },
-            heldout: {
-              task: '全新留出任务',
-              baseline_context_sha256: 'e'.repeat(64),
-              candidate_context_sha256: 'f'.repeat(64),
-            },
-          },
+          guidance: payload.guidance,
+          guidance_sha256: createHash('sha256').update(String(payload.guidance), 'utf8').digest('hex'),
+          builder_context_sha256: (payload.builder_provenance as Record<string, unknown>).context_sha256,
+          builder_provenance_sha256: '7'.repeat(64),
+          proposal_sha256: '8'.repeat(64),
+          source_epoch_sha256: sha256CanonicalJson(syntheticMethodEpoch(this.methodEpochProfileSha256)),
+          evaluation_plan: this.methodEvaluationPlan,
+          completed_generation_labels: [],
+          generation_total: 4,
+          idempotent,
+        }
+        if (this.methodCreateResponseGate !== null) await this.methodCreateResponseGate
+        if (this.loseFirstMethodCreateResponse) {
+          this.loseFirstMethodCreateResponse = false
+          throw new Error('synthetic method create response lost after commit')
+        }
+        break
+        }
+      case 'begin_method_generation':
+        if (payload.candidate_id !== this.methodCandidateId) {
+          throw new Error('synthetic generation intent candidate mismatch')
+        }
+        {
+          const label = String(payload.label)
+          if (this.failBeginMethodGenerationLabel === label) {
+            throw new Error('synthetic generation intent unavailable before commit')
+          }
+          const idempotent = this.methodGenerationIntents.has(label)
+          if (this.completedMethodGenerations.has(label)) {
+            throw new Error('synthetic generation already completed')
+          }
+          this.methodGenerationIntents.add(label)
+          result = {
+            candidate_id: payload.candidate_id,
+            label: payload.label,
+            context_sha256: payload.context_sha256,
+            expected_epoch_sha256: payload.expected_epoch_sha256,
+            intent_sha256: '4'.repeat(64),
+            idempotent,
+          }
+          this.methodCandidates = this.methodCandidates.map(candidate => ({
+            ...candidate,
+            preparation_resumable: false,
+            preparation_blocked_reason: `${label} 正在调用或已在付费后中断。`,
+          }))
+        }
+        break
+      case 'record_method_generation':
+        if (payload.candidate_id !== this.methodCandidateId
+          || !['targeted_candidate', 'regression_candidate', 'heldout_baseline', 'heldout_candidate']
+            .includes(String(payload.label))) {
+          throw new Error('synthetic invalid method generation')
+        }
+        if (!this.methodGenerationIntents.has(String(payload.label))) {
+          throw new Error('synthetic missing generation intent')
+        }
+        if (this.failRecordMethodGenerationLabel === String(payload.label)) {
+          this.failRecordMethodGenerationLabel = null
+          throw new Error('synthetic generation record unavailable after paid output')
+        }
+        this.completedMethodGenerations.add(String(payload.label))
+        this.methodCandidates = this.methodCandidates.map(candidate => ({
+          ...candidate,
+          preparation_completed: this.completedMethodGenerations.size,
+          preparation_resumable: true,
+          preparation_blocked_reason: null,
+        }))
+        result = {
+          candidate_id: payload.candidate_id,
+          label: payload.label,
+          completed_generation_labels: [...this.completedMethodGenerations],
+          generation_total: 4,
+          idempotent: false,
+        }
+        if (this.methodGenerationRecordResponseGate?.label === String(payload.label)) {
+          await this.methodGenerationRecordResponseGate.promise
+        }
+        break
+      case 'record_method_generation_failure':
+        this.methodCandidates = this.methodCandidates.map(candidate => ({
+          ...candidate,
+          preparation_resumable: false,
+          preparation_blocked_reason: '模型来源无法形成唯一 epoch；为避免重复付费，只能放弃。',
+        }))
+        result = {
+          candidate_id: payload.candidate_id,
+          label: payload.label,
+          error_code: payload.error_code,
+          failure_marker_sha256: '6'.repeat(64),
+        }
+        break
+      case 'record_method_builder_failure':
+        if (this.methodBuilderIntentId !== String(payload.candidate_id)) {
+          throw new Error('synthetic missing builder intent for failure')
+        }
+        this.methodCandidates = [{
+          id: payload.candidate_id,
+          observation_id: payload.observation_id,
+          title: '未完成的新方式准备',
+          summary: '此次准备未封存可用的创作指导。',
+          tradeoff: '未改变当前方法，也未保存模型生成正文。',
+          status: 'CANDIDATE',
+          ready: false,
+          adoption_pending: false,
+          rolled_back: false,
+          preparation_completed: 0,
+          preparation_total: 4,
+          preparation_resumable: false,
+          preparation_blocked_reason: '模型来源无法形成唯一 epoch；为避免重复付费，只能放弃。',
+          comparisons: [],
+        }]
+        result = {
+          candidate_id: payload.candidate_id,
+          observation_id: payload.observation_id,
+          error_code: payload.error_code,
+          failure_marker_sha256: '3'.repeat(64),
+          idempotent: false,
         }
         break
       case 'stage_method_comparisons':
+        if (payload.candidate_id !== this.methodCandidateId
+          || this.completedMethodGenerations.size !== 4
+          || Object.hasOwn(payload, 'generations')) {
+          throw new Error('synthetic incomplete method preparation')
+        }
         this.methodCandidates = this.methodCandidates.map(candidate => ({
           ...candidate,
           status: 'EVALUATING',
           adoption_pending: false,
           rolled_back: false,
+          preparation_completed: 4,
+          preparation_total: 4,
+          preparation_resumable: false,
+          preparation_blocked_reason: null,
           comparisons: [
             { phase: 'targeted', left: '目标 A', right: '目标 B', choice: null },
             { phase: 'regression', left: '回归 A', right: '回归 B', choice: null },
@@ -1526,7 +2031,20 @@ class FakeController implements ControllerPort {
         break
       }
       case 'reject_method_candidate':
-        this.methodCandidates = this.methodCandidates.map(item => ({ ...item, status: 'REJECTED', ready: false }))
+        this.methodCandidates = this.methodCandidates.map(item => ({
+          ...item,
+          status: 'REJECTED',
+          ready: false,
+          preparation_resumable: false,
+          preparation_blocked_reason: null,
+        }))
+        this.methodCandidateId = null
+        this.methodCandidateObservationId = null
+        this.methodCandidateGuidance = null
+        this.methodEvaluationPlan = null
+        this.methodBuilderIntentId = null
+        this.completedMethodGenerations.clear()
+        this.methodGenerationIntents.clear()
         result = { snapshot: this.snapshot() }
         break
       case 'rollback_method':
@@ -1764,4 +2282,29 @@ class FakeController implements ControllerPort {
         active: item.version === this.activeMethodVersion,
       }))
   }
+}
+
+function syntheticMethodEpoch(profileSha256: string): Record<string, unknown> {
+  return {
+    method_version: 'baseline-v1',
+    requested_model: 'deepseek-v4-pro',
+    returned_model: 'deepseek-v4-pro',
+    system_fingerprint: 'fingerprint-one',
+    profile_sha256: profileSha256,
+    parameters: {
+      thinking: 'enabled',
+      reasoning_effort: 'high',
+      max_tokens: 32_768,
+    },
+  }
+}
+
+function sha256CanonicalJson(value: Record<string, unknown>): string {
+  const sorted = Object.fromEntries(Object.entries(value)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => [key, item !== null && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right)))
+      : item]))
+  return createHash('sha256').update(`${JSON.stringify(sorted)}\n`, 'utf8').digest('hex')
 }

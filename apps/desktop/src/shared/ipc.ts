@@ -79,6 +79,8 @@ export interface MethodComparisonSnapshot {
 
 export interface MethodCandidateSnapshot {
   readonly id: string
+  /** The repeated-feedback observation that owns this one durable candidate. */
+  readonly observationId: string
   readonly title: string
   readonly summary: string
   readonly tradeoff: string
@@ -88,6 +90,13 @@ export interface MethodCandidateSnapshot {
   readonly adoptionPending: boolean
   /** This promoted method was explicitly rolled back and is history-only in v1. */
   readonly rolledBack: boolean
+  /** Number of immutable paid generation slots already sealed for preparation. */
+  readonly completedGenerationCount: number
+  readonly generationTotal: number
+  /** The frozen candidate can continue without rebuilding or repeating sealed slots. */
+  readonly resumable: boolean
+  /** Actionable reason when the only safe operation is immutable rejection. */
+  readonly preparationBlockedReason: string | null
   readonly comparisons: readonly MethodComparisonSnapshot[]
 }
 

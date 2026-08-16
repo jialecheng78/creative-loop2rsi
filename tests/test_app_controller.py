@@ -286,6 +286,165 @@ class AppControllerTests(unittest.TestCase):
             arguments.extend(["--dispatch-id", f"dispatch-{run_id}"])
         return self.command(*arguments)
 
+    def create_ready_method_candidate(
+        self,
+        *,
+        project_name="method-resume-project",
+        candidate_id="method-resume-v1",
+    ):
+        project, observation, context = self.create_ready_method_context(
+            project_name=project_name,
+            candidate_id=candidate_id,
+        )
+        self.begin_builder_preparation(
+            project, candidate_id, observation["id"], context
+        )
+        guidance = "用人物可见的选择、动作与后果推进情节。"
+        created = self.request(
+            "create_method_candidate",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": observation["id"],
+                "guidance": guidance,
+                "builder_role_id": "method-candidate-builder",
+                "builder_context_id": "method-builder-context-resume",
+                "builder_task_id": "method-builder-task-resume",
+                "builder_attested_by": "local-main-supervisor",
+                "builder_provenance": self.runtime_provenance(
+                    context_sha256=context["builder_context_sha256"],
+                    response_id="response-method-builder-resume",
+                ),
+            },
+        )
+        return project, observation, context, guidance, created
+
+    def create_ready_method_context(
+        self,
+        *,
+        project_name="method-context-project",
+        candidate_id="method-context-v1",
+    ):
+        project, _ = self.bootstrap(project_name)
+        feedback_text = "减少解释性句子，让人物通过可见行动推进情节。"
+        for number in range(1, 4):
+            run_id = f"resume-source-run-{number}"
+            begun = self.request(
+                "begin_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "work_id": f"resume-source-work-{number}",
+                    "task": f"独立创作任务 {number}",
+                },
+            )
+            completed = self.request(
+                "complete_work",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "output": f"基线作品 {number}：人物解释了自己的决定。",
+                    "runtime_provenance": self.runtime_provenance(
+                        context_sha256=begun["context_sha256"],
+                        response_id=f"response-resume-source-{number}",
+                    ),
+                },
+            )
+            self.request(
+                "submit_feedback",
+                {
+                    "project": str(project),
+                    "run_id": run_id,
+                    "action": "rewrite",
+                    "feedback_at": completed["review_available_at"],
+                    "feedback_text": feedback_text,
+                    "machine_direction": "UNKNOWN",
+                },
+            )
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        observation = next(
+            item
+            for item in snapshot["learning"]["observations"]
+            if item["ready_for_candidate"]
+        )
+        context = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": observation["id"],
+            },
+        )
+        return project, observation, context
+
+    def begin_builder_preparation(
+        self, project, candidate_id, observation_id, context
+    ):
+        return self.request(
+            "begin_method_candidate_preparation",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": observation_id,
+                "builder_context_sha256": context["builder_context_sha256"],
+                "expected_epoch_sha256": context["method_epoch_sha256"],
+            },
+        )
+
+    def begin_method_generation(self, project, candidate_id, label, plan, epoch):
+        locations = {
+            "targeted_candidate": ("targeted", "candidate_context_sha256"),
+            "regression_candidate": ("regression", "candidate_context_sha256"),
+            "heldout_baseline": ("heldout", "baseline_context_sha256"),
+            "heldout_candidate": ("heldout", "candidate_context_sha256"),
+        }
+        phase, field = locations[label]
+        return self.request(
+            "begin_method_generation",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "label": label,
+                "context_sha256": plan[phase][field],
+                "expected_epoch_sha256": epoch,
+            },
+        )
+
+    def seal_method_generation(
+        self, project, created, label, *, output=None, response_id=None
+    ):
+        candidate_id = created["candidate_id"]
+        plan = created["evaluation_plan"]
+        locations = {
+            "targeted_candidate": ("targeted", "candidate_context_sha256"),
+            "regression_candidate": ("regression", "candidate_context_sha256"),
+            "heldout_baseline": ("heldout", "baseline_context_sha256"),
+            "heldout_candidate": ("heldout", "candidate_context_sha256"),
+        }
+        phase, field = locations[label]
+        self.begin_method_generation(
+            project,
+            candidate_id,
+            label,
+            plan,
+            created["source_epoch_sha256"],
+        )
+        return self.request(
+            "record_method_generation",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "label": label,
+                "generation": {
+                    "output": output or f"{label} 已封存作品",
+                    "runtime_provenance": self.runtime_provenance(
+                        context_sha256=plan[phase][field],
+                        response_id=response_id or f"response-{label}",
+                    ),
+                },
+            },
+        )
+
     def test_progressive_bootstrap_allows_work_without_faking_charter_confirmation(self):
         project, initialized = self.bootstrap()
         system = self.read_json(project / "creative-system/system.json")
@@ -1653,6 +1812,890 @@ class AppControllerTests(unittest.TestCase):
                 },
             )
 
+    def test_method_candidate_preparation_resumes_durable_slots_after_crash(self):
+        project, observation, _, guidance, created = (
+            self.create_ready_method_candidate()
+        )
+        candidate_id = created["candidate_id"]
+        plan = created["evaluation_plan"]
+
+        def generation(label, output, response_id):
+            context_locations = {
+                "targeted_candidate": ("targeted", "candidate_context_sha256"),
+                "regression_candidate": ("regression", "candidate_context_sha256"),
+                "heldout_baseline": ("heldout", "baseline_context_sha256"),
+                "heldout_candidate": ("heldout", "candidate_context_sha256"),
+            }
+            phase, field = context_locations[label]
+            return {
+                "output": output,
+                "runtime_provenance": self.runtime_provenance(
+                    context_sha256=plan[phase][field],
+                    response_id=response_id,
+                ),
+            }
+
+        first_generation = generation(
+            "targeted_candidate",
+            "目标候选：她把停用的门卡递给警卫。",
+            "response-resume-targeted",
+        )
+        self.begin_method_generation(
+            project,
+            candidate_id,
+            "targeted_candidate",
+            plan,
+            created["source_epoch_sha256"],
+        )
+        first = self.request(
+            "record_method_generation",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "label": "targeted_candidate",
+                "generation": first_generation,
+            },
+        )
+        self.assertFalse(first["idempotent"])
+        self.begin_method_generation(
+            project,
+            candidate_id,
+            "regression_candidate",
+            plan,
+            created["source_epoch_sha256"],
+        )
+        second = self.request(
+            "record_method_generation",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "label": "regression_candidate",
+                "generation": generation(
+                    "regression_candidate",
+                    "回归候选：他关掉广播，亲手撕掉通行名单。",
+                    "response-resume-regression",
+                ),
+            },
+        )
+        self.assertEqual(
+            second["completed_generation_labels"],
+            ["targeted_candidate", "regression_candidate"],
+        )
+
+        # A fresh Main process proposes a new id, but the Controller returns the
+        # one frozen candidate and its durable progress instead of billing again.
+        resumed = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": "method-should-not-be-created-v2",
+                "observation_id": observation["id"],
+            },
+        )
+        self.assertEqual(resumed["candidate_id"], candidate_id)
+        self.assertFalse(resumed["builder_required"])
+        self.assertEqual(resumed["guidance"], guidance)
+        self.assertEqual(resumed["evaluation_plan"], plan)
+        self.assertEqual(
+            resumed["completed_generation_labels"],
+            ["targeted_candidate", "regression_candidate"],
+        )
+        self.assertEqual(resumed["generation_total"], 4)
+
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        public_candidate = next(
+            item
+            for item in snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(public_candidate["observation_id"], observation["id"])
+        self.assertEqual(public_candidate["preparation_completed"], 2)
+        self.assertEqual(public_candidate["preparation_total"], 4)
+        self.assertTrue(public_candidate["preparation_resumable"])
+        self.assertIsNone(public_candidate["preparation_blocked_reason"])
+        self.assertEqual(public_candidate["comparisons"], [])
+
+        repeated = self.request(
+            "record_method_generation",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "label": "targeted_candidate",
+                "generation": first_generation,
+            },
+        )
+        self.assertTrue(repeated["idempotent"])
+        changed = dict(first_generation)
+        changed["output"] = "试图覆盖已经封存的付费结果。"
+        with self.assertRaisesRegex(AppRequestError, "拒绝覆盖"):
+            self.request(
+                "record_method_generation",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "label": "targeted_candidate",
+                    "generation": changed,
+                },
+            )
+        with self.assertRaisesRegex(AppRequestError, "已有未完成方法候选"):
+            self.request(
+                "create_method_candidate",
+                {
+                    "project": str(project),
+                    "candidate_id": "method-parallel-v2",
+                    "observation_id": observation["id"],
+                    "guidance": guidance,
+                    "builder_role_id": "method-candidate-builder",
+                    "builder_context_id": "parallel-context",
+                    "builder_task_id": "parallel-task",
+                    "builder_attested_by": "local-main-supervisor",
+                    "builder_provenance": self.runtime_provenance(
+                        context_sha256=resumed["builder_context_sha256"],
+                        response_id="response-parallel-builder",
+                    ),
+                },
+            )
+
+        for label, output, response_id in (
+            (
+                "heldout_baseline",
+                "留出基线：人物说明自己为什么必须离开。",
+                "response-resume-heldout-baseline",
+            ),
+            (
+                "heldout_candidate",
+                "留出候选：她把返程票塞进陌生人的口袋。",
+                "response-resume-heldout-candidate",
+            ),
+        ):
+            self.begin_method_generation(
+                project,
+                candidate_id,
+                label,
+                plan,
+                created["source_epoch_sha256"],
+            )
+            self.request(
+                "record_method_generation",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "label": label,
+                    "generation": generation(label, output, response_id),
+                },
+            )
+
+        # Simulate a hard crash after the complete deterministic pending tree
+        # is written but before its one atomic publish rename.
+        original_rename = app_service.os.rename
+
+        def crash_before_comparison_publish(source, destination):
+            if Path(source).name == ".pending-comparisons":
+                raise RuntimeError("synthetic comparison publish crash")
+            return original_rename(source, destination)
+
+        with mock.patch.object(
+            app_service.os,
+            "rename",
+            side_effect=crash_before_comparison_publish,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "publish crash"):
+                self.request(
+                    "stage_method_comparisons",
+                    {"project": str(project), "candidate_id": candidate_id},
+                )
+        candidate_root = (
+            project
+            / "creative-system"
+            / "app-methods"
+            / "candidates"
+            / candidate_id
+        )
+        self.assertFalse((candidate_root / "comparisons").exists())
+        self.assertTrue((candidate_root / ".pending-comparisons").is_dir())
+        self.assertEqual(
+            self.read_json(candidate_root / "status.json")["lifecycle"],
+            "CANDIDATE",
+        )
+        for label in app_service.METHOD_GENERATION_LABELS:
+            slot = candidate_root / "preparation" / "generations" / label
+            self.assertTrue((slot / "output.md").is_file())
+            self.assertTrue((slot / "runtime-provenance.json").is_file())
+            receipt = self.read_json(slot / "receipt.json")
+            self.assertEqual(receipt["label"], label)
+            self.assertRegex(receipt["output"]["sha256"], r"^[0-9a-f]{64}$")
+
+        with mock.patch.object(
+            app_service,
+            "_candidate_status_update",
+            side_effect=RuntimeError("synthetic status projection crash"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "projection crash"):
+                self.request(
+                    "stage_method_comparisons",
+                    {"project": str(project), "candidate_id": candidate_id},
+                )
+        self.assertTrue((candidate_root / "comparisons").is_dir())
+        self.assertEqual(
+            self.read_json(candidate_root / "status.json")["lifecycle"],
+            "CANDIDATE",
+        )
+        projection_crash_snapshot = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        projection_crash_candidate = next(
+            item
+            for item in projection_crash_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(
+            self.read_json(candidate_root / "status.json")["lifecycle"],
+            "EVALUATING",
+        )
+        self.assertEqual(projection_crash_candidate["status"], "EVALUATING")
+        self.assertEqual(len(projection_crash_candidate["comparisons"]), 3)
+        self.assertEqual(projection_crash_candidate["preparation_completed"], 4)
+        self.assertFalse(projection_crash_candidate["preparation_resumable"])
+
+        finalized = self.request(
+            "stage_method_comparisons",
+            {"project": str(project), "candidate_id": candidate_id},
+        )
+        self.assertEqual(finalized["lifecycle"], "EVALUATING")
+        restarted_snapshot = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        restarted_candidate = next(
+            item
+            for item in restarted_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(restarted_candidate["preparation_completed"], 4)
+        self.assertFalse(restarted_candidate["preparation_resumable"])
+        self.assertEqual(len(restarted_candidate["comparisons"]), 3)
+
+    def test_method_generation_epoch_mismatch_records_nothing_and_can_be_abandoned(self):
+        project, observation, _, _, created = self.create_ready_method_candidate(
+            project_name="method-mismatch-project",
+            candidate_id="method-mismatch-v1",
+        )
+        candidate_id = created["candidate_id"]
+        plan = created["evaluation_plan"]
+        mismatched = self.runtime_provenance(
+            context_sha256=plan["targeted"]["candidate_context_sha256"],
+            fingerprint="fp-different-model-build",
+            response_id="response-method-mismatch",
+        )
+        self.begin_method_generation(
+            project,
+            candidate_id,
+            "targeted_candidate",
+            plan,
+            created["source_epoch_sha256"],
+        )
+        with self.assertRaisesRegex(AppRequestError, "fingerprint"):
+            self.request(
+                "record_method_generation",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "label": "targeted_candidate",
+                    "generation": {
+                        "output": "不应被封存的漂移结果。",
+                        "runtime_provenance": mismatched,
+                    },
+                },
+            )
+        candidate_root = (
+            project
+            / "creative-system"
+            / "app-methods"
+            / "candidates"
+            / candidate_id
+        )
+        self.assertFalse(
+            (candidate_root / "preparation" / "generations" / "targeted_candidate").exists()
+        )
+        failure_path = (
+            candidate_root
+            / "preparation"
+            / "failures"
+            / "targeted_candidate.json"
+        )
+        failure = self.read_json(failure_path)
+        self.assertEqual(failure["error_code"], "METHOD_EPOCH_CHANGED")
+        self.assertEqual(failure["label"], "targeted_candidate")
+        self.assertNotEqual(
+            failure["expected_epoch_sha256"], failure["observed_epoch_sha256"]
+        )
+        serialized_failure = json.dumps(failure, ensure_ascii=False)
+        self.assertNotIn("不应被封存的漂移结果", serialized_failure)
+        self.assertNotIn("response-method-mismatch", serialized_failure)
+        self.assertNotIn("runtime_provenance", serialized_failure)
+        restarted = self.request("system_snapshot", {"project": str(project)})
+        blocked_candidate = next(
+            item
+            for item in restarted["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertFalse(blocked_candidate["preparation_resumable"])
+        self.assertIn("重复付费", blocked_candidate["preparation_blocked_reason"])
+        with self.assertRaisesRegex(AppRequestError, "永久停止"):
+            self.request(
+                "method_candidate_context",
+                {
+                    "project": str(project),
+                    "candidate_id": "method-mismatch-retry-v2",
+                    "observation_id": observation["id"],
+                },
+            )
+        rejected = self.request(
+            "reject_method_candidate",
+            {"project": str(project), "candidate_id": candidate_id},
+        )
+        rejected_candidate = next(
+            item
+            for item in rejected["snapshot"]["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(rejected_candidate["status"], "REJECTED")
+        self.assertFalse(rejected_candidate["preparation_resumable"])
+        self.assertTrue((candidate_root / "rejection.json").is_file())
+        replacement = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": "method-mismatch-replacement-v2",
+                "observation_id": observation["id"],
+            },
+        )
+        self.assertEqual(
+            replacement["candidate_id"], "method-mismatch-replacement-v2"
+        )
+        self.assertTrue(replacement["builder_required"])
+
+    def test_builder_intent_blocks_restart_without_persisting_paid_content(self):
+        candidate_id = "method-builder-window-v1"
+        project, observation, context = self.create_ready_method_context(
+            project_name="method-builder-window-project",
+            candidate_id=candidate_id,
+        )
+        first = self.begin_builder_preparation(
+            project, candidate_id, observation["id"], context
+        )
+        repeated = self.begin_builder_preparation(
+            project, candidate_id, observation["id"], context
+        )
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(repeated["idempotent"])
+        intent_path = (
+            project
+            / "creative-system/app-methods/builder-preparations"
+            / f"{candidate_id}.json"
+        )
+        serialized_intent = intent_path.read_text(encoding="utf-8")
+        self.assertNotIn("用人物可见的选择", serialized_intent)
+        self.assertNotIn("response", serialized_intent)
+        self.assertNotIn("RuntimeProvenance", serialized_intent)
+
+        live_snapshot = self.request("system_snapshot", {"project": str(project)})
+        candidate = next(
+            item
+            for item in live_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(candidate["status"], "CANDIDATE")
+        self.assertEqual(candidate["preparation_completed"], 0)
+        self.assertFalse(candidate["preparation_resumable"])
+        with self.assertRaisesRegex(AppRequestError, "重复付费"):
+            self.request(
+                "method_candidate_context",
+                {
+                    "project": str(project),
+                    "candidate_id": "method-builder-window-retry-v2",
+                    "observation_id": observation["id"],
+                },
+            )
+
+        failure = self.request(
+            "record_method_builder_failure",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": observation["id"],
+                "builder_context_sha256": context["builder_context_sha256"],
+                "expected_epoch_sha256": context["method_epoch_sha256"],
+                "observed_evidence_sha256": "9" * 64,
+                "error_code": "METHOD_EPOCH_UNVERIFIABLE",
+            },
+        )
+        self.assertRegex(failure["failure_marker_sha256"], r"^[0-9a-f]{64}$")
+        failure_text = (
+            project
+            / "creative-system/app-methods/builder-failures"
+            / f"{candidate_id}.json"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("guidance", failure_text)
+        self.assertNotIn("response", failure_text)
+        self.request(
+            "reject_method_candidate",
+            {"project": str(project), "candidate_id": candidate_id},
+        )
+        replacement = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": "method-builder-window-replacement-v2",
+                "observation_id": observation["id"],
+            },
+        )
+        self.assertTrue(replacement["builder_required"])
+
+    def test_builder_epoch_mismatch_persists_hash_only_failure_before_candidate(self):
+        candidate_id = "method-builder-epoch-drift-v1"
+        project, observation, context = self.create_ready_method_context(
+            project_name="method-builder-epoch-drift-project",
+            candidate_id=candidate_id,
+        )
+        self.begin_builder_preparation(
+            project, candidate_id, observation["id"], context
+        )
+        with self.assertRaisesRegex(AppRequestError, "不属于同一模型基线"):
+            self.request(
+                "create_method_candidate",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "observation_id": observation["id"],
+                    "guidance": "用人物可见的动作与后果推进情节。",
+                    "builder_role_id": "method-candidate-builder",
+                    "builder_context_id": "method-builder-drift-context",
+                    "builder_task_id": "method-builder-drift-task",
+                    "builder_attested_by": "local-main-supervisor",
+                    "builder_provenance": self.runtime_provenance(
+                        context_sha256=context["builder_context_sha256"],
+                        fingerprint="fp-builder-drifted-v2",
+                        response_id="response-builder-drifted",
+                    ),
+                },
+            )
+
+        failure_path = (
+            project
+            / "creative-system/app-methods/builder-failures"
+            / f"{candidate_id}.json"
+        )
+        failure = self.read_json(failure_path)
+        self.assertEqual(failure["error_code"], "METHOD_EPOCH_CHANGED")
+        self.assertEqual(failure["source_refs"], [])
+        serialized = failure_path.read_text(encoding="utf-8")
+        self.assertNotIn("guidance", serialized)
+        self.assertNotIn("response-builder-drifted", serialized)
+        self.assertNotIn("fp-builder-drifted-v2", serialized)
+
+        snapshot = self.request("system_snapshot", {"project": str(project)})
+        candidate = next(
+            item
+            for item in snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(candidate["status"], "CANDIDATE")
+        self.assertFalse(candidate["preparation_resumable"])
+        with self.assertRaisesRegex(AppRequestError, "重复付费"):
+            self.request(
+                "method_candidate_context",
+                {
+                    "project": str(project),
+                    "candidate_id": "method-builder-epoch-drift-retry-v2",
+                    "observation_id": observation["id"],
+                },
+            )
+        rejected = self.request(
+            "reject_method_candidate",
+            {"project": str(project), "candidate_id": candidate_id},
+        )
+        rejected_candidate = next(
+            item
+            for item in rejected["snapshot"]["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(rejected_candidate["status"], "REJECTED")
+
+    def test_candidate_pending_recovery_validates_builder_before_roll_forward(self):
+        core = load_controller()
+        for mode in (
+            "full",
+            "partial",
+            "tampered",
+            "extra",
+            "mismatched-intent",
+        ):
+            with self.subTest(mode=mode):
+                candidate_id = f"method-candidate-pending-{mode}"
+                project, observation, _, _, _ = self.create_ready_method_candidate(
+                    project_name=f"candidate-pending-{mode}-project",
+                    candidate_id=candidate_id,
+                )
+                root = (
+                    project
+                    / "creative-system/app-methods/candidates"
+                    / candidate_id
+                )
+                pending = root.parent / f".pending-{candidate_id}"
+                os.rename(root, pending)
+                if mode == "partial":
+                    (pending / "status.json").unlink()
+                elif mode == "tampered":
+                    provenance_path = pending / "builder-provenance.json"
+                    provenance = self.read_json(provenance_path)
+                    provenance["context_sha256"] = "0" * 64
+                    provenance["content_hash"] = core.app_record_content_hash(
+                        provenance
+                    )
+                    self.write_json(provenance_path, provenance)
+                elif mode == "extra":
+                    (pending / "late-write.txt").write_text(
+                        "unbound late write", encoding="utf-8"
+                    )
+                elif mode == "mismatched-intent":
+                    intent_path = (
+                        project
+                        / "creative-system/app-methods/builder-preparations"
+                        / f"{candidate_id}.json"
+                    )
+                    intent = self.read_json(intent_path)
+                    intent["expected_epoch_sha256"] = "0" * 64
+                    intent["content_hash"] = core.app_record_content_hash(intent)
+                    self.write_json(intent_path, intent)
+
+                snapshot = self.request(
+                    "system_snapshot", {"project": str(project)}
+                )
+                candidate = next(
+                    item
+                    for item in snapshot["method_candidates"]
+                    if item["id"] == candidate_id
+                )
+                if mode == "full":
+                    self.assertTrue(root.is_dir())
+                    self.assertFalse(pending.exists())
+                    self.assertTrue(candidate["preparation_resumable"])
+                    resumed = self.request(
+                        "method_candidate_context",
+                        {
+                            "project": str(project),
+                            "candidate_id": "ignored-new-id",
+                            "observation_id": observation["id"],
+                        },
+                    )
+                    self.assertFalse(resumed["builder_required"])
+                else:
+                    self.assertFalse(candidate["preparation_resumable"])
+                    with self.assertRaises(AppRequestError):
+                        self.request(
+                            "method_candidate_context",
+                            {
+                                "project": str(project),
+                                "candidate_id": "ignored-new-id",
+                                "observation_id": observation["id"],
+                            },
+                        )
+                    rejected = self.request(
+                        "reject_method_candidate",
+                        {"project": str(project), "candidate_id": candidate_id},
+                    )
+                    rejected_candidate = next(
+                        item
+                        for item in rejected["snapshot"]["method_candidates"]
+                        if item["id"] == candidate_id
+                    )
+                    self.assertEqual(rejected_candidate["status"], "REJECTED")
+
+    def test_candidate_pending_requires_matching_builder_intent(self):
+        candidate_id = "method-candidate-pending-missing-intent"
+        project, observation, _, _, _ = self.create_ready_method_candidate(
+            project_name="candidate-pending-missing-intent-project",
+            candidate_id=candidate_id,
+        )
+        root = (
+            project
+            / "creative-system/app-methods/candidates"
+            / candidate_id
+        )
+        pending = root.parent / f".pending-{candidate_id}"
+        os.rename(root, pending)
+        (
+            project
+            / "creative-system/app-methods/builder-preparations"
+            / f"{candidate_id}.json"
+        ).unlink()
+
+        with self.assertRaisesRegex(AppRequestError, "intent"):
+            self.request(
+                "method_candidate_context",
+                {
+                    "project": str(project),
+                    "candidate_id": "ignored-new-id",
+                    "observation_id": observation["id"],
+                },
+            )
+        self.assertTrue(pending.is_dir())
+        self.assertFalse(root.exists())
+
+    def test_generation_pending_and_slot_inventory_fail_closed(self):
+        cases = ("full", "partial", "tampered-pending", "extra", "missing-intent")
+        for mode in cases:
+            with self.subTest(mode=mode):
+                candidate_id = f"method-slot-{mode}"
+                project, _, _, _, created = self.create_ready_method_candidate(
+                    project_name=f"method-slot-{mode}-project",
+                    candidate_id=candidate_id,
+                )
+                self.seal_method_generation(
+                    project, created, "targeted_candidate"
+                )
+                root = (
+                    project
+                    / "creative-system/app-methods/candidates"
+                    / candidate_id
+                )
+                slot = root / "preparation/generations/targeted_candidate"
+                pending = slot.parent / ".pending-targeted_candidate"
+                if mode == "full":
+                    os.rename(slot, pending)
+                    resumed = self.request(
+                        "method_candidate_context",
+                        {
+                            "project": str(project),
+                            "candidate_id": "ignored-new-id",
+                            "observation_id": created["observation_id"],
+                        },
+                    )
+                    self.assertEqual(
+                        resumed["completed_generation_labels"],
+                        ["targeted_candidate"],
+                    )
+                    self.assertTrue(slot.is_dir())
+                    self.assertFalse(pending.exists())
+                    continue
+                if mode == "partial":
+                    self.begin_method_generation(
+                        project,
+                        candidate_id,
+                        "regression_candidate",
+                        created["evaluation_plan"],
+                        created["source_epoch_sha256"],
+                    )
+                    partial = slot.parent / ".pending-regression_candidate"
+                    partial.mkdir()
+                    (partial / "output.md").write_text(
+                        "仅存在的已付费正文", encoding="utf-8"
+                    )
+                elif mode == "tampered-pending":
+                    os.rename(slot, pending)
+                    (pending / "output.md").write_text(
+                        "被篡改但仍保留 exact-three inventory 的正文",
+                        encoding="utf-8",
+                    )
+                elif mode == "extra":
+                    (slot / "late-reasoning.txt").write_text(
+                        "must-not-be-accepted", encoding="utf-8"
+                    )
+                else:
+                    (
+                        root
+                        / "preparation/intents/targeted_candidate.json"
+                    ).unlink()
+                snapshot = self.request(
+                    "system_snapshot", {"project": str(project)}
+                )
+                candidate = next(
+                    item
+                    for item in snapshot["method_candidates"]
+                    if item["id"] == candidate_id
+                )
+                self.assertFalse(candidate["preparation_resumable"])
+                if mode == "partial":
+                    self.assertEqual(candidate["preparation_completed"], 1)
+                with self.assertRaises(AppRequestError):
+                    self.request(
+                        "begin_method_generation",
+                        {
+                            "project": str(project),
+                            "candidate_id": candidate_id,
+                            "label": "heldout_baseline",
+                            "context_sha256": created["evaluation_plan"]["heldout"][
+                                "baseline_context_sha256"
+                            ],
+                            "expected_epoch_sha256": created[
+                                "source_epoch_sha256"
+                            ],
+                        },
+                    )
+
+    def test_pending_comparisons_are_content_validated_before_publish(self):
+        for mode in ("partial", "tampered"):
+            with self.subTest(mode=mode):
+                candidate_id = f"method-comparison-{mode}"
+                project, _, _, _, created = self.create_ready_method_candidate(
+                    project_name=f"method-comparison-{mode}-project",
+                    candidate_id=candidate_id,
+                )
+                root = (
+                    project
+                    / "creative-system/app-methods/candidates"
+                    / candidate_id
+                )
+                pending = root / ".pending-comparisons"
+                if mode == "partial":
+                    (pending / "targeted").mkdir(parents=True)
+                else:
+                    for label in app_service.METHOD_GENERATION_LABELS:
+                        self.seal_method_generation(project, created, label)
+                    original_rename = app_service.os.rename
+
+                    def crash_publish(source, destination):
+                        if Path(source).name == ".pending-comparisons":
+                            raise RuntimeError("synthetic full pending crash")
+                        return original_rename(source, destination)
+
+                    with mock.patch.object(
+                        app_service.os, "rename", side_effect=crash_publish
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "full pending"):
+                            self.request(
+                                "stage_method_comparisons",
+                                {
+                                    "project": str(project),
+                                    "candidate_id": candidate_id,
+                                },
+                            )
+                    public_path = pending / "targeted/public.json"
+                    public = self.read_json(public_path)
+                    public["left"] = "内部合同自洽但与 slot 不同的篡改文本"
+                    public["left_sha256"] = hashlib.sha256(
+                        public["left"].encode("utf-8")
+                    ).hexdigest()
+                    public["content_hash"] = load_controller().app_record_content_hash(
+                        public
+                    )
+                    self.write_json(public_path, public)
+                snapshot = self.request(
+                    "system_snapshot", {"project": str(project)}
+                )
+                candidate = next(
+                    item
+                    for item in snapshot["method_candidates"]
+                    if item["id"] == candidate_id
+                )
+                self.assertEqual(candidate["status"], "CANDIDATE")
+                self.assertFalse(candidate["preparation_resumable"])
+                self.assertEqual(candidate["comparisons"], [])
+                if mode == "partial":
+                    self.assertTrue(pending.is_dir())
+                with self.assertRaises(AppRequestError):
+                    self.request(
+                        "begin_method_generation",
+                        {
+                            "project": str(project),
+                            "candidate_id": candidate_id,
+                            "label": "targeted_candidate",
+                            "context_sha256": created["evaluation_plan"]["targeted"][
+                                "candidate_context_sha256"
+                            ],
+                            "expected_epoch_sha256": created[
+                                "source_epoch_sha256"
+                            ],
+                        },
+                    )
+
+    def test_direct_stage_rejects_extra_generation_intent_inventory(self):
+        candidate_id = "method-extra-generation-intent-v1"
+        project, _, _, _, created = self.create_ready_method_candidate(
+            project_name="method-extra-generation-intent-project",
+            candidate_id=candidate_id,
+        )
+        for label in app_service.METHOD_GENERATION_LABELS:
+            self.seal_method_generation(project, created, label)
+        root = (
+            project
+            / "creative-system/app-methods/candidates"
+            / candidate_id
+        )
+        extra_intent = root / "preparation/intents/late-paid-call.json"
+        extra_intent.write_text("{}\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(AppRequestError, "未声明条目"):
+            self.request(
+                "stage_method_comparisons",
+                {"project": str(project), "candidate_id": candidate_id},
+            )
+        self.assertFalse((root / "comparisons").exists())
+        self.assertFalse((root / ".pending-comparisons").exists())
+
+    def test_rejection_receipt_projects_terminal_state_after_status_crash(self):
+        project, observation, _, _, created = self.create_ready_method_candidate(
+            project_name="method-rejection-crash-project",
+            candidate_id="method-rejection-crash-v1",
+        )
+        candidate_id = created["candidate_id"]
+        with mock.patch.object(
+            app_service,
+            "_candidate_status_update",
+            side_effect=RuntimeError("synthetic rejection status crash"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "rejection status crash"):
+                self.request(
+                    "reject_method_candidate",
+                    {"project": str(project), "candidate_id": candidate_id},
+                )
+        root = (
+            project
+            / "creative-system/app-methods/candidates"
+            / candidate_id
+        )
+        self.assertTrue((root / "rejection.json").is_file())
+        self.assertEqual(self.read_json(root / "status.json")["lifecycle"], "CANDIDATE")
+        restarted = self.request("system_snapshot", {"project": str(project)})
+        rejected = next(
+            item
+            for item in restarted["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertEqual(rejected["status"], "REJECTED")
+        self.assertEqual(self.read_json(root / "status.json")["lifecycle"], "REJECTED")
+        for operation, payload in (
+            (
+                "stage_method_comparisons",
+                {"project": str(project), "candidate_id": candidate_id},
+            ),
+            (
+                "adopt_method_candidate",
+                {"project": str(project), "candidate_id": candidate_id},
+            ),
+            (
+                "submit_method_comparison",
+                {
+                    "project": str(project),
+                    "candidate_id": candidate_id,
+                    "phase": "targeted",
+                    "choice": "A",
+                },
+            ),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(AppRequestError):
+                    self.request(operation, payload)
+        replacement = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": "method-rejection-replacement-v2",
+                "observation_id": observation["id"],
+            },
+        )
+        self.assertTrue(replacement["builder_required"])
+
     def test_minimum_app_method_loop_requires_three_works_and_binds_next_work(self):
         project, _ = self.bootstrap()
         feedback_text = "减少解释性句子，让人物通过可见行动推进情节。"
@@ -1718,6 +2761,9 @@ class AppControllerTests(unittest.TestCase):
         self.assertNotIn("heldout_task", context)
         self.assertNotIn("heldout_output", context)
         self.assertEqual(len(context["source_works"]), 3)
+        self.begin_builder_preparation(
+            project, candidate_id, ready[0]["id"], context
+        )
         guidance = "优先用人物可见的选择、动作与后果推进情节；仅在动作无法表达必要因果时保留一句解释。"
         created = self.request(
             "create_method_candidate",
@@ -2347,6 +3393,9 @@ class AppControllerTests(unittest.TestCase):
             {item["run_id"] for item in context["source_works"]},
             {"epoch-run-1", "epoch-run-2", "epoch-run-4"},
         )
+        self.begin_builder_preparation(
+            project, candidate_id, ready[0]["id"], context
+        )
         with self.assertRaisesRegex(AppRequestError, "Candidate Builder"):
             self.request(
                 "create_method_candidate",
@@ -2372,6 +3421,40 @@ class AppControllerTests(unittest.TestCase):
                 / "creative-system/app-methods/candidates"
                 / candidate_id
             ).exists()
+        )
+        failure_path = (
+            project
+            / "creative-system/app-methods/builder-failures"
+            / f"{candidate_id}.json"
+        )
+        self.assertEqual(
+            self.read_json(failure_path)["error_code"], "METHOD_EPOCH_CHANGED"
+        )
+        blocked_snapshot = self.request(
+            "system_snapshot", {"project": str(project)}
+        )
+        blocked_candidate = next(
+            item
+            for item in blocked_snapshot["method_candidates"]
+            if item["id"] == candidate_id
+        )
+        self.assertFalse(blocked_candidate["preparation_resumable"])
+        self.request(
+            "reject_method_candidate",
+            {"project": str(project), "candidate_id": candidate_id},
+        )
+
+        candidate_id = "method-epoch-isolated-v2"
+        context = self.request(
+            "method_candidate_context",
+            {
+                "project": str(project),
+                "candidate_id": candidate_id,
+                "observation_id": ready[0]["id"],
+            },
+        )
+        self.begin_builder_preparation(
+            project, candidate_id, ready[0]["id"], context
         )
         created = self.request(
             "create_method_candidate",
