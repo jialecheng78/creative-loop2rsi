@@ -1,5 +1,9 @@
 export { DshRuntimeAdapter, type HarnessFactory } from './adapter.js'
-export { assertDshCompatibility, type DshCompatibility } from './compatibility.js'
+export {
+  assertDshCompatibility,
+  type DshCompatibility,
+  type DshRuntimePackageSet,
+} from './compatibility.js'
 export { buildRuntimeEnvironment, containsDeepSeekCredential } from './environment.js'
 export { DshRuntimeError, publicRuntimeError } from './errors.js'
 export { resolvePublishedRuntime, type PublishedRuntimeInput } from './published-runtime.js'

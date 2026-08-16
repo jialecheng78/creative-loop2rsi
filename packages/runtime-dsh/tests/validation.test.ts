@@ -13,6 +13,7 @@ import {
   isLoopbackGateway,
   validateLaunchSpec,
   type DshRuntimeLaunchSpec,
+  type DshRuntimePackageSet,
 } from '../src/index.js'
 
 const root = resolve('/tmp', 'creative-rsi-runtime-test')
@@ -98,17 +99,82 @@ describe('runtime launch validation', () => {
     expect(isLoopbackGateway('http://127.0.0.1:4000')).toBe(true)
   })
 
-  it('pins the real CLI and SDK package surfaces', () => {
-    expect(assertDshCompatibility(
-      { name: '@deepseek-ai/dsh', version: '0.1.0-rc.6', bin: { dsh: 'lib/bin.js' } },
-      { name: '@deepseek-ai/dsh-sdk-client', version: '0.1.0-rc.6', exports: { '.': {} } },
-    )).toEqual({ cliVersion: '0.1.0-rc.6', sdkVersion: '0.1.0-rc.6' })
-    expect(() => assertDshCompatibility(
-      { name: '@deepseek-ai/dsh', version: '0.1.0-rc.5', bin: { dsh: 'lib/bin.js' } },
-      { name: '@deepseek-ai/dsh-sdk-client', version: '0.1.0-rc.6', exports: { '.': {} } },
-    )).toThrow(/精确/u)
+  it('pins the five published runtime package surfaces Studio actually uses', () => {
+    expect(assertDshCompatibility()).toEqual({
+      runtimeVersion: '0.1.0-rc.6',
+      sdkVersion: '0.1.0-rc.6',
+    })
+    expect(assertDshCompatibility(compatiblePackageSet())).toEqual({
+      runtimeVersion: '0.1.0-rc.6',
+      sdkVersion: '0.1.0-rc.6',
+    })
+
+    const compatible = compatiblePackageSet()
+    for (const incompatible of [
+      {
+        ...compatible,
+        runtime: { ...compatible.runtime, version: '0.1.0-rc.5' },
+      },
+      {
+        ...compatible,
+        runtime: { ...compatible.runtime, bin: { dsh: 'lib/bin.js' } },
+      },
+      {
+        ...compatible,
+        runtime: { ...compatible.runtime, exports: { '.': {} } },
+      },
+      {
+        ...compatible,
+        sdkClient: { ...compatible.sdkClient, exports: {} },
+      },
+      {
+        ...compatible,
+        sdkServer: { ...compatible.sdkServer, exports: {} },
+      },
+      {
+        ...compatible,
+        llmDeepSeek: { ...compatible.llmDeepSeek, version: '0.1.0-rc.5' },
+      },
+      {
+        ...compatible,
+        agentSpine: { ...compatible.agentSpine, exports: {} },
+      },
+    ]) {
+      expect(() => assertDshCompatibility(incompatible)).toThrow(/精确/u)
+    }
   })
 })
+
+function compatiblePackageSet(): DshRuntimePackageSet {
+  return {
+    runtime: {
+      name: '@deepseek-ai/dsh-sdk-jsonrpc-demo',
+      version: '0.1.0-rc.6',
+      bin: { 'dsh-jsonrpc-agent': 'lib/bin.js' },
+      exports: { './bin': {} },
+    },
+    sdkClient: {
+      name: '@deepseek-ai/dsh-sdk-client',
+      version: '0.1.0-rc.6',
+      exports: { '.': {} },
+    },
+    sdkServer: {
+      name: '@deepseek-ai/dsh-sdk-jsonrpc-server',
+      version: '0.1.0-rc.6',
+      exports: { '.': {} },
+    },
+    llmDeepSeek: {
+      name: '@deepseek-ai/dsh-llm-deepseek',
+      version: '0.1.0-rc.6',
+      exports: { '.': {} },
+    },
+    agentSpine: {
+      name: '@deepseek-ai/dsh-agent-spine-demo',
+      version: '0.1.0-rc.6',
+      exports: { '.': {} },
+    },
+  }
+}
 
 interface AnonymousUserIdModule {
   getOrCreateAnonymousUserId(options: {

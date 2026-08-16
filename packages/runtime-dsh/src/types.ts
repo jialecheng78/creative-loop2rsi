@@ -1,4 +1,4 @@
-export const SUPPORTED_DSH_VERSION = '0.1.0-rc.6' as const
+export const SUPPORTED_DSH_RUNTIME_VERSION = '0.1.0-rc.6' as const
 export const SUPPORTED_DSH_SDK_VERSION = '0.1.0-rc.6' as const
 export const MAX_DSH_OUTPUT_TOKENS = 32_768 as const
 

@@ -4,11 +4,17 @@ This package is the only DSH-specific boundary in Creative RSI Studio. Its
 public types describe Studio runs and never expose DSH session or Cordis
 types.
 
-The pinned `@deepseek-ai/dsh` package is a profile CLI. It is **not** treated
-as a reusable JSON-RPC runtime. Long-lived application runs use the separate,
-published `@deepseek-ai/dsh-sdk-client` API and require an explicitly supplied
-stdio JSON-RPC runtime command. Missing commands, unsupported package versions,
-non-loopback gateways, and unsafe environments fail closed.
+The production dependency set contains only the five published packages that
+Studio actually executes or loads: `@deepseek-ai/dsh-sdk-jsonrpc-demo` provides
+the stdio runtime command, `@deepseek-ai/dsh-sdk-client` owns the client side of
+that protocol, and the trusted profile loads
+`@deepseek-ai/dsh-sdk-jsonrpc-server`, `@deepseek-ai/dsh-llm-deepseek`, and
+`@deepseek-ai/dsh-agent-spine-demo`. Compatibility checks pin all five packages
+to rc.6 and verify the exact public bin/export surfaces Studio uses. The
+`@deepseek-ai/dsh` profile CLI meta package is not executed by Studio and is
+therefore not a runtime dependency; its unrelated browser/client dependency
+closure must not enter the packaged application. Missing commands, unsupported
+package versions, non-loopback gateways, and unsafe environments fail closed.
 
 Electron `utilityProcess` cannot provide a writable stdin stream. The desktop
 application therefore runs this adapter inside a utility worker and lets the

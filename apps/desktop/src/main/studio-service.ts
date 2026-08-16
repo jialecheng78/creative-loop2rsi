@@ -12,7 +12,7 @@ import {
 import {
   DshRuntimeError,
   resolvePublishedRuntime,
-  SUPPORTED_DSH_VERSION,
+  SUPPORTED_DSH_RUNTIME_VERSION,
   type DshModelId,
   type DshRuntimeLaunchSpec,
   type RuntimeErrorCode,
@@ -1605,7 +1605,7 @@ function runtimeProvenancePayload(
     app_version: appVersion,
     completed_at: provenance.completedAt ?? null,
     controller_version: CONTROLLER_VERSION,
-    dsh_version: SUPPORTED_DSH_VERSION,
+    dsh_version: SUPPORTED_DSH_RUNTIME_VERSION,
     profile_sha256: active.profileSha256,
     context_sha256: active.contextSha256,
     requested_model: active.model,
