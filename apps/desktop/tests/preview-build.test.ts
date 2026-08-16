@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmod, lstat, mkdtemp, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,6 +13,7 @@ import {
   inventoryTree,
   previewOutputPath,
   removePackageManagerMetadata,
+  removeRuntimeBuildMetadata,
   removePnpmWorkspaceSelfReference,
   restoreLegacyWorkspaceRuntimeDependencies,
   validateSidecarEvidence,
@@ -119,6 +120,48 @@ describe('preview build inventory', () => {
       .toBe(false)
   })
 
+  it('strips declaration and source-map files across app and production dependencies only', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-runtime-metadata-'))
+    temporary.push(root)
+    const appDist = join(root, 'dist', 'main')
+    const dependency = join(root, 'node_modules', 'synthetic-runtime', 'lib')
+    await mkdir(appDist, { recursive: true })
+    await mkdir(dependency, { recursive: true })
+    const removable = [
+      join(appDist, 'index.d.ts'),
+      join(appDist, 'index.d.mts'),
+      join(appDist, 'index.d.cts'),
+      join(appDist, 'index.js.map'),
+      join(dependency, 'context.d.ts'),
+      join(dependency, 'context.js.map'),
+    ]
+    await Promise.all(removable.map(path => writeFile(
+      path,
+      path.endsWith('context.d.ts') ? 'export interface Context { registry: string }\n' : '{}\n',
+    )))
+    const preserved = {
+      [join(appDist, 'index.js')]: 'export {}\n',
+      [join(dependency, 'context.js')]: 'export const ready = true\n',
+      [join(dirname(dependency), 'package.json')]: '{"name":"synthetic-runtime"}\n',
+      [join(dependency, 'data.json')]: '{"ready":true}\n',
+      [join(dependency, 'binding.node')]: 'synthetic-native',
+    }
+    await Promise.all(Object.entries(preserved).map(([path, content]) => writeFile(path, content)))
+
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
+    await expect(removeRuntimeBuildMetadata(root)).resolves.toBeUndefined()
+    for (const path of removable) {
+      await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' })
+    }
+    for (const [path, content] of Object.entries(preserved)) {
+      await expect(readFile(path, 'utf8')).resolves.toBe(content)
+    }
+
+    const registryConfig = join(dependency, 'runtime-config.json')
+    await writeFile(registryConfig, '{"registry":"https://packages.example.invalid/"}\n')
+    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+  })
+
   it('rejects local build-home paths and unapproved registry configuration', async () => {
     const root = await mkdtemp(join(tmpdir(), 'preview-private-provenance-'))
     temporary.push(root)
@@ -134,38 +177,88 @@ describe('preview build inventory', () => {
 
     await writeFile(metadata, JSON.stringify({ registry: 'https://registry.npmjs.org/' }))
     await expect(auditPackagedTree(root)).resolves.toHaveLength(2)
+
+    await writeFile(metadata, JSON.stringify({ registry: 'https://registry.npmjs.org' }))
+    await expect(auditPackagedTree(root)).resolves.toHaveLength(2)
   })
 
   it('rejects nested, escaped, or non-canonical registry metadata', async () => {
     const root = await mkdtemp(join(tmpdir(), 'preview-registry-policy-'))
     temporary.push(root)
-    const metadata = join(root, 'runtime-config.json')
-    await writeFile(metadata, 'registries:\n  default: http://registry.npmjs.org/\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-
-    await writeFile(metadata, '{"registry":"https:\\/\\/packages.example.invalid\\/"}\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-
-    await writeFile(metadata, '{"registry":"https:\\u002f\\u002fpackages.example.invalid\\u002f"}\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-
-    await writeFile(metadata, 'registry=ssh://packages.example.invalid/repository\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-
-    await writeFile(metadata, 'registry=packages.example.invalid\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-
-    await writeFile(metadata, `registries:\n  note: ${'x'.repeat(400)}\n  default: http://registry.npmjs.org/\n`)
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-
-    await writeFile(metadata, 'registries: { default: http://registry.npmjs.org/ }\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-
+    const jsonMetadata = join(root, 'runtime-config.json')
+    const yamlMetadata = join(root, 'runtime-config.yaml')
     const tomlMetadata = join(root, 'runtime-config.toml')
-    await writeFile(metadata, '{}\n')
-    await writeFile(tomlMetadata, '[registries]\ndefault = "http://registry.npmjs.org/"\n')
-    await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-    await (await import('node:fs/promises')).rm(tomlMetadata)
+    const iniMetadata = join(root, 'runtime-config.ini')
+    const syntheticPrivateHost = ['repo', 'example', 'internal'].join('.')
+    const expectRejected = async (path: string, content: string) => {
+      await writeFile(path, content)
+      await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+      await rm(path)
+    }
+
+    await expectRejected(
+      jsonMetadata,
+      '{"registries":{"default":"http://registry.npmjs.org/"}}\n',
+    )
+    await expectRejected(jsonMetadata, '{"registry":"https:\\/\\/packages.example.invalid\\/"}\n')
+    await expectRejected(
+      jsonMetadata,
+      '{"registry":"https:\\u002f\\u002fpackages.example.invalid\\u002f"}\n',
+    )
+    await writeFile(jsonMetadata, [
+      '{',
+      '  // synthetic JSONC is accepted when it has no registry configuration',
+      '  "compilerOptions": { "strict": true },',
+      '  "dependency": "synthetic-typert-registry",',
+      '}',
+      '',
+    ].join('\n'))
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
+    await rm(jsonMetadata)
+    await writeFile(jsonMetadata, '')
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
+    await rm(jsonMetadata)
+    await writeFile(jsonMetadata, [
+      '{',
+      '  /* "registry": "https://packages.example.invalid/" */',
+      '  "name": "synthetic-runtime",',
+      '}',
+      '',
+    ].join('\n'))
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
+    await rm(jsonMetadata)
+    await expectRejected(jsonMetadata, [
+      '{',
+      '  // trailing commas make this JSONC instead of strict JSON',
+      '  "registry": "https://packages.example.invalid/",',
+      '}',
+      '',
+    ].join('\n'))
+    await expectRejected(
+      yamlMetadata,
+      `registries:\n  note: ${'x'.repeat(400)}\n  default: http://registry.npmjs.org/\n`,
+    )
+    await expectRejected(yamlMetadata, 'registries: { default: http://registry.npmjs.org/ }\n')
+    await expectRejected(yamlMetadata, `registry: ${syntheticPrivateHost}\n`)
+    for (const blockStyle of ['>', '|']) {
+      await expectRejected(
+        yamlMetadata,
+        `registry: ${blockStyle}\n  https://packages.example.invalid/\n`,
+      )
+    }
+    await expectRejected(tomlMetadata, '[registries]\ndefault = "http://registry.npmjs.org/"\n')
+    await expectRejected(
+      tomlMetadata,
+      '["registries"]\n"default" = "https://packages.example.invalid/"\n',
+    )
+    await expectRejected(
+      tomlMetadata,
+      '"registry-url" = "https://packages.example.invalid/"\n',
+    )
+    await expectRejected(iniMetadata, 'registry=ssh://packages.example.invalid/repository\n')
+    await expectRejected(iniMetadata, `registry: ${syntheticPrivateHost}\n`)
+    await expectRejected(iniMetadata, 'registryUrl=https://packages.example.invalid/\n')
+    await expectRejected(iniMetadata, '@synthetic:registry=https://packages.example.invalid/\n')
 
     for (const registry of [
       'https://registry.npmjs.org/?token=synthetic',
@@ -173,17 +266,71 @@ describe('preview build inventory', () => {
       'https://synthetic-user@registry.npmjs.org/',
       'https://registry.npmjs.org/private',
     ]) {
-      await writeFile(metadata, JSON.stringify({ registry }))
-      await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+      await expectRejected(jsonMetadata, JSON.stringify({ registry }))
     }
 
-    await writeFile(metadata, '{}\n')
     for (const extension of ['py', 'sh', 'ps1', 'bat', 'cmd']) {
       const scriptMetadata = join(root, `runtime_config.${extension}`)
-      await writeFile(scriptMetadata, 'registry = "https://packages.example.invalid/"\n')
-      await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
-      await (await import('node:fs/promises')).rm(scriptMetadata)
+      await expectRejected(scriptMetadata, 'registry = "https://packages.example.invalid/"\n')
     }
+    await expectRejected(
+      join(root, 'runtime_config.sh'),
+      'registry=https://packages.example.invalid/\n',
+    )
+    await expectRejected(
+      join(root, 'runtime_config.sh'),
+      `registry=${syntheticPrivateHost}\n`,
+    )
+    await expectRejected(
+      join(root, 'runtime_config.cmd'),
+      'set registry=https://packages.example.invalid/\n',
+    )
+    await expectRejected(
+      join(root, 'runtime_config.py'),
+      'registry: str = "https://packages.example.invalid/"\n',
+    )
+
+    const typescriptMetadata = join(root, 'runtime-config.ts')
+    await expectRejected(
+      typescriptMetadata,
+      'const config = { registry: `https://packages.example.invalid/` }\n',
+    )
+    await expectRejected(
+      typescriptMetadata,
+      'const config = { "registry-url": "https://packages.example.invalid/" }\n',
+    )
+    await expectRejected(
+      typescriptMetadata,
+      'const config = { "@synthetic:registry": "https://packages.example.invalid/" }\n',
+    )
+    await expectRejected(
+      typescriptMetadata,
+      'const registryUrl = "https://packages.example.invalid/"\n',
+    )
+    await writeFile(typescriptMetadata, [
+      'interface RuntimeOptions {',
+      '  registry: RegistryService;',
+      '  registryMode: { registry: "public" | "private" };',
+      '}',
+      'interface LiteralRegistry { registry: "public" }',
+      'const note = \'registry = "https://packages.example.invalid/"\'',
+      'const ready = true // registry = "https://packages.example.invalid/"',
+      'const config = { registry: `https://${host}/` }',
+      '',
+    ].join('\n'))
+    const sidecarSource = join(root, 'loopctl.py')
+    await writeFile(sidecarSource, [
+      'registry: "RegistryService"',
+      'registry = load_json(project / "registry.json")',
+      '',
+    ].join('\n'))
+    const shellSource = join(root, 'runtime-safe.sh')
+    await writeFile(shellSource, [
+      'registry=$config.registry',
+      'registry=$(load_registry)',
+      '',
+    ].join('\n'))
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
   })
 
   it('rejects generic cross-platform home and package-store paths without a known username', async () => {

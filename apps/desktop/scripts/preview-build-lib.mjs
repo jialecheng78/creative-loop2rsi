@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawn } from 'node:child_process'
+import ts from 'typescript'
 
 const EXPECTED_NODE = 'v24.19.0'
 const EXPECTED_PNPM = '11.7.0'
@@ -34,14 +35,12 @@ const PACKAGE_MANAGER_METADATA_NAMES = new Set([
   'yarn-debug.log',
   'yarn.lock',
 ])
-const PUBLIC_REGISTRY_URLS = new Set([
+const PUBLIC_REGISTRY_HOSTS = new Set([
   'npm.pkg.github.com',
   'registry.npmjs.org',
   'registry.npmmirror.com',
   'registry.yarnpkg.com',
-].map(host => `https://${host}/`))
-const REGISTRY_ASSIGNMENT = /(?:^|[\s"'[{,])(?:@[^:\s"'=]+:)?(?:registry|registry-url|registryUrl|registries\.default)\s*["']?\s*[:=]\s*["']?([^\s"'`,}\]]+)/gim
-const REGISTRY_INLINE_DEFAULT = /(?:^|[\s"'[{,])registries\s*["']?\s*[:=]\s*\{\s*["']?default["']?\s*[:=]\s*["']?([^\s"'`,}\]]+)/gim
+])
 const GENERIC_POSIX_HOME_PATH = /(?:\/(?:Users|home)\/[^/\u0000\s"'<>:]+|\/root(?:\/[^/\u0000\s"'<>:]+)?)(?:\/|(?=$|[\s"'<>:,}\]]))/
 const GENERIC_WINDOWS_HOME_PATH = /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]+Users[\\/]+[^\\/\u0000\s"'<>:]+(?:[\\/]+|(?=$|[\s"'<>:,}\]]))/i
 const POSIX_PACKAGE_STORE_PATH = /\/(?:[^/\u0000\s"'<>:]+\/)*(?:\.pnpm-store|pnpm\/store|npm-cache|npm\/cache|yarn-cache|yarn\/cache)\//i
@@ -356,8 +355,8 @@ export async function auditPackagedTree(root, options = {}) {
     if (POSIX_PACKAGE_STORE_PATH.test(text) || WINDOWS_PACKAGE_STORE_PATH.test(text)) {
       throw new Error(`packaged tree contains an absolute package-store path: ${entry.path}`)
     }
-    for (const registry of registryAssignments(text)) {
-      if (!PUBLIC_REGISTRY_URLS.has(registry)) {
+    for (const registry of registryAssignments(entry.path, text)) {
+      if (!isApprovedRegistry(registry)) {
         throw new Error(`packaged tree contains unapproved registry metadata: ${entry.path}`)
       }
     }
@@ -441,7 +440,7 @@ async function reduceDeployedApp(directory) {
       await rm(join(directory, name), { force: true, recursive: true })
     }
   }
-  await removeBuildMetadata(join(directory, 'dist'))
+  await removeRuntimeBuildMetadata(directory)
   await removePackageManagerMetadata(directory)
   const raw = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'))
   await writeJson(join(directory, 'package.json'), {
@@ -727,12 +726,17 @@ export async function probeDeployedRuntime(deployed) {
   }
 }
 
-async function removeBuildMetadata(directory) {
+export async function removeRuntimeBuildMetadata(directory) {
   for (const name of await readdir(directory)) {
     const path = join(directory, name)
     const info = await lstat(path)
-    if (info.isDirectory()) await removeBuildMetadata(path)
-    else if (name.endsWith('.map') || name.endsWith('.d.ts')) await rm(path, { force: true })
+    if (info.isDirectory() && !info.isSymbolicLink()) await removeRuntimeBuildMetadata(path)
+    else if (name.endsWith('.map')
+      || name.endsWith('.d.ts')
+      || name.endsWith('.d.mts')
+      || name.endsWith('.d.cts')) {
+      await rm(path, { force: true })
+    }
   }
 }
 
@@ -877,51 +881,34 @@ function decodeStrictText(relativePath, bytes) {
   return /[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? null : text
 }
 
-function registryAssignments(text) {
-  const normalized = text.replaceAll('\\/', '/').replace(/\\u002f/gi, '/')
-  const values = []
-  for (const match of normalized.matchAll(REGISTRY_ASSIGNMENT)) values.push(match[1])
-  for (const match of normalized.matchAll(REGISTRY_INLINE_DEFAULT)) values.push(match[1])
-
-  try {
-    collectJsonRegistryAssignments(JSON.parse(normalized), values)
-  } catch {
-    // Non-JSON text is handled by direct assignments and the indentation-aware block below.
+function registryAssignments(relativePath, text) {
+  const normalized = text.replace(/^\uFEFF/, '').replaceAll('\\/', '/').replace(/\\u002f/gi, '/')
+  const name = basename(relativePath).toLowerCase()
+  if (name.endsWith('.json')) {
+    const values = []
+    try {
+      collectJsonRegistryAssignments(JSON.parse(normalized), values)
+    } catch {
+      return jsonConfigRegistryAssignments(normalized)
+    }
+    return values
   }
-
-  let registriesIndent = null
-  let registriesSection = false
-  for (const line of normalized.split(/\r?\n/)) {
-    if (/^\s*$/.test(line)) continue
-    const indent = line.match(/^\s*/)[0].length
-    if (/^\s*\[registries\]\s*$/.test(line)) {
-      registriesSection = true
-      registriesIndent = null
-      continue
-    }
-    if (registriesSection && /^\s*\[[^\]]+\]\s*$/.test(line)) {
-      registriesSection = false
-      continue
-    }
-    if (/^\s*["']?registries["']?\s*:\s*(?:\{\s*)?$/.test(line)) {
-      registriesIndent = indent
-      registriesSection = false
-      continue
-    }
-    if (registriesSection) {
-      const match = line.match(/^\s*default\s*=\s*["']?([^\s"'`,}\]]+)/)
-      if (match !== null) values.push(match[1])
-      continue
-    }
-    if (registriesIndent === null) continue
-    if (indent <= registriesIndent) {
-      registriesIndent = null
-      continue
-    }
-    const match = line.match(/^\s*["']?default["']?\s*:\s*["']?([^\s"'`,}\]]+)/)
-    if (match !== null) values.push(match[1])
+  if (name.endsWith('.yaml') || name.endsWith('.yml')) return yamlRegistryAssignments(normalized)
+  if (name.endsWith('.toml')) return tomlRegistryAssignments(normalized)
+  if (name.endsWith('.ini')
+    || name.endsWith('.cfg')
+    || name.endsWith('.conf')
+    || name.endsWith('.properties')
+    || name === '.npmrc') {
+    return propertyRegistryAssignments(normalized)
   }
-  return values
+  if (['.js', '.ts', '.tsx', '.cjs', '.mjs', '.py', '.sh', '.ps1', '.bat', '.cmd']
+    .some(extension => name.endsWith(extension))) {
+    return ['.js', '.ts', '.tsx', '.cjs', '.mjs'].some(extension => name.endsWith(extension))
+      ? javascriptRegistryAssignments(name, normalized)
+      : lineSourceRegistryAssignments(name, normalized)
+  }
+  return []
 }
 
 function collectJsonRegistryAssignments(value, values) {
@@ -932,7 +919,7 @@ function collectJsonRegistryAssignments(value, values) {
   }
   for (const [key, nested] of Object.entries(value)) {
     const normalizedKey = key.toLowerCase()
-    if (['registry', 'registry-url', 'registryurl'].includes(normalizedKey)) {
+    if (isDirectRegistryKey(normalizedKey)) {
       values.push(typeof nested === 'string' ? nested : '')
     } else if (normalizedKey === 'registries' && nested !== null && typeof nested === 'object') {
       const defaultValue = nested.default
@@ -940,6 +927,365 @@ function collectJsonRegistryAssignments(value, values) {
     }
     collectJsonRegistryAssignments(nested, values)
   }
+}
+
+function jsonConfigRegistryAssignments(text) {
+  const tokens = configTokens(text, { slashComments: true })
+  const values = []
+  for (let index = 0; index < tokens.length; index += 1) {
+    const key = tokenKey(tokens[index])
+    if (key === null || tokens[index + 1]?.value !== ':') continue
+    if (isDirectRegistryKey(key)) {
+      values.push(configTokenValue(tokens[index + 2]))
+      continue
+    }
+    if (key !== 'registries' || tokens[index + 2]?.value !== '{') continue
+    let depth = 1
+    for (let nested = index + 3; nested < tokens.length && depth > 0; nested += 1) {
+      if (tokens[nested].value === '{') depth += 1
+      else if (tokens[nested].value === '}') depth -= 1
+      else if (depth === 1
+        && tokenKey(tokens[nested]) === 'default'
+        && tokens[nested + 1]?.value === ':') {
+        values.push(configTokenValue(tokens[nested + 2]))
+      }
+    }
+  }
+  return values
+}
+
+function yamlRegistryAssignments(text) {
+  const lines = text.split(/\r?\n/)
+  const values = []
+  let registriesIndent = null
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (/^\s*(?:#.*)?$/.test(line)) continue
+    const indent = leadingWhitespace(line)
+    if (registriesIndent !== null && indent <= registriesIndent) registriesIndent = null
+
+    const inline = line.match(/^\s*["']?registries["']?\s*:\s*\{\s*["']?default["']?\s*:\s*([^}]+)\}/i)
+    if (inline !== null) {
+      values.push(configScalar(inline[1]))
+      continue
+    }
+    if (/^\s*["']?registries["']?\s*:\s*$/.test(line.toLowerCase())) {
+      registriesIndent = indent
+      continue
+    }
+
+    const direct = line.match(/^\s*(?:["']?(?:@[^:\s"']+:)?(?:registry|registry-url|registryurl|registries\.default)["']?)\s*:\s*(.*)$/i)
+    const nested = registriesIndent !== null && indent > registriesIndent
+      ? line.match(/^\s*["']?default["']?\s*:\s*(.*)$/i)
+      : null
+    const match = direct ?? nested
+    if (match === null) continue
+    const raw = match[1].trim()
+    if (/^[>|][-+]?\s*(?:#.*)?$/.test(raw)) {
+      const block = []
+      let blockIndex = index + 1
+      for (; blockIndex < lines.length; blockIndex += 1) {
+        const blockLine = lines[blockIndex]
+        if (blockLine.trim() !== '' && leadingWhitespace(blockLine) <= indent) break
+        block.push(blockLine.trim())
+      }
+      values.push(block.filter(Boolean).join(raw.startsWith('>') ? ' ' : '\n').trim())
+      index = blockIndex - 1
+    } else {
+      values.push(configScalar(raw))
+    }
+  }
+  return values
+}
+
+function tomlRegistryAssignments(text) {
+  const values = []
+  let registriesSection = false
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*(?:#.*)?$/.test(line)) continue
+    const section = line.match(/^\s*\[([^\]]+)\]\s*(?:#.*)?$/)
+    if (section !== null) {
+      registriesSection = unquotedConfigKey(section[1]) === 'registries'
+      continue
+    }
+    const assignment = line.match(/^\s*((?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s=]+))\s*=\s*(.*)$/)
+    if (assignment === null) continue
+    const key = unquotedConfigKey(assignment[1])
+    const raw = assignment[2]
+    if (isDirectRegistryKey(key) || (registriesSection && key === 'default')) {
+      values.push(configScalar(raw))
+      continue
+    }
+    if (key === 'registries') {
+      const inline = raw.match(/^\s*\{[\s\S]*?(?:"default"|'default'|default)\s*=\s*([^,}]+)[\s\S]*\}/i)
+      if (inline !== null) values.push(configScalar(inline[1]))
+    }
+  }
+  return values
+}
+
+function propertyRegistryAssignments(text) {
+  const values = []
+  let registriesSection = false
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*(?:[#;].*)?$/.test(line)) continue
+    const section = line.match(/^\s*\[([^\]]+)\]\s*$/)
+    if (section !== null) {
+      registriesSection = section[1].trim().toLowerCase() === 'registries'
+      continue
+    }
+    const direct = line.match(/^\s*(?:@[^:\s=]+:)?(?:registry|registry-url|registryurl|registries\.default)\s*[:=]\s*(.*)$/i)
+    const nested = registriesSection ? line.match(/^\s*default\s*[:=]\s*(.*)$/i) : null
+    const match = direct ?? nested
+    if (match !== null) values.push(configScalar(match[1]))
+  }
+  return values
+}
+
+function javascriptRegistryAssignments(name, text) {
+  const values = []
+  const scriptKind = name.endsWith('.tsx')
+    ? ts.ScriptKind.TSX
+    : name.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS
+  const source = ts.createSourceFile(name, text, ts.ScriptTarget.Latest, true, scriptKind)
+  const literal = node => ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)
+    ? node.text
+    : null
+  const propertyKey = node => {
+    if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+      return node.text
+    }
+    if (ts.isComputedPropertyName(node)
+      && (ts.isStringLiteral(node.expression) || ts.isNoSubstitutionTemplateLiteral(node.expression))) {
+      return node.expression.text
+    }
+    return null
+  }
+  const assignmentKey = node => {
+    if (ts.isIdentifier(node)) return node.text
+    if (ts.isPropertyAccessExpression(node)) return node.name.text
+    if (ts.isElementAccessExpression(node)
+      && node.argumentExpression !== undefined
+      && (ts.isStringLiteral(node.argumentExpression)
+        || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression))) {
+      return node.argumentExpression.text
+    }
+    return null
+  }
+  const collectLiteral = (key, initializer) => {
+    if (key === null || !isDirectRegistryKey(key)) return
+    const value = initializer === undefined ? null : literal(initializer)
+    if (value !== null) values.push(value)
+  }
+  const visit = node => {
+    if (ts.isPropertyAssignment(node)) {
+      const key = propertyKey(node.name)
+      collectLiteral(key, node.initializer)
+      if (key?.toLowerCase() === 'registries' && ts.isObjectLiteralExpression(node.initializer)) {
+        for (const property of node.initializer.properties) {
+          if (ts.isPropertyAssignment(property)
+            && propertyKey(property.name)?.toLowerCase() === 'default') {
+            const value = literal(property.initializer)
+            if (value !== null) values.push(value)
+          }
+        }
+      }
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      collectLiteral(node.name.text, node.initializer)
+    } else if (ts.isPropertyDeclaration(node)) {
+      collectLiteral(propertyKey(node.name), node.initializer)
+    } else if (ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      collectLiteral(assignmentKey(node.left), node.right)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  return values
+}
+
+function lineSourceRegistryAssignments(name, text) {
+  const values = []
+  const unquotedEndpoints = ['.sh', '.ps1', '.bat', '.cmd'].some(extension => name.endsWith(extension))
+  const python = name.endsWith('.py')
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*(?:REM\b|::)/i.test(line)) continue
+    const tokens = configTokens(line, { hashComments: true })
+    for (let index = 0; index < tokens.length; index += 1) {
+      const key = tokenKey(tokens[index])
+      if (key === null || !isDirectRegistryKey(key)) continue
+      let delimiter = index + 1
+      if (tokens[delimiter]?.value === '?') delimiter += 1
+      if (![':', '='].includes(tokens[delimiter]?.value)) continue
+      if (python && tokens[delimiter].value === ':' && tokens[index].type !== 'string') {
+        const initializer = tokens.findIndex((token, candidate) => candidate > delimiter && token.value === '=')
+        if (initializer < 0) continue
+        delimiter = initializer
+      }
+      const value = tokens[delimiter + 1]
+      if (value?.type === 'string') {
+        if (['|', '+'].includes(tokens[delimiter + 2]?.value)) continue
+        if (value.quote === '`' && value.interpolated) continue
+        if (value.value.includes('${') || value.value.includes('$(')) continue
+        values.push(value.value)
+      } else if (unquotedEndpoints && value !== undefined) {
+        const raw = line.slice(value.start, tokens.at(-1).end).trim()
+        const endpoint = unquotedRegistryEndpoint(raw)
+        if (endpoint !== null) values.push(endpoint)
+      }
+    }
+  }
+  return values
+}
+
+function unquotedRegistryEndpoint(raw) {
+  const match = raw.match(/^([A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s;]+|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:\/[^\s;]*)?)(?=$|[\s;])/)
+  return match?.[1] ?? null
+}
+
+function configTokens(text, options = {}) {
+  const tokens = []
+  const punctuation = new Set(['{', '}', '[', ']', ':', '=', ',', ';', '?', '|', '+'])
+  for (let index = 0; index < text.length;) {
+    const character = text[index]
+    if (/\s/.test(character)) {
+      index += 1
+      continue
+    }
+    if (options.hashComments === true && character === '#') break
+    if (options.slashComments === true && text.startsWith('//', index)) {
+      const newline = text.indexOf('\n', index + 2)
+      index = newline < 0 ? text.length : newline + 1
+      continue
+    }
+    if (options.slashComments === true && text.startsWith('/*', index)) {
+      const end = text.indexOf('*/', index + 2)
+      index = end < 0 ? text.length : end + 2
+      continue
+    }
+    if (['"', "'", '`'].includes(character)) {
+      const start = index
+      const quote = character
+      let value = ''
+      let escaped = false
+      let closed = false
+      let interpolated = false
+      index += 1
+      for (; index < text.length; index += 1) {
+        const nested = text[index]
+        if (escaped) {
+          value += nested
+          escaped = false
+        } else if (nested === '\\') {
+          escaped = true
+        } else if (nested === quote) {
+          closed = true
+          index += 1
+          break
+        } else {
+          if (quote === '`' && nested === '$' && text[index + 1] === '{') interpolated = true
+          value += nested
+        }
+      }
+      tokens.push({ type: closed ? 'string' : 'invalid-string', value, quote, interpolated, start, end: index })
+      continue
+    }
+    if (punctuation.has(character)) {
+      tokens.push({ type: 'punctuation', value: character, start: index, end: index + 1 })
+      index += 1
+      continue
+    }
+    const start = index
+    while (index < text.length
+      && !/\s/.test(text[index])
+      && !punctuation.has(text[index])
+      && !(options.hashComments === true && text[index] === '#')
+      && !(options.slashComments === true && (text.startsWith('//', index) || text.startsWith('/*', index)))) {
+      index += 1
+    }
+    if (index === start) index += 1
+    else tokens.push({ type: 'word', value: text.slice(start, index), start, end: index })
+  }
+  return tokens
+}
+
+function tokenKey(token) {
+  if (token === undefined || !['string', 'word'].includes(token.type)) return null
+  return token.value.replace(/^\$/, '').toLowerCase()
+}
+
+function isDirectRegistryKey(key) {
+  const normalized = key.toLowerCase()
+  return ['registry', 'registry-url', 'registryurl', 'registries.default'].includes(normalized)
+    || /^@[^:]+:registry$/.test(normalized)
+}
+
+function configTokenValue(token) {
+  if (token === undefined || !['string', 'word'].includes(token.type)) return ''
+  return token.value
+}
+
+function sourceStringLiteral(raw) {
+  const value = raw.trimStart()
+  const quote = value[0]
+  if (!['"', "'", '`'].includes(quote)) return null
+  let escaped = false
+  let result = ''
+  for (let index = 1; index < value.length; index += 1) {
+    const character = value[index]
+    if (escaped) {
+      result += character
+      escaped = false
+    } else if (character === '\\') {
+      escaped = true
+    } else if (character === quote) {
+      if (quote === '`' && result.includes('${')) return null
+      if (/^\s*\|/.test(value.slice(index + 1))) return null
+      return result
+    } else {
+      result += character
+    }
+  }
+  return null
+}
+
+function configScalar(raw) {
+  const value = raw.trim()
+  if (value.startsWith('"') || value.startsWith("'")) {
+    const parsed = sourceStringLiteral(value)
+    return parsed ?? ''
+  }
+  return value.replace(/\s+[;#].*$/, '').replace(/[;,]\s*$/, '').trim()
+}
+
+function leadingWhitespace(line) {
+  return line.match(/^\s*/)[0].length
+}
+
+function unquotedConfigKey(raw) {
+  const value = raw.trim()
+  if ((value.startsWith('"') && value.endsWith('"'))
+    || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1).toLowerCase()
+  }
+  return value.toLowerCase()
+}
+
+function isApprovedRegistry(value) {
+  let registry
+  try {
+    registry = new URL(value)
+  } catch {
+    return false
+  }
+  return registry.protocol === 'https:'
+    && registry.username === ''
+    && registry.password === ''
+    && registry.port === ''
+    && PUBLIC_REGISTRY_HOSTS.has(registry.hostname.toLowerCase())
+    && registry.pathname === '/'
+    && registry.search === ''
+    && registry.hash === ''
 }
 
 async function run(command, args, options = {}) {

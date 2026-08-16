@@ -47,6 +47,7 @@ export function inventoryTree(
   options?: { readonly platform?: NodeJS.Platform },
 ): Promise<readonly PreviewInventoryEntry[]>
 export function removePackageManagerMetadata(root: string): Promise<void>
+export function removeRuntimeBuildMetadata(root: string): Promise<void>
 export function auditPackagedTree(
   root: string,
   options?: {
