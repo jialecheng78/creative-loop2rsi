@@ -751,7 +751,9 @@ export async function removeRuntimeBuildMetadata(directory, options = {}) {
     const path = join(directory, name)
     const info = await lstat(path)
     if (info.isDirectory() && !info.isSymbolicLink()) {
-      if (dependencyTree && DEPENDENCY_TEST_DIRECTORIES.has(name.toLowerCase())) {
+      if (dependencyTree
+        && !isDependencyPackageContainer(directory)
+        && DEPENDENCY_TEST_DIRECTORIES.has(name.toLowerCase())) {
         await rm(path, { force: true, recursive: true })
       } else {
         await removeRuntimeBuildMetadata(path, { dependencyTree })
@@ -767,6 +769,12 @@ export async function removeRuntimeBuildMetadata(directory, options = {}) {
       await removeLocalSourceComments(path)
     }
   }
+}
+
+function isDependencyPackageContainer(directory) {
+  if (basename(directory).toLowerCase() === 'node_modules') return true
+  return basename(directory).startsWith('@')
+    && basename(dirname(directory)).toLowerCase() === 'node_modules'
 }
 
 function isNonRuntimeDocumentation(name) {

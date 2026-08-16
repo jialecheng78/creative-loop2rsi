@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmod, link, lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -216,6 +216,47 @@ describe('preview build inventory', () => {
     const registryConfig = join(dependency, 'runtime-config.json')
     await writeFile(registryConfig, '{"registry":"https://packages.example.invalid/"}\n')
     await expect(auditPackagedTree(root)).rejects.toThrow('unapproved registry metadata')
+  })
+
+  it('preserves dependency package entries named spec or test while stripping their internal test directories', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-package-entry-boundary-'))
+    temporary.push(root)
+    const scopedPackage = join(
+      root,
+      'node_modules',
+      '.pnpm',
+      '@standard-schema+spec@1.1.0',
+      'node_modules',
+      '@standard-schema',
+      'spec',
+    )
+    const scopedTests = join(scopedPackage, 'tests')
+    const consumer = join(root, 'node_modules', 'synthetic-consumer')
+    const consumerLink = join(consumer, 'node_modules', '@standard-schema', 'spec')
+    const unscopedPackage = join(root, 'node_modules', 'test')
+    const unscopedInternalSpec = join(unscopedPackage, 'spec')
+    await mkdir(scopedTests, { recursive: true })
+    await mkdir(dirname(consumerLink), { recursive: true })
+    await mkdir(unscopedInternalSpec, { recursive: true })
+    await writeFile(join(scopedPackage, 'package.json'), JSON.stringify({
+      name: '@standard-schema/spec',
+      version: '1.1.0',
+    }))
+    await writeFile(join(scopedTests, 'runtime.test.js'), 'throw new Error("test-only")\n')
+    await writeFile(join(consumer, 'package.json'), '{"name":"synthetic-consumer"}\n')
+    await symlink(relative(dirname(consumerLink), scopedPackage), consumerLink)
+    await writeFile(join(unscopedPackage, 'package.json'), '{"name":"test"}\n')
+    await writeFile(join(unscopedInternalSpec, 'fixture.js'), 'throw new Error("test-only")\n')
+
+    await expect(realpath(consumerLink)).resolves.toBe(await realpath(scopedPackage))
+    await expect(removeRuntimeBuildMetadata(root)).resolves.toBeUndefined()
+
+    await expect(realpath(consumerLink)).resolves.toBe(await realpath(scopedPackage))
+    await expect(readFile(join(scopedPackage, 'package.json'), 'utf8')).resolves.toContain('@standard-schema/spec')
+    await expect(readFile(join(scopedTests, 'runtime.test.js'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(readFile(join(unscopedPackage, 'package.json'), 'utf8')).resolves.toContain('"test"')
+    await expect(readFile(join(unscopedInternalSpec, 'fixture.js'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(auditPackagedTree(root)).resolves.toBeDefined()
   })
 
   it('rejects local build-home paths and unapproved registry configuration', async () => {
