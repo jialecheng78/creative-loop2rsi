@@ -958,9 +958,10 @@ export function NewMethodsPage(props: {
                       ? <>
                           <h2>{comparisonLabel(unanswered.phase)}</h2>
                           <p>只比较作品，不会告诉你哪一边使用了候选方法。你的选择保存后不能改写。</p>
+                          <p className="comparison-scroll-hint">正文较长时，请在 A/B 正文框内滚动至末尾再选择。</p>
                           <div className="blind-comparison">
-                            <section><span>版本 A</span><p>{unanswered.left}</p></section>
-                            <section><span>版本 B</span><p>{unanswered.right}</p></section>
+                            <section><span>版本 A</span><p aria-label="版本 A 正文" role="region" tabIndex={0}>{unanswered.left}</p></section>
+                            <section><span>版本 B</span><p aria-label="版本 B 正文" role="region" tabIndex={0}>{unanswered.right}</p></section>
                           </div>
                           <div className="comparison-actions">
                             <button className="secondary-button" disabled={busy} onClick={() => void compare(method.id, unanswered.phase, 'A')} type="button">A 更好</button>

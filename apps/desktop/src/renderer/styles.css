@@ -258,7 +258,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 .method-card .blind-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: stretch; }
 .blind-comparison section { min-width: 0; padding: 18px; border: 1px solid #dcd6c9; border-radius: 12px; background: #fbfaf6; }
 .blind-comparison section > span { color: #315f4d; font-size: 12px; font-weight: 750; }
-.blind-comparison section > p { max-height: 320px; margin: 12px 0 0; overflow: auto; color: var(--ink); white-space: pre-wrap; }
+.blind-comparison section > p { max-height: 320px; margin: 12px 0 0; overflow-y: scroll; scrollbar-gutter: stable; color: var(--ink); white-space: pre-wrap; }
+.blind-comparison section > p:focus-visible { outline: 3px solid #4e7565; outline-offset: 3px; }
+.method-card .comparison-scroll-hint { margin-bottom: 0; color: #5f6f67; font-size: 13px; }
 .method-card .comparison-actions { justify-content: center; }
 .section-notice { min-height: 20px; margin: 16px 0 0; color: var(--muted); font-size: 13px; }
 

@@ -219,6 +219,25 @@ describe('App shell', () => {
     expect(blocked).not.toContain('盲比 4/3')
     expect(blocked).not.toContain('>采用新方式</button>')
   })
+
+  it('makes both blind-comparison texts named, keyboard-focusable scroll regions', () => {
+    const html = renderCandidate({
+      status: 'EVALUATING',
+      ready: false,
+      completedGenerationCount: 4,
+      comparisons: [
+        { phase: 'targeted', left: 'A 正文', right: 'B 正文', choice: null },
+        { phase: 'regression', left: '回归 A', right: '回归 B', choice: null },
+        { phase: 'heldout', left: '留出 A', right: '留出 B', choice: null },
+      ],
+    })
+
+    expect(html.match(/role="region"/gu)).toHaveLength(2)
+    expect(html.match(/tabindex="0"/gu)).toHaveLength(2)
+    expect(html).toContain('aria-label="版本 A 正文"')
+    expect(html).toContain('aria-label="版本 B 正文"')
+    expect(html).toContain('正文较长时，请在 A/B 正文框内滚动至末尾再选择。')
+  })
 })
 
 function renderNewMethod(flags: Pick<MethodCandidateSnapshot, 'adoptionPending' | 'rolledBack'>): string {
