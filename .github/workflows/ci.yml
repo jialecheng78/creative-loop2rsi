@@ -58,6 +58,10 @@ jobs:
       - name: Install workspace
         run: pnpm install --frozen-lockfile
 
+      - name: Materialize pinned Electron runtime
+        if: runner.os != 'Linux'
+        run: node apps/desktop/node_modules/electron/install.js
+
       - name: Typecheck and test workspace
         run: pnpm run check
 

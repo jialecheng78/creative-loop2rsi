@@ -212,6 +212,14 @@ class RepositoryPolicyTests(unittest.TestCase):
             self.assertIn(version, workflow)
         self.assertIn("python -X utf8 -m unittest discover -s tests -v", workflow)
         self.assertIn("--mode tracked", workflow)
+        electron_install = "run: node apps/desktop/node_modules/electron/install.js"
+        self.assertIn("if: runner.os != 'Linux'", workflow)
+        self.assertIn(electron_install, workflow)
+        self.assertLess(
+            workflow.index("run: pnpm install --frozen-lockfile"),
+            workflow.index(electron_install),
+        )
+        self.assertLess(workflow.index(electron_install), workflow.index("run: pnpm run check"))
         for job in ("dco:", "policy:", "gitleaks-history:", "archive-audit:"):
             self.assertIn(job, workflow)
         self.assertIn("--ignore-gitleaks-allow", workflow)
