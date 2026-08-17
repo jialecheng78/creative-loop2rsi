@@ -148,6 +148,15 @@ def validate_sidecar_executable(
         raise RuntimeError("POSIX sidecar executable mode must be 0755")
 
 
+def create_sidecar_build_directory(output: Path) -> Path:
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".{output.name}-build-",
+            dir=output.parent,
+        )
+    )
+
+
 def _regular_notice(path: Path, label: str) -> Path:
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"{label} notice must be a regular file")
@@ -312,7 +321,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
-    temporary = Path(tempfile.mkdtemp(prefix="creative-rsi-sidecar-build-"))
+    temporary = create_sidecar_build_directory(output)
     try:
         source_root = temporary / "source"
         source_hashes: Dict[str, str] = {}

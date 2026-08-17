@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from tools.build_controller_sidecar import (
     SIDECAR_NAME,
+    create_sidecar_build_directory,
     install_runtime_notices,
     inventory_sidecar_tree,
     select_python_license,
@@ -18,6 +20,20 @@ from tools.build_controller_sidecar import (
 
 
 class ControllerSidecarBuilderTests(unittest.TestCase):
+    def test_build_directory_is_a_unique_sibling_of_the_final_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sidecar-builder-volume-") as temporary:
+            output = Path(temporary) / "dist" / "controller-sidecar"
+            output.parent.mkdir()
+
+            build_root = create_sidecar_build_directory(output)
+            try:
+                self.assertEqual(build_root.parent, output.parent)
+                self.assertTrue(build_root.name.startswith(f".{output.name}-build-"))
+                self.assertNotEqual(build_root, output)
+                self.assertTrue(build_root.is_dir())
+            finally:
+                shutil.rmtree(build_root, ignore_errors=True)
+
     def test_runtime_notices_are_copied_and_hash_bound_without_source_paths(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sidecar-runtime-notices-") as temporary:
             root = Path(temporary)
