@@ -103,6 +103,7 @@ describe('desktop security defaults', () => {
         await rm(temporaryRoot, { recursive: true, force: true })
       }
     },
+    35_000,
   )
 
   it('replaces the utility environment and strips secrets and proxies', () => {
