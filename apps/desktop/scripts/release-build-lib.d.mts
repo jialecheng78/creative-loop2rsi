@@ -31,6 +31,7 @@ export interface MacReleaseBuildResult {
 }
 
 export function releaseOutputPath(root: string): string
+export function pinnedPnpmCli(root: string, entry?: string): Promise<string>
 export function buildMacRelease(options: MacReleaseBuildOptions): Promise<MacReleaseBuildResult>
 export function validateReleasePreview(options: {
   readonly root: string

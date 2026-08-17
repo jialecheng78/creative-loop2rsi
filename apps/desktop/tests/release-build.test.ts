@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -27,6 +27,7 @@ import {
   collectPackagedNodeComponents,
   createDeliveryManifest,
   isExpectedUnsignedSpctlAssessment,
+  pinnedPnpmCli,
   releaseOutputPath,
   renderChecksums,
   preparePublicEvidenceAuditTree,
@@ -274,6 +275,17 @@ async function buildSyntheticPackagedEvidenceFixture(options: {
 }
 
 describe('macOS release packaging', () => {
+  it('uses the resolved regular target behind a global pnpm launcher', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'release-pnpm-cli-'))
+    temporary.push(root)
+    const target = join(root, 'pnpm.cjs')
+    const launcher = join(root, 'pnpm')
+    await writeFile(target, '#!/usr/bin/env node\nconsole.log("11.7.0")\n')
+    await symlink(target, launcher)
+
+    await expect(pinnedPnpmCli(root, launcher)).resolves.toBe(await realpath(target))
+  })
+
   it('uses the fixed alpha output contract', () => {
     expect(releaseOutputPath('/repo')).toBe(
       join(resolve('/repo'), 'dist', 'releases', 'studio-v1.0.0-alpha.1'),
