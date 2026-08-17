@@ -1372,7 +1372,8 @@ class AppControllerTests(unittest.TestCase):
         snapshot = self.request("system_snapshot", {"project": str(project)})
         self.assertEqual(snapshot["last_work"]["run_id"], "run-a")
         self.assertEqual(
-            snapshot["last_work"]["output"], artifact_a.read_text(encoding="utf-8")
+            snapshot["last_work"]["output"],
+            artifact_a.read_bytes().decode("utf-8"),
         )
         self.assertTrue(snapshot["last_work"]["sealed"])
         self.assertTrue(snapshot["recovery_required"])

@@ -275,7 +275,9 @@ async function buildSyntheticPackagedEvidenceFixture(options: {
 
 describe('macOS release packaging', () => {
   it('uses the fixed alpha output contract', () => {
-    expect(releaseOutputPath('/repo')).toBe('/repo/dist/releases/studio-v1.0.0-alpha.1')
+    expect(releaseOutputPath('/repo')).toBe(
+      join(resolve('/repo'), 'dist', 'releases', 'studio-v1.0.0-alpha.1'),
+    )
     expect(RELEASE_TAG).toBe('studio-v1.0.0-alpha.1')
     expect(MAIN_ARCHIVE_NAME).toBe('Creative-RSI-Studio-1.0.0-alpha.1-macos-arm64.zip')
     expect(EVIDENCE_ARCHIVE_NAME).toBe('Creative-RSI-Studio-1.0.0-alpha.1-evidence.zip')

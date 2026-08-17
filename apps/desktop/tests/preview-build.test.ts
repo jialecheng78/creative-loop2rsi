@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { chmod, cp, link, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, link, lstat, mkdtemp, mkdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -45,9 +45,9 @@ describe('preview build inventory', () => {
 
   it('uses a Finder-recognizable macOS app path', () => {
     expect(previewOutputPath('/repo', 'darwin', 'arm64'))
-      .toBe('/repo/dist/studio-preview/darwin-arm64/Creative RSI Studio.app')
+      .toBe(join(resolve('/repo'), 'dist', 'studio-preview', 'darwin-arm64', 'Creative RSI Studio.app'))
     expect(previewOutputPath('/repo', 'win32', 'x64'))
-      .toBe('/repo/dist/studio-preview/win32-x64/Creative RSI Studio-win32-x64')
+      .toBe(join(resolve('/repo'), 'dist', 'studio-preview', 'win32-x64', 'Creative RSI Studio-win32-x64'))
   })
 
   it('hashes regular files and preserves internal symlinks', async () => {
@@ -57,19 +57,23 @@ describe('preview build inventory', () => {
     await writeFile(join(root, 'real', 'file.txt'), 'hello')
     await symlink('real/file.txt', join(root, 'link.txt'))
     const result = await inventoryTree(root)
+    const rawTarget = await readlink(join(root, 'link.txt'))
+    const hostMode = process.platform === 'win32'
+      ? null
+      : expect.stringMatching(/^[0-7]{4}$/)
     expect(result).toEqual([
-      expect.objectContaining({ path: '.', type: 'directory', mode: expect.stringMatching(/^[0-7]{4}$/) }),
+      expect.objectContaining({ path: '.', type: 'directory', mode: hostMode }),
       expect.objectContaining({
-        path: 'link.txt', type: 'symlink', target: 'real/file.txt', mode: expect.stringMatching(/^[0-7]{4}$/),
+        path: 'link.txt', type: 'symlink', target: rawTarget, mode: hostMode,
       }),
-      expect.objectContaining({ path: 'real', type: 'directory', mode: expect.stringMatching(/^[0-7]{4}$/) }),
+      expect.objectContaining({ path: 'real', type: 'directory', mode: hostMode }),
       expect.objectContaining({
-        path: 'real/file.txt', type: 'file', bytes: 5, mode: expect.stringMatching(/^[0-7]{4}$/),
+        path: 'real/file.txt', type: 'file', bytes: 5, mode: hostMode,
       }),
     ])
     await expect(inventoryTree(root, { platform: 'win32' })).resolves.toEqual([
       { path: '.', type: 'directory', mode: null },
-      { path: 'link.txt', type: 'symlink', target: 'real/file.txt', mode: null },
+      { path: 'link.txt', type: 'symlink', target: rawTarget, mode: null },
       { path: 'real', type: 'directory', mode: null },
       expect.objectContaining({ path: 'real/file.txt', type: 'file', bytes: 5, mode: null }),
     ])

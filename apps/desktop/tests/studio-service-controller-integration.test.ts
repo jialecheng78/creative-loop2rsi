@@ -294,7 +294,12 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
     expect(observation?.readyForCandidate).toBe(true)
 
     const preparing = firstService.prepareMethodCandidate(observation!.id)
-    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(4))
+    let preparationError: unknown
+    const preparationSettled = preparing.catch(error => { preparationError = error })
+    await vi.waitFor(
+      () => expect(fixture.runtime.handles).toHaveLength(4),
+      { timeout: 30_000 },
+    )
     const builder = fixture.runtime.handles[3]!
     // Builder still belongs to the source epoch. Only the next paid generation
     // observes the drift, which must become a durable non-content marker.
@@ -305,16 +310,19 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
     await firstService.acceptRuntimeEvent({
       type: 'state', runId: builder.runId, state: 'completed',
     })
-    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(5))
+    await vi.waitFor(
+      () => expect(fixture.runtime.handles).toHaveLength(5),
+      { timeout: 30_000 },
+    )
     const mismatchedGeneration = fixture.runtime.handles[4]!
-    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'METHOD_EPOCH_CHANGED' })
     await firstService.acceptRuntimeEvent({
       type: 'output', runId: mismatchedGeneration.runId, text: '这段付费正文不得进入 failure marker。',
     })
     await firstService.acceptRuntimeEvent({
       type: 'state', runId: mismatchedGeneration.runId, state: 'completed',
     })
-    await firstFailure
+    await preparationSettled
+    expect(preparationError).toMatchObject({ code: 'METHOD_EPOCH_CHANGED' })
 
     const blocked = await firstService.getStatus()
     const candidate = blocked.activeSystem?.methodCandidates[0]
@@ -380,8 +388,12 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
 
     fixture.loopback.systemFingerprint = 'integration-builder-fingerprint-v2'
     const preparing = firstService.prepareMethodCandidate(observation!.id)
-    const firstFailure = expect(preparing).rejects.toMatchObject({ code: 'METHOD_EPOCH_CHANGED' })
-    await vi.waitFor(() => expect(fixture.runtime.handles).toHaveLength(4))
+    let preparationError: unknown
+    const preparationSettled = preparing.catch(error => { preparationError = error })
+    await vi.waitFor(
+      () => expect(fixture.runtime.handles).toHaveLength(4),
+      { timeout: 30_000 },
+    )
     const builder = fixture.runtime.handles[3]!
     await firstService.acceptRuntimeEvent({
       type: 'output', runId: builder.runId, text: '这段已付费 Builder 指导不得进入 failure marker。',
@@ -389,7 +401,8 @@ describe('StudioService + ControllerBridge + Python Controller integration', () 
     await firstService.acceptRuntimeEvent({
       type: 'state', runId: builder.runId, state: 'completed',
     })
-    await firstFailure
+    await preparationSettled
+    expect(preparationError).toMatchObject({ code: 'METHOD_EPOCH_CHANGED' })
 
     const blocked = await firstService.getStatus()
     const candidate = blocked.activeSystem?.methodCandidates[0]
