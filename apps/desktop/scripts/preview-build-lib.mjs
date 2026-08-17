@@ -214,11 +214,11 @@ export async function buildPreview(options) {
   if (process.version !== EXPECTED_NODE) {
     throw new Error(`preview build requires Node ${EXPECTED_NODE}; observed ${process.version}`)
   }
-  const pnpmCli = process.env.npm_execpath
-  if (pnpmCli === undefined || !isAbsolute(pnpmCli)) {
+  const pnpmCliEntry = process.env.npm_execpath
+  if (pnpmCliEntry === undefined || !isAbsolute(pnpmCliEntry)) {
     throw new Error('preview build must run from the pinned pnpm script')
   }
-  await assertRegularFile(pnpmCli, 'pnpm CLI')
+  const pnpmCli = await resolvePnpmCli(pnpmCliEntry)
   const observedPnpm = (await run(process.execPath, [pnpmCli, '--version'], { cwd: root })).stdout.trim()
   if (observedPnpm !== EXPECTED_PNPM) {
     throw new Error(`preview build requires pnpm ${EXPECTED_PNPM}; observed ${observedPnpm}`)
@@ -333,6 +333,20 @@ export async function buildPreview(options) {
   } finally {
     await rm(stagingRoot, { force: true, recursive: true })
   }
+}
+
+export async function resolvePnpmCli(entry) {
+  if (typeof entry !== 'string' || !isAbsolute(entry)) {
+    throw new Error('pnpm CLI path must be absolute')
+  }
+  let target
+  try {
+    target = await realpath(entry)
+  } catch {
+    throw new Error('pnpm CLI target cannot be resolved')
+  }
+  await assertRegularFile(target, 'resolved pnpm CLI')
+  return target
 }
 
 export function previewOutputPath(root, platform, arch) {
