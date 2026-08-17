@@ -65,6 +65,7 @@ export interface PreviewBuildResult {
 }
 
 export function buildPreview(options: PreviewBuildOptions): Promise<PreviewBuildResult>
+export function resolvePnpmCli(entry: string): Promise<string>
 export function previewOutputPath(root: string, platform: string, arch: string): string
 export function inventoryTree(
   root: string,

@@ -21,6 +21,7 @@ import {
   removeRuntimeBuildMetadata,
   removePnpmWorkspaceSelfReference,
   removeUnusedMacPrivacyDeclarations,
+  resolvePnpmCli,
   restoreLegacyWorkspaceRuntimeDependencies,
   sealMacBundle,
   validateElectronRuntimeEvidence,
@@ -48,6 +49,23 @@ describe('preview build inventory', () => {
       .toBe(join(resolve('/repo'), 'dist', 'studio-preview', 'darwin-arm64', 'Creative RSI Studio.app'))
     expect(previewOutputPath('/repo', 'win32', 'x64'))
       .toBe(join(resolve('/repo'), 'dist', 'studio-preview', 'win32-x64', 'Creative RSI Studio-win32-x64'))
+  })
+
+  it('resolves a global pnpm launcher symlink to one regular CLI target', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'preview-pnpm-cli-'))
+    temporary.push(root)
+    const target = join(root, 'pnpm.cjs')
+    const launcher = join(root, 'pnpm')
+    const directory = join(root, 'not-a-cli')
+    await writeFile(target, 'console.log("11.7.0")\n')
+    await symlink(target, launcher)
+    await mkdir(directory)
+
+    await expect(resolvePnpmCli(launcher)).resolves.toBe(await realpath(target))
+    await expect(resolvePnpmCli(target)).resolves.toBe(await realpath(target))
+    await expect(resolvePnpmCli(directory)).rejects.toThrow('resolved pnpm CLI must be a regular file')
+    await expect(resolvePnpmCli(join(root, 'missing'))).rejects.toThrow('pnpm CLI target cannot be resolved')
+    await expect(resolvePnpmCli('relative/pnpm')).rejects.toThrow('pnpm CLI path must be absolute')
   })
 
   it('hashes regular files and preserves internal symlinks', async () => {
