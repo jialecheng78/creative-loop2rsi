@@ -23,6 +23,7 @@ import {
   auditPackagedTree,
   inventoryTree,
   previewOutputPath,
+  resolvePnpmCli,
   validateElectronRuntimeEvidence,
   validateSidecarEvidence,
   validateSidecarRuntimeComponents,
@@ -1568,15 +1569,14 @@ async function assertNoArchivedMacMetadata(root) {
   }
 }
 
-async function pinnedPnpmCli(root) {
+export async function pinnedPnpmCli(root, entry = process.env.npm_execpath) {
   if (process.version !== EXPECTED_NODE) {
     throw new Error(`release packaging requires Node ${EXPECTED_NODE}; observed ${process.version}`)
   }
-  const pnpmCli = process.env.npm_execpath
-  if (pnpmCli === undefined || !isAbsolute(pnpmCli)) {
+  if (entry === undefined || !isAbsolute(entry)) {
     throw new Error('release packaging must run from the pinned pnpm script')
   }
-  await assertRegularFile(pnpmCli, 'pnpm CLI')
+  const pnpmCli = await resolvePnpmCli(entry)
   const version = (await run(process.execPath, [pnpmCli, '--version'], { cwd: root })).stdout.trim()
   if (version !== EXPECTED_PNPM) {
     throw new Error(`release packaging requires pnpm ${EXPECTED_PNPM}; observed ${version}`)
